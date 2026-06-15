@@ -1,0 +1,37 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+rust_library(
+    name = "soulrust",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    compile_data = ["assets/htmx.min.js"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//crates/soulseek-proto:soulseek_proto",
+        "@crates//:bincode",
+        "@crates//:rust-messenger",
+        "@crates//:self-replace",
+        "@crates//:semver",
+        "@crates//:serde",
+        "@crates//:serde_json",
+        "@crates//:serde_yaml",
+        "@crates//:tiny_http",
+        "@crates//:ureq",
+    ],
+)
+
+rust_binary(
+    name = "soulrust_bin",
+    srcs = ["src/main.rs"],
+    deps = [
+        ":soulrust",
+        "@crates//:rust-messenger",
+    ],
+)
+
+rust_test(
+    name = "soulrust_test",
+    crate = ":soulrust",
+)

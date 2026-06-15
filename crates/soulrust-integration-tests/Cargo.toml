@@ -1,0 +1,20 @@
+[package]
+name = "soulrust-integration-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+soulrust = { path = "../soulrust" }
+soulseek-proto = { path = "../soulseek-proto" }
+rust-messenger = { git = "file:///home/berend/Developer/rust-messenger", rev = "b80597f" }
+testcontainers = { version = "0.27", features = ["blocking"] }
+ureq = "2"
+
+[[test]]
+name = "soulfind_protocol"
+path = "tests/soulfind_protocol.rs"
+
+[[test]]
+name = "soulfind_app"
+path = "tests/soulfind_app.rs"

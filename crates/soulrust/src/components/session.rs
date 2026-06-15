@@ -1,0 +1,629 @@
+//! The Soulseek session state machine: pure protocol logic over the bus.
+//! Socket I/O lives in [`crate::components::net_edge`]; this component only
+//! consumes decoded frame payloads (`NetRx`) and produces outgoing frames
+//! (`NetTx`), which keeps it fully unit-testable with a capturing writer.
+
+use std::collections::HashSet;
+
+use rust_messenger::traits;
+use rust_messenger::traits::extended::Sender;
+use soulseek_proto::server::{
+    FileSearchRequest, GetPeerAddressRequest, LoginRequest, ServerMessage, ServerRequest,
+    SetWaitPort,
+};
+
+use crate::config::AppContext;
+use crate::messages::{
+    BrowseAccepted, BrowseFailed, BrowseUser, HandlerId, NetConn, NetConnEvent, NetRx, NetTx,
+    PeerBrowseConnect, SessionEvent, SessionEventKind, StartSearch, StartSearchResult,
+    StartedSearch,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionState {
+    Disconnected,
+    AwaitingLogin,
+    LoggedIn,
+}
+
+pub struct Session {
+    username: String,
+    password: String,
+    listen_port: u32,
+    state: SessionState,
+    next_token: u32,
+    /// Usernames for which we've asked the server for a peer address and are
+    /// waiting to start a browse. A GetPeerAddress response for one of these
+    /// triggers a peer connection rather than just a log note.
+    pending_browses: HashSet<String>,
+}
+
+/// Client identity sent in the Login message.
+const MAJOR_VERSION: u32 = 160;
+const MINOR_VERSION: u32 = 1;
+
+impl Session {
+    pub fn new<W: traits::core::Writer>(ctx: &AppContext, _writer: &W) -> Self {
+        Session {
+            username: ctx.config.server.username.clone(),
+            password: ctx.config.server.password.clone(),
+            listen_port: ctx.config.server.listen_port,
+            state: SessionState::Disconnected,
+            next_token: 1,
+            pending_browses: HashSet::new(),
+        }
+    }
+
+    fn emit<W: traits::core::Writer>(kind: SessionEventKind, writer: &W) {
+        Self::send(&SessionEvent { kind }, writer);
+    }
+}
+
+impl traits::core::Handler for Session {
+    type Id = HandlerId;
+    const ID: HandlerId = HandlerId::Session;
+}
+
+impl traits::core::Handle<NetConn> for Session {
+    fn handle<W: traits::core::Writer>(&mut self, message: &NetConn, writer: &W) {
+        match &message.event {
+            NetConnEvent::Connected => {
+                let login = LoginRequest {
+                    username: self.username.clone(),
+                    password: self.password.clone(),
+                    major_version: MAJOR_VERSION,
+                    minor_version: MINOR_VERSION,
+                };
+                Self::send(&NetTx { frame: login.to_frame() }, writer);
+                self.state = SessionState::AwaitingLogin;
+                Self::emit(SessionEventKind::Connecting, writer);
+            }
+            NetConnEvent::Failed { reason } | NetConnEvent::Closed { reason } => {
+                self.state = SessionState::Disconnected;
+                Self::emit(SessionEventKind::Disconnected { reason: reason.clone() }, writer);
+            }
+        }
+    }
+}
+
+impl traits::core::Handle<NetRx> for Session {
+    fn handle<W: traits::core::Writer>(&mut self, message: &NetRx, writer: &W) {
+        let decoded = match ServerMessage::decode(&message.payload) {
+            Ok(decoded) => decoded,
+            Err(err) => {
+                Self::emit(
+                    SessionEventKind::ProtocolNote { note: format!("undecodable frame: {err}") },
+                    writer,
+                );
+                return;
+            }
+        };
+
+        match decoded {
+            ServerMessage::Login(soulseek_proto::server::LoginResponse::Success {
+                greeting,
+                own_ip,
+                ..
+            }) => {
+                self.state = SessionState::LoggedIn;
+                let wait_port = SetWaitPort {
+                    port: self.listen_port,
+                    obfuscation_type: 0,
+                    obfuscated_port: 0,
+                };
+                Self::send(&NetTx { frame: wait_port.to_frame() }, writer);
+                Self::emit(
+                    SessionEventKind::LoggedIn { greeting, own_ip: own_ip.to_string() },
+                    writer,
+                );
+            }
+            ServerMessage::Login(soulseek_proto::server::LoginResponse::Failure {
+                reason,
+                detail,
+            }) => {
+                self.state = SessionState::Disconnected;
+                let reason = match detail {
+                    Some(detail) => format!("{reason}: {detail}"),
+                    None => reason,
+                };
+                Self::emit(SessionEventKind::LoginFailed { reason }, writer);
+            }
+            ServerMessage::FileSearch(broadcast) => {
+                Self::emit(
+                    SessionEventKind::SearchBroadcastSeen {
+                        username: broadcast.username,
+                        query: broadcast.query,
+                    },
+                    writer,
+                );
+            }
+            ServerMessage::GetPeerAddress(response) => {
+                if self.pending_browses.remove(&response.username) {
+                    // 0.0.0.0:0 is the server's way of saying "unknown/offline".
+                    if response.ip.is_unspecified() || response.port == 0 {
+                        Self::send(
+                            &BrowseFailed {
+                                username: response.username.clone(),
+                                reason: "user is offline or not reachable".into(),
+                            },
+                            writer,
+                        );
+                    } else {
+                        Self::send(
+                            &PeerBrowseConnect {
+                                username: response.username.clone(),
+                                ip: response.ip.to_string(),
+                                port: response.port as u16,
+                            },
+                            writer,
+                        );
+                    }
+                } else {
+                    Self::emit(
+                        SessionEventKind::ProtocolNote {
+                            note: format!(
+                                "peer address: {} at {}:{}",
+                                response.username, response.ip, response.port
+                            ),
+                        },
+                        writer,
+                    );
+                }
+            }
+            ServerMessage::Unknown { code, body } => {
+                Self::emit(
+                    SessionEventKind::ProtocolNote {
+                        note: format!("unhandled server message code {code} ({} bytes)", body.len()),
+                    },
+                    writer,
+                );
+            }
+        }
+    }
+}
+
+impl traits::core::Handle<StartSearch> for Session {
+    fn handle<W: traits::core::Writer>(&mut self, message: &StartSearch, writer: &W) {
+        if self.state != SessionState::LoggedIn {
+            Self::send(
+                &StartSearchResult {
+                    corr: message.corr,
+                    started: Vec::new(),
+                    error: Some("not logged in to the soulseek server".into()),
+                },
+                writer,
+            );
+            return;
+        }
+
+        let mut started = Vec::new();
+        for job in &message.jobs {
+            let query = job.to_query();
+            if query.is_empty() {
+                continue;
+            }
+            let token = self.next_token;
+            self.next_token += 1;
+            let request = FileSearchRequest { token, query: query.clone() };
+            Self::send(&NetTx { frame: request.to_frame() }, writer);
+            Self::emit(
+                SessionEventKind::SearchStarted { token, query: query.clone() },
+                writer,
+            );
+            started.push(StartedSearch { token, query });
+        }
+
+        Self::send(
+            &StartSearchResult { corr: message.corr, started, error: None },
+            writer,
+        );
+    }
+}
+
+impl traits::core::Handle<BrowseUser> for Session {
+    fn handle<W: traits::core::Writer>(&mut self, message: &BrowseUser, writer: &W) {
+        let username = message.username.trim();
+        if self.state != SessionState::LoggedIn {
+            Self::send(
+                &BrowseAccepted {
+                    corr: message.corr,
+                    error: Some("not logged in to the soulseek server".into()),
+                },
+                writer,
+            );
+            return;
+        }
+        if username.is_empty() {
+            Self::send(
+                &BrowseAccepted {
+                    corr: message.corr,
+                    error: Some("enter a username to browse".into()),
+                },
+                writer,
+            );
+            return;
+        }
+
+        // Ask the server where this peer lives; the GetPeerAddress response
+        // (handled above) opens the peer connection.
+        let request = GetPeerAddressRequest { username: username.to_owned() };
+        Self::send(&NetTx { frame: request.to_frame() }, writer);
+        self.pending_browses.insert(username.to_owned());
+        Self::send(&BrowseAccepted { corr: message.corr, error: None }, writer);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::extract::SearchJob;
+    use crate::messages::MessageId;
+    use rust_messenger::traits::core::Handle;
+    use std::net::Ipv4Addr;
+    use std::sync::{Arc, Mutex};
+
+    /// Captures every message written to the bus as (message id, payload).
+    #[derive(Clone, Default)]
+    struct CapturingWriter {
+        records: Arc<Mutex<Vec<(u16, Vec<u8>)>>>,
+    }
+
+    impl traits::core::Writer for CapturingWriter {
+        fn write<
+            M: traits::core::Message,
+            H: traits::core::Handler,
+            F: FnOnce(&mut [u8]),
+        >(
+            &self,
+            size: usize,
+            callback: F,
+        ) {
+            let mut buf = vec![0u8; size];
+            callback(&mut buf);
+            self.records.lock().unwrap().push((M::ID.into(), buf));
+        }
+    }
+
+    impl CapturingWriter {
+        fn frames(&self) -> Vec<Vec<u8>> {
+            self.records
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(id, _)| *id == u16::from(MessageId::NetTx))
+                .map(|(_, buf)| NetTx::deserialize_from(buf).frame)
+                .collect()
+        }
+
+        fn events(&self) -> Vec<SessionEventKind> {
+            self.records
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(id, _)| *id == u16::from(MessageId::SessionEvent))
+                .map(|(_, buf)| SessionEvent::deserialize_from(buf).kind)
+                .collect()
+        }
+
+        fn search_results(&self) -> Vec<StartSearchResult> {
+            self.records
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(id, _)| *id == u16::from(MessageId::StartSearchResult))
+                .map(|(_, buf)| StartSearchResult::deserialize_from(buf))
+                .collect()
+        }
+
+        fn browse_accepts(&self) -> Vec<BrowseAccepted> {
+            self.decode(MessageId::BrowseAccepted, BrowseAccepted::deserialize_from)
+        }
+
+        fn peer_browse_connects(&self) -> Vec<PeerBrowseConnect> {
+            self.decode(MessageId::PeerBrowseConnect, PeerBrowseConnect::deserialize_from)
+        }
+
+        fn browse_failures(&self) -> Vec<BrowseFailed> {
+            self.decode(MessageId::BrowseFailed, BrowseFailed::deserialize_from)
+        }
+
+        fn decode<T>(&self, id: MessageId, f: impl Fn(&[u8]) -> T) -> Vec<T> {
+            self.records
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(rid, _)| *rid == u16::from(id))
+                .map(|(_, buf)| f(buf))
+                .collect()
+        }
+    }
+
+    fn get_peer_address_payload(username: &str, ip: Ipv4Addr, port: u32) -> Vec<u8> {
+        use soulseek_proto::wire::{put_ipv4, put_string, put_u16, put_u32};
+        let mut body = Vec::new();
+        put_u32(&mut body, 3); // GetPeerAddress code
+        put_string(&mut body, username);
+        put_ipv4(&mut body, ip);
+        put_u32(&mut body, port);
+        put_u32(&mut body, 0); // obfuscation type
+        put_u16(&mut body, 0); // obfuscated port
+        body
+    }
+
+    fn logged_in_session(writer: &CapturingWriter) -> Session {
+        let mut session = test_session();
+        session.handle(&NetConn { event: NetConnEvent::Connected }, writer);
+        session.handle(&NetRx { payload: login_success_payload() }, writer);
+        session
+    }
+
+    fn test_session() -> Session {
+        let mut config = Config::default();
+        config.server.username = "testuser".into();
+        config.server.password = "testpass".into();
+        let ctx = AppContext::new(config, "/tmp/unused.yaml".into());
+        Session::new(&ctx, &CapturingWriter::default())
+    }
+
+    fn login_success_payload() -> Vec<u8> {
+        use soulseek_proto::wire::{put_bool, put_ipv4, put_string, put_u32};
+        let mut body = Vec::new();
+        put_u32(&mut body, 1); // login code
+        put_bool(&mut body, true);
+        put_string(&mut body, "Welcome!");
+        put_ipv4(&mut body, Ipv4Addr::new(203, 0, 113, 9));
+        put_string(&mut body, "0123456789abcdef0123456789abcdef");
+        put_bool(&mut body, false);
+        body
+    }
+
+    #[test]
+    fn connect_sends_byte_exact_login_frame() {
+        let writer = CapturingWriter::default();
+        let mut session = test_session();
+        session.handle(&NetConn { event: NetConnEvent::Connected }, &writer);
+
+        let expected = LoginRequest {
+            username: "testuser".into(),
+            password: "testpass".into(),
+            major_version: 160,
+            minor_version: 1,
+        }
+        .to_frame();
+        assert_eq!(writer.frames(), vec![expected]);
+        assert_eq!(writer.events(), vec![SessionEventKind::Connecting]);
+    }
+
+    #[test]
+    fn login_success_sets_wait_port_and_emits_logged_in() {
+        let writer = CapturingWriter::default();
+        let mut session = test_session();
+        session.handle(&NetConn { event: NetConnEvent::Connected }, &writer);
+        session.handle(&NetRx { payload: login_success_payload() }, &writer);
+
+        let frames = writer.frames();
+        assert_eq!(frames.len(), 2, "login + set wait port");
+        let expected_wait_port =
+            SetWaitPort { port: 2234, obfuscation_type: 0, obfuscated_port: 0 }.to_frame();
+        assert_eq!(frames[1], expected_wait_port);
+
+        assert!(matches!(
+            writer.events().last(),
+            Some(SessionEventKind::LoggedIn { greeting, own_ip })
+                if greeting == "Welcome!" && own_ip == "203.0.113.9"
+        ));
+    }
+
+    #[test]
+    fn login_failure_emits_reason_with_detail() {
+        use soulseek_proto::wire::{put_bool, put_string, put_u32};
+        let writer = CapturingWriter::default();
+        let mut session = test_session();
+        session.handle(&NetConn { event: NetConnEvent::Connected }, &writer);
+
+        let mut body = Vec::new();
+        put_u32(&mut body, 1);
+        put_bool(&mut body, false);
+        put_string(&mut body, "INVALIDPASS");
+        session.handle(&NetRx { payload: body }, &writer);
+
+        assert!(matches!(
+            writer.events().last(),
+            Some(SessionEventKind::LoginFailed { reason }) if reason == "INVALIDPASS"
+        ));
+    }
+
+    #[test]
+    fn search_before_login_returns_error_not_frames() {
+        let writer = CapturingWriter::default();
+        let mut session = test_session();
+        session.handle(
+            &StartSearch {
+                corr: 5,
+                source_label: "x".into(),
+                jobs: vec![SearchJob { raw_query: Some("q".into()), ..Default::default() }],
+            },
+            &writer,
+        );
+
+        assert!(writer.frames().is_empty());
+        let results = writer.search_results();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].corr, 5);
+        assert!(results[0].error.as_deref().unwrap().contains("not logged in"));
+    }
+
+    #[test]
+    fn search_when_logged_in_sends_one_frame_per_job_with_fresh_tokens() {
+        let writer = CapturingWriter::default();
+        let mut session = test_session();
+        session.handle(&NetConn { event: NetConnEvent::Connected }, &writer);
+        session.handle(&NetRx { payload: login_success_payload() }, &writer);
+
+        session.handle(
+            &StartSearch {
+                corr: 9,
+                source_label: "spotify".into(),
+                jobs: vec![
+                    SearchJob {
+                        artist: Some("A".into()),
+                        title: Some("One".into()),
+                        ..Default::default()
+                    },
+                    SearchJob { raw_query: Some("B Two".into()), ..Default::default() },
+                ],
+            },
+            &writer,
+        );
+
+        let frames = writer.frames();
+        // login + wait port + 2 searches
+        assert_eq!(frames.len(), 4);
+        assert_eq!(frames[2], FileSearchRequest { token: 1, query: "A One".into() }.to_frame());
+        assert_eq!(frames[3], FileSearchRequest { token: 2, query: "B Two".into() }.to_frame());
+
+        let results = writer.search_results();
+        assert_eq!(results[0].started.len(), 2);
+        assert_eq!(results[0].error, None);
+        assert!(writer
+            .events()
+            .iter()
+            .any(|e| matches!(e, SessionEventKind::SearchStarted { token: 1, query } if query == "A One")));
+    }
+
+    #[test]
+    fn search_broadcast_and_unknown_codes_become_events() {
+        use soulseek_proto::wire::{put_string, put_u32};
+        let writer = CapturingWriter::default();
+        let mut session = test_session();
+
+        let mut body = Vec::new();
+        put_u32(&mut body, 26); // file search code
+        put_string(&mut body, "bob");
+        put_u32(&mut body, 99);
+        put_string(&mut body, "some query");
+        session.handle(&NetRx { payload: body }, &writer);
+
+        let mut unknown = Vec::new();
+        put_u32(&mut unknown, 9999);
+        session.handle(&NetRx { payload: unknown }, &writer);
+
+        let events = writer.events();
+        assert!(matches!(
+            &events[0],
+            SessionEventKind::SearchBroadcastSeen { username, query }
+                if username == "bob" && query == "some query"
+        ));
+        assert!(matches!(
+            &events[1],
+            SessionEventKind::ProtocolNote { note } if note.contains("9999")
+        ));
+    }
+
+    #[test]
+    fn browse_before_login_is_rejected_without_network_traffic() {
+        let writer = CapturingWriter::default();
+        let mut session = test_session();
+        session.handle(&BrowseUser { corr: 7, username: "alice".into() }, &writer);
+
+        assert!(writer.frames().is_empty());
+        let accepts = writer.browse_accepts();
+        assert_eq!(accepts.len(), 1);
+        assert_eq!(accepts[0].corr, 7);
+        assert!(accepts[0].error.as_deref().unwrap().contains("not logged in"));
+    }
+
+    #[test]
+    fn browse_when_logged_in_requests_peer_address_and_accepts() {
+        let writer = CapturingWriter::default();
+        let mut session = logged_in_session(&writer);
+        session.handle(&BrowseUser { corr: 3, username: "  alice  ".into() }, &writer);
+
+        // login + wait port + GetPeerAddress request.
+        let frames = writer.frames();
+        assert_eq!(
+            frames.last().unwrap(),
+            &GetPeerAddressRequest { username: "alice".into() }.to_frame(),
+            "trimmed username is looked up"
+        );
+        let accepts = writer.browse_accepts();
+        assert_eq!(accepts.last().unwrap().error, None);
+    }
+
+    #[test]
+    fn peer_address_for_a_pending_browse_triggers_a_peer_connection() {
+        let writer = CapturingWriter::default();
+        let mut session = logged_in_session(&writer);
+        session.handle(&BrowseUser { corr: 1, username: "alice".into() }, &writer);
+        session.handle(
+            &NetRx { payload: get_peer_address_payload("alice", Ipv4Addr::new(198, 51, 100, 7), 2234) },
+            &writer,
+        );
+
+        let connects = writer.peer_browse_connects();
+        assert_eq!(connects.len(), 1);
+        assert_eq!(connects[0].username, "alice");
+        assert_eq!(connects[0].ip, "198.51.100.7");
+        assert_eq!(connects[0].port, 2234);
+        assert!(writer.browse_failures().is_empty());
+    }
+
+    #[test]
+    fn offline_peer_address_fails_the_browse() {
+        let writer = CapturingWriter::default();
+        let mut session = logged_in_session(&writer);
+        session.handle(&BrowseUser { corr: 1, username: "ghost".into() }, &writer);
+        session.handle(
+            &NetRx { payload: get_peer_address_payload("ghost", Ipv4Addr::UNSPECIFIED, 0) },
+            &writer,
+        );
+
+        assert!(writer.peer_browse_connects().is_empty());
+        let failures = writer.browse_failures();
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].reason.contains("offline"));
+    }
+
+    #[test]
+    fn unrelated_peer_address_stays_a_log_note() {
+        let writer = CapturingWriter::default();
+        let mut session = logged_in_session(&writer);
+        // No pending browse for this user → it should just be a protocol note.
+        session.handle(
+            &NetRx { payload: get_peer_address_payload("stranger", Ipv4Addr::new(1, 2, 3, 4), 99) },
+            &writer,
+        );
+        assert!(writer.peer_browse_connects().is_empty());
+        assert!(writer
+            .events()
+            .iter()
+            .any(|e| matches!(e, SessionEventKind::ProtocolNote { note } if note.contains("stranger"))));
+    }
+
+    #[test]
+    fn disconnect_resets_state_so_searches_fail_again() {
+        let writer = CapturingWriter::default();
+        let mut session = test_session();
+        session.handle(&NetConn { event: NetConnEvent::Connected }, &writer);
+        session.handle(&NetRx { payload: login_success_payload() }, &writer);
+        session.handle(
+            &NetConn { event: NetConnEvent::Closed { reason: "eof".into() } },
+            &writer,
+        );
+
+        session.handle(
+            &StartSearch {
+                corr: 1,
+                source_label: "x".into(),
+                jobs: vec![SearchJob { raw_query: Some("q".into()), ..Default::default() }],
+            },
+            &writer,
+        );
+        assert!(writer.search_results()[0].error.is_some());
+        assert!(writer
+            .events()
+            .iter()
+            .any(|e| matches!(e, SessionEventKind::Disconnected { reason } if reason == "eof")));
+    }
+}

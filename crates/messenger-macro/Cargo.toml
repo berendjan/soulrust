@@ -1,0 +1,13 @@
+[package]
+name = "messenger-macro"
+version = "0.1.0"
+edition = "2021"
+description = "Generates message-routing traits and a messenger struct from a component spec, replacing the Go interface-gen-v2/messenger-gen-v2 codegen tools."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }

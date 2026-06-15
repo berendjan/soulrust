@@ -1,0 +1,26 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "soulseek_proto",
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    deps = [
+        "@crates//:flate2",
+        "@crates//:md5",
+    ],
+)
+
+rust_test(
+    name = "soulseek_proto_test",
+    crate = ":soulseek_proto",
+)
+
+# Cross-implementation conformance test: our codec vs byte vectors generated
+# from Nicotine+ (tests/fixtures/nicotine_vectors.rs is include!()'d, so it is
+# compile_data rather than a compiled source).
+rust_test(
+    name = "nicotine_vectors_test",
+    srcs = ["tests/nicotine_vectors.rs"],
+    compile_data = ["tests/fixtures/nicotine_vectors.rs"],
+    deps = [":soulseek_proto"],
+)

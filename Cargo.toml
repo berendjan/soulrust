@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/messenger-macro",
+    "crates/messenger-tests",
+    "crates/soulrust",
+    "crates/soulrust-integration-tests",
+    "crates/soulseek-proto",
+]

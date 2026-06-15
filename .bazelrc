@@ -1,0 +1,7 @@
+build --incompatible_strict_action_env
+test --test_output=errors
+
+# Docker-backed integration tests are opt-in: `bazel test --config=docker ...`
+test --test_tag_filters=-docker
+test:docker --test_tag_filters=docker
+test:docker --test_env=DOCKER_HOST --test_env=HOME --test_env=XDG_RUNTIME_DIR --test_env=TESTCONTAINERS_RYUK_DISABLED

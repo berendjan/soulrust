@@ -1,0 +1,39 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "soulrust_integration_tests",
+    srcs = glob(["src/**/*.rs"]),
+    deps = [
+        "//crates/soulrust",
+        "//crates/soulseek-proto:soulseek_proto",
+        "@crates//:testcontainers",
+        "@crates//:ureq",
+    ],
+)
+
+[
+    rust_test(
+        name = test_name,
+        srcs = ["tests/%s.rs" % test_name],
+        # `local` keeps the test out of the sandbox so the Docker socket and
+        # ~/.docker config are reachable; the `docker` tag lets .bazelrc filter
+        # these out of default `bazel test //...` runs.
+        tags = [
+            "docker",
+            "local",
+            "requires-network",
+        ],
+        deps = [
+            ":soulrust_integration_tests",
+            "//crates/soulrust",
+            "//crates/soulseek-proto:soulseek_proto",
+            "@crates//:rust-messenger",
+            "@crates//:testcontainers",
+            "@crates//:ureq",
+        ],
+    )
+    for test_name in [
+        "soulfind_protocol",
+        "soulfind_app",
+    ]
+]

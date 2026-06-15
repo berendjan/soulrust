@@ -1,0 +1,9 @@
+[package]
+name = "soulseek-proto"
+version = "0.1.0"
+edition = "2021"
+description = "Sans-IO implementation of the Soulseek (slsk) wire protocol: framing, primitive encoding, and message types, following the Nicotine+ SLSKPROTOCOL documentation."
+
+[dependencies]
+flate2 = "1"
+md5 = "0.7"
