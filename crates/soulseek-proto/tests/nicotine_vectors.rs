@@ -74,11 +74,11 @@ fn shared_file_list_request_body_matches_nicotine() {
 }
 
 #[test]
-fn set_wait_port_is_a_documented_superset_of_nicotine() {
-    // Deliberate divergence: Nicotine+ sends the port ONLY and does not
-    // implement obfuscated connections, while we send the spec's full
-    // port + obfuscation_type + obfuscated_port (SoulseekQt does too, and the
-    // server accepts both). Nicotine+'s bytes must be our prefix.
+fn set_wait_port_is_a_soulseekqt_superset_of_nicotine() {
+    // We send the SoulseekQt form: port + obfuscation_type + obfuscated_port.
+    // Nicotine+ sends the port ALONE (slskmessages.py: `__slots__ = ("port",)`),
+    // so the executed-oracle fixture SET_WAIT_PORT_BODY is just the 4-byte port.
+    // The server accepts both; Nicotine+'s bytes must be the prefix of ours.
     let ours = body(&SetWaitPort { port: 2234, obfuscation_type: 0, obfuscated_port: 0 });
     assert_eq!(&ours[..vectors::SET_WAIT_PORT_BODY.len()], vectors::SET_WAIT_PORT_BODY);
     assert_eq!(ours.len(), 12, "port + obfuscation_type + obfuscated_port");

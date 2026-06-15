@@ -73,6 +73,23 @@ impl<'a> Reader<'a> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
 
+    /// Decodes a Soulseek file size. The original Soulseek NS client has a bug
+    /// where files larger than 2 GiB are transmitted with the low 32 bits
+    /// holding the real size and the high 32 bits set to `0xFFFFFFFF` (garbage),
+    /// which a naive `u64` read inflates to ~16 EiB. Nicotine+'s
+    /// `SlskMessage.unpack_file_size` detects this by checking the
+    /// most-significant byte (wire offset +7): if it is `255`, only the low 32
+    /// bits are the size and the high word is discarded. Eight bytes are always
+    /// consumed either way.
+    pub fn file_size(&mut self) -> Result<u64, DecodeError> {
+        let bytes = self.take(8)?;
+        if bytes[7] == 255 {
+            Ok(u32::from_le_bytes(bytes[..4].try_into().unwrap()) as u64)
+        } else {
+            Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+        }
+    }
+
     pub fn bool(&mut self) -> Result<bool, DecodeError> {
         Ok(self.u8()? != 0)
     }
@@ -201,6 +218,100 @@ mod tests {
         let mut buf = Vec::new();
         put_string(&mut buf, "teststring");
         assert_eq!(buf, b"\x0a\x00\x00\x00teststring");
+    }
+
+    #[test]
+    fn bool_decodes_any_nonzero_byte_as_true() {
+        // Nicotine+ unpack_bool is `bool(self._message[self._offset])`: it reads
+        // a single byte and treats any nonzero value as true, not only 0x01.
+        let buf = [0x00u8, 0x01, 0xFF];
+        let mut r = Reader::new(&buf);
+        assert!(!r.bool().unwrap());
+        assert!(r.bool().unwrap());
+        assert!(r.bool().unwrap());
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn u16_reader_is_little_endian_and_two_bytes_wide() {
+        // Nicotine+ UINT16_UNPACK is Struct("<H"): two little-endian bytes.
+        // (Its unpack_uint16 advances the internal offset by 4, but that only
+        // works because obfuscated_port — the sole uint16 — is the last field
+        // in its message; the field itself is two bytes on the wire.) Pin that
+        // our reader consumes exactly two bytes by reading a trailing u8 after.
+        let mut buf = Vec::new();
+        put_u16(&mut buf, 0x0102);
+        put_u8(&mut buf, 0x7B);
+        assert_eq!(buf, [0x02, 0x01, 0x7B]);
+
+        let mut r = Reader::new(&buf);
+        assert_eq!(r.u16().unwrap(), 0x0102);
+        assert_eq!(r.u8().unwrap(), 0x7B);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn u64_round_trips_full_width() {
+        // Nicotine+ UINT64_UNPACK is Struct("<Q"): eight little-endian bytes.
+        let mut buf = Vec::new();
+        put_u64(&mut buf, 0x0102_0304_0506_0708);
+        assert_eq!(buf, [0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+
+        let mut r = Reader::new(&buf);
+        assert_eq!(r.u64().unwrap(), 0x0102_0304_0506_0708);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn empty_string_round_trips() {
+        // Nicotine+ pack_string of "" encodes UINT32_PACK(0) with no payload;
+        // unpack_string then decodes a zero-length slice to "".
+        let mut buf = Vec::new();
+        put_string(&mut buf, "");
+        assert_eq!(buf, [0x00, 0x00, 0x00, 0x00]);
+
+        let mut r = Reader::new(&buf);
+        assert_eq!(r.string().unwrap(), "");
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn ipv4_is_stored_little_endian_octet_order_on_the_wire() {
+        // Nicotine+ unpack_ip reverses the four wire bytes before inet_ntoa:
+        // `inet_ntoa(self._message[start:start+4].tobytes()[::-1])`. So the
+        // first octet of the dotted address is the LAST byte on the wire.
+        // For 192.168.1.2 the wire bytes are therefore [2, 1, 168, 192].
+        let mut buf = Vec::new();
+        put_ipv4(&mut buf, Ipv4Addr::new(192, 168, 1, 2));
+        assert_eq!(buf, [0x02, 0x01, 0xA8, 0xC0]);
+
+        let mut r = Reader::new(&buf);
+        assert_eq!(r.ipv4().unwrap(), Ipv4Addr::new(192, 168, 1, 2));
+    }
+
+    #[test]
+    fn file_size_applies_soulseek_ns_overflow_workaround() {
+        // Nicotine+ unpack_file_size (slskmessages.py:3208): if the
+        // most-significant byte (offset +7) is 255, the high word is garbage
+        // from the Soulseek NS >2 GiB bug, so only the low 32 bits are the size.
+        // Wire bytes: low word = 4096, high word = 0xFFFFFFFF.
+        let buf = [0x00, 0x10, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF];
+        let mut r = Reader::new(&buf);
+        assert_eq!(r.file_size().unwrap(), 4096);
+        assert!(r.is_empty(), "all 8 bytes are consumed even in the bug case");
+    }
+
+    #[test]
+    fn file_size_keeps_genuine_large_values_intact() {
+        // When the top byte is not 255 the value is a real uint64 and must be
+        // read at full width — a legitimate >2 GiB file (3 GiB here) is not
+        // truncated. Matches Nicotine+'s `else: unpack_uint64()` branch.
+        let mut buf = Vec::new();
+        put_u64(&mut buf, 3 * 1024 * 1024 * 1024);
+        assert_eq!(buf[7], 0x00, "top byte is not the bug sentinel");
+        let mut r = Reader::new(&buf);
+        assert_eq!(r.file_size().unwrap(), 3 * 1024 * 1024 * 1024);
+        assert!(r.is_empty());
     }
 
     #[test]

@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use rust_messenger::traits;
 use rust_messenger::traits::extended::Sender;
-use soulseek_proto::frame::{split_frame, MAX_FRAME_LEN};
+use soulseek_proto::frame::{split_frame_capped, MAX_LARGE_PEER_MESSAGE_LEN};
 use soulseek_proto::peer::{ConnectionType, PeerInit};
 use soulseek_proto::peer_message::{GetSharedFileList, PeerMessage, SharedFileListResponse};
 
@@ -117,11 +117,10 @@ fn browse_over_stream<S: Read + Write>(
             return Err("peer closed the connection before sending its share list".into());
         }
         pending.extend_from_slice(&chunk[..n]);
-        if pending.len() > MAX_FRAME_LEN {
-            return Err("peer sent an oversized share list".into());
-        }
         loop {
-            match split_frame(&pending) {
+            // A SharedFileListResponse is a "large" peer message; split_frame_capped
+            // rejects a declared length beyond that cap before we buffer it.
+            match split_frame_capped(&pending, MAX_LARGE_PEER_MESSAGE_LEN) {
                 Ok(Some((payload, rest))) => {
                     let consumed = pending.len() - rest.len();
                     match PeerMessage::decode(payload) {
@@ -169,6 +168,7 @@ fn to_listing(username: &str, response: &SharedFileListResponse) -> BrowseListin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soulseek_proto::frame::split_frame;
     use soulseek_proto::peer::PeerInitMessage;
     use soulseek_proto::peer_message::{SharedDirectory, SharedFile};
     use std::io::Cursor;

@@ -114,7 +114,9 @@ fn read_directories(r: &mut Reader) -> Result<Vec<SharedDirectory>, DecodeError>
         for _ in 0..file_count {
             let _code = r.u8()?; // always 1, unused
             let name = r.string()?;
-            let size = r.u64()?;
+            // Nicotine+'s `unpack_file_size` workaround for the Soulseek NS
+            // >2 GiB bug, not a plain u64.
+            let size = r.file_size()?;
             let extension = r.string()?;
             let attr_count = r.u32()? as usize;
             let mut attributes = Vec::with_capacity(attr_count.min(MAX_PREALLOC));
@@ -337,6 +339,47 @@ mod tests {
         assert_eq!(resp.private_directories[0].path, "Buddies Only");
         assert_eq!(resp.private_directories[0].files[0].name, "secret.mp3");
         assert_eq!(resp.private_directories[0].files[0].size, 4096);
+    }
+
+    #[test]
+    fn oversized_file_size_uses_soulseek_ns_workaround() {
+        // A buggy Soulseek NS peer sends a >2 GiB file with the low word holding
+        // the real size and the high word set to 0xFFFFFFFF. Nicotine+'s
+        // `unpack_file_size` (slskmessages.py:3208) detects offset+7 == 255 and
+        // keeps only the low 32 bits. Without the workaround this size would
+        // decode as ~16 EiB; we pin the corrected value here.
+        let mut raw = Vec::new();
+        put_u32(&mut raw, 1);
+        put_string(&mut raw, "Music");
+        put_u32(&mut raw, 1);
+        put_u8(&mut raw, 1);
+        put_string(&mut raw, "huge.flac");
+        // size: low word = 100 MiB, high word = 0xFFFFFFFF garbage.
+        put_u32(&mut raw, 100 * 1024 * 1024);
+        put_u32(&mut raw, 0xFFFF_FFFF);
+        put_string(&mut raw, ""); // empty ext
+        put_u32(&mut raw, 0); // no attributes
+
+        let frame = frame_u32(code::SHARED_FILE_LIST, &zlib_compress(&raw));
+        let (payload, _) = split_frame(&frame).unwrap().unwrap();
+        let PeerMessage::SharedFileList(resp) = PeerMessage::decode(payload).unwrap() else {
+            panic!("expected a shared file list");
+        };
+        assert_eq!(resp.directories[0].files[0].size, 100 * 1024 * 1024);
+    }
+
+    #[test]
+    fn empty_share_list_round_trips() {
+        // Nicotine+ sends `pack_uint32(0)` for the folder count when a peer has
+        // no shares (or its share DB fails to read); decoding yields an empty
+        // tree, not an error. Pin the fully-empty round trip.
+        let original = SharedFileListResponse::default();
+        let frame = original.to_frame();
+        let (payload, _) = split_frame(&frame).unwrap().unwrap();
+        assert_eq!(
+            PeerMessage::decode(payload).unwrap(),
+            PeerMessage::SharedFileList(original)
+        );
     }
 
     #[test]

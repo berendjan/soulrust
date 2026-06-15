@@ -106,6 +106,11 @@ impl ServerRequest for SetWaitPort {
     const CODE: u32 = code::SET_WAIT_PORT;
 
     fn encode_body(&self, buf: &mut Vec<u8>) {
+        // SoulseekQt form: the port followed by the obfuscation fields. We don't
+        // implement obfuscated connections, so obfuscation_type and
+        // obfuscated_port are 0, but we send them as SoulseekQt does. Nicotine+
+        // instead sends the port alone; the server accepts both (verified by the
+        // soulfind_protocol integration test).
         put_u32(buf, self.port);
         put_u32(buf, self.obfuscation_type);
         put_u32(buf, self.obfuscated_port);
@@ -252,6 +257,8 @@ mod tests {
 
     #[test]
     fn set_wait_port_frame_is_byte_exact() {
+        // SoulseekQt form: port + obfuscation_type + obfuscated_port (three
+        // u32s). Body is 12 bytes, frame length = code(4) + body(12) = 16.
         let frame = SetWaitPort { port: 2234, obfuscation_type: 0, obfuscated_port: 0 }.to_frame();
         assert_eq!(
             frame,
@@ -357,6 +364,57 @@ mod tests {
                 port: 2234,
                 obfuscation_type: 1,
                 obfuscated_port: 2235,
+            })
+        );
+    }
+
+    #[test]
+    fn get_peer_address_response_decodes_offline_user_as_zeroes() {
+        // Nicotine+'s GetPeerAddress.parse_network_message does no special-casing:
+        // it unpacks user/ip/port/obfuscation_type/obfuscated_port straight off
+        // the wire (slskmessages.py). The server signals an offline/unknown user
+        // with 0.0.0.0 and port 0, which must decode to the zero values verbatim
+        // (unpack_ip of four zero bytes is "0.0.0.0", unpack_uint16 of 0 is 0).
+        let mut body = Vec::new();
+        put_u32(&mut body, code::GET_PEER_ADDRESS);
+        put_string(&mut body, "ghost");
+        put_ipv4(&mut body, Ipv4Addr::new(0, 0, 0, 0));
+        put_u32(&mut body, 0); // port
+        put_u32(&mut body, 0); // obfuscation type
+        put_u16(&mut body, 0); // obfuscated port
+        assert_eq!(
+            ServerMessage::decode(&body).unwrap(),
+            ServerMessage::GetPeerAddress(GetPeerAddressResponse {
+                username: "ghost".into(),
+                ip: Ipv4Addr::new(0, 0, 0, 0),
+                port: 0,
+                obfuscation_type: 0,
+                obfuscated_port: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn login_success_response_decodes_supporter_true() {
+        // The is_supporter trailing field is a bool: Nicotine+ reads it with
+        // unpack_bool, so any nonzero byte is true. The existing success test
+        // pins the false branch; pin the true branch here so a flipped/dropped
+        // trailing bool is caught.
+        let mut body = Vec::new();
+        put_u32(&mut body, code::LOGIN);
+        put_bool(&mut body, true);
+        put_string(&mut body, "Welcome to Soulseek!");
+        put_ipv4(&mut body, Ipv4Addr::new(203, 0, 113, 7));
+        put_string(&mut body, "0123456789abcdef0123456789abcdef");
+        put_bool(&mut body, true);
+
+        assert_eq!(
+            ServerMessage::decode(&body).unwrap(),
+            ServerMessage::Login(LoginResponse::Success {
+                greeting: "Welcome to Soulseek!".into(),
+                own_ip: Ipv4Addr::new(203, 0, 113, 7),
+                password_md5: "0123456789abcdef0123456789abcdef".into(),
+                is_supporter: true,
             })
         );
     }

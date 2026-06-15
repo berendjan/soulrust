@@ -31,5 +31,8 @@ pub mod peer_message;
 pub mod server;
 pub mod wire;
 
-pub use frame::{split_frame, FrameError, MAX_FRAME_LEN};
+pub use frame::{
+    split_frame, split_frame_capped, FrameError, MAX_LARGE_PEER_MESSAGE_LEN,
+    MAX_PEER_INIT_MESSAGE_LEN, MAX_PEER_MESSAGE_LEN, MAX_SERVER_MESSAGE_LEN,
+};
 pub use wire::{DecodeError, Reader};
