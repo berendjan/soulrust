@@ -9,7 +9,6 @@
 
 use crate::components::browse::Browse;
 use crate::components::net_edge::NetEdge;
-use crate::components::peer_edge::PeerEdge;
 use crate::components::peer_net::PeerNet;
 use crate::components::session::Session;
 use crate::components::ui::Ui;
@@ -20,9 +19,9 @@ use crate::extract::ExtractorComponent;
 use crate::messages::{
     ApplyUpdateReq, ApplyUpdateResult, BrowseAccepted, BrowseFailed, BrowseHtml, BrowseListing,
     BrowseRenderReq, BrowseUser, ConfigChanged, ConfigSnapshot, ExtractRequest, ExtractResult,
-    GetConfigReq, HttpHtml, HttpRender, NetConn, NetRx, NetTx, PeerActivity, PeerBrowseConnect,
-    SetConfigReq, SetConfigResult, SessionEvent, StartSearch, StartSearchResult, UpdateDownloaded,
-    UpdaterStatusChanged,
+    GetConfigReq, HttpHtml, HttpRender, IncomingSearch, NetConn, NetRx, NetTx, PeerActivity,
+    PeerBrowseConnect, PeerPierce, SetConfigReq, SetConfigResult, SessionEvent, StartSearch,
+    StartSearchResult, UpdateDownloaded, UpdaterStatusChanged,
 };
 
 rust_messenger::Messenger! {
@@ -34,7 +33,6 @@ rust_messenger::Messenger! {
             updater: Updater,
             ui: Ui,
             net_edge: NetEdge,
-            peer_edge: PeerEdge,
             peer_net: PeerNet,
             browse: Browse,
             web_bridge: WebBridge,
@@ -53,19 +51,24 @@ rust_messenger::Messenger! {
             ConfigStore, ConfigSnapshot: [ web_bridge ],
             ConfigStore, SetConfigResult: [ web_bridge ],
             Updater, ApplyUpdateResult: [ web_bridge ],
-            // soulseek socket <-> session
+            // soulseek socket <-> session; peer_net also sends server frames
+            // (ConnectToPeer relay requests for search delivery).
             NetEdge, NetConn: [ session ],
             NetEdge, NetRx: [ session ],
             Session, NetTx: [ net_edge ],
-            // browse: bridge -> session -> peer edge -> browse read-model
+            PeerNet, NetTx: [ net_edge ],
+            // browse: bridge -> session -> peer_net -> browse read-model
             WebBridge, BrowseUser: [ session ],
             Session, BrowseAccepted: [ web_bridge ],
-            Session, PeerBrowseConnect: [ peer_edge ],
+            Session, PeerBrowseConnect: [ peer_net ],
             Session, BrowseFailed: [ browse ],
-            PeerEdge, BrowseListing: [ browse ],
-            PeerEdge, BrowseFailed: [ browse ],
+            PeerNet, BrowseListing: [ browse ],
+            PeerNet, BrowseFailed: [ browse ],
             WebBridge, BrowseRenderReq: [ browse ],
             Browse, BrowseHtml: [ web_bridge ],
+            // serving: incoming searches matched + delivered; firewall pierces
+            Session, IncomingSearch: [ peer_net ],
+            Session, PeerPierce: [ peer_net ],
             // peer network edge: serving activity -> ui log
             PeerNet, PeerActivity: [ ui ],
             // broadcasts

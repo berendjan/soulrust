@@ -57,6 +57,8 @@ rust_messenger::messenger_id_enum!(
         BrowseRenderReq = 25,
         BrowseHtml = 26,
         PeerActivity = 27,
+        IncomingSearch = 28,
+        PeerPierce = 29,
     }
 );
 
@@ -330,6 +332,26 @@ pub struct PeerActivity {
     pub note: String,
 }
 
+/// session → peer_net: a search relayed by the server. peer_net matches it
+/// against our shares and, on a hit, delivers a FileSearchResponse to the
+/// searcher (queue + ConnectToPeer relay).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncomingSearch {
+    pub username: String,
+    pub token: u32,
+    pub query: String,
+}
+
+/// session → peer_net: a server ConnectToPeer — a (likely firewalled) peer
+/// wants to reach us. We connect to `ip:port` and send PierceFirewall(token).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerPierce {
+    pub username: String,
+    pub ip: String,
+    pub port: u16,
+    pub token: u32,
+}
+
 // ---------------------------------------------------------------------------
 // bus plumbing: Message + ExtendedMessage + deserialize_from for every type
 
@@ -393,6 +415,8 @@ impl_bus_message!(
     BrowseRenderReq => MessageId::BrowseRenderReq,
     BrowseHtml => MessageId::BrowseHtml,
     PeerActivity => MessageId::PeerActivity,
+    IncomingSearch => MessageId::IncomingSearch,
+    PeerPierce => MessageId::PeerPierce,
 );
 
 #[cfg(test)]

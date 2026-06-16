@@ -7,6 +7,7 @@ use std::collections::HashSet;
 
 use rust_messenger::traits;
 use rust_messenger::traits::extended::Sender;
+use soulseek_proto::peer::ConnectionType;
 use soulseek_proto::server::{
     FileSearchRequest, GetPeerAddressRequest, LoginRequest, ServerMessage, ServerRequest,
     SetWaitPort,
@@ -14,9 +15,9 @@ use soulseek_proto::server::{
 
 use crate::config::AppContext;
 use crate::messages::{
-    BrowseAccepted, BrowseFailed, BrowseUser, HandlerId, NetConn, NetConnEvent, NetRx, NetTx,
-    PeerBrowseConnect, SessionEvent, SessionEventKind, StartSearch, StartSearchResult,
-    StartedSearch,
+    BrowseAccepted, BrowseFailed, BrowseUser, HandlerId, IncomingSearch, NetConn, NetConnEvent,
+    NetRx, NetTx, PeerBrowseConnect, PeerPierce, SessionEvent, SessionEventKind, StartSearch,
+    StartSearchResult, StartedSearch,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +130,16 @@ impl traits::core::Handle<NetRx> for Session {
                 Self::emit(SessionEventKind::LoginFailed { reason }, writer);
             }
             ServerMessage::FileSearch(broadcast) => {
+                // Hand the search to peer_net to match against our shares and
+                // deliver results to the searcher.
+                Self::send(
+                    &IncomingSearch {
+                        username: broadcast.username.clone(),
+                        token: broadcast.token,
+                        query: broadcast.query.clone(),
+                    },
+                    writer,
+                );
                 Self::emit(
                     SessionEventKind::SearchBroadcastSeen {
                         username: broadcast.username,
@@ -171,17 +182,30 @@ impl traits::core::Handle<NetRx> for Session {
                 }
             }
             ServerMessage::ConnectToPeer(request) => {
-                // Stage 2c will hand this to the peer reactor (indirect connect
-                // + PierceFirewall); for now just surface it.
-                Self::emit(
-                    SessionEventKind::ProtocolNote {
-                        note: format!(
-                            "connect-to-peer request from {} ({})",
-                            request.username, request.connection_type
-                        ),
-                    },
-                    writer,
-                );
+                // A (likely firewalled) peer wants to reach us. For peer ('P')
+                // connections, hand it to peer_net to dial back + pierce. File
+                // and distributed connections are handled in later stages.
+                if request.connection_type == ConnectionType::Peer {
+                    Self::send(
+                        &PeerPierce {
+                            username: request.username,
+                            ip: request.ip.to_string(),
+                            port: request.port as u16,
+                            token: request.token,
+                        },
+                        writer,
+                    );
+                } else {
+                    Self::emit(
+                        SessionEventKind::ProtocolNote {
+                            note: format!(
+                                "connect-to-peer ({}) from {} not yet handled",
+                                request.connection_type, request.username
+                            ),
+                        },
+                        writer,
+                    );
+                }
             }
             ServerMessage::ExcludedSearchPhrases(excluded) => {
                 Self::emit(
@@ -350,6 +374,14 @@ mod tests {
 
         fn browse_failures(&self) -> Vec<BrowseFailed> {
             self.decode(MessageId::BrowseFailed, BrowseFailed::deserialize_from)
+        }
+
+        fn incoming_searches(&self) -> Vec<IncomingSearch> {
+            self.decode(MessageId::IncomingSearch, IncomingSearch::deserialize_from)
+        }
+
+        fn pierces(&self) -> Vec<PeerPierce> {
+            self.decode(MessageId::PeerPierce, PeerPierce::deserialize_from)
         }
 
         fn decode<T>(&self, id: MessageId, f: impl Fn(&[u8]) -> T) -> Vec<T> {
@@ -623,6 +655,50 @@ mod tests {
             .events()
             .iter()
             .any(|e| matches!(e, SessionEventKind::ProtocolNote { note } if note.contains("stranger"))));
+    }
+
+    #[test]
+    fn file_search_broadcast_is_forwarded_as_incoming_search() {
+        use soulseek_proto::wire::{put_string, put_u32};
+        let writer = CapturingWriter::default();
+        let mut session = test_session();
+        let mut body = Vec::new();
+        put_u32(&mut body, 26); // FileSearch
+        put_string(&mut body, "bob");
+        put_u32(&mut body, 99);
+        put_string(&mut body, "rust album");
+        session.handle(&NetRx { payload: body }, &writer);
+
+        let searches = writer.incoming_searches();
+        assert_eq!(searches.len(), 1);
+        assert_eq!(searches[0].username, "bob");
+        assert_eq!(searches[0].token, 99);
+        assert_eq!(searches[0].query, "rust album");
+    }
+
+    #[test]
+    fn connect_to_peer_for_a_peer_connection_triggers_a_pierce() {
+        use soulseek_proto::wire::{put_bool, put_ipv4, put_string, put_u32};
+        let writer = CapturingWriter::default();
+        let mut session = test_session();
+        let mut body = Vec::new();
+        put_u32(&mut body, 18); // ConnectToPeer
+        put_string(&mut body, "carol");
+        put_string(&mut body, "P");
+        put_ipv4(&mut body, Ipv4Addr::new(10, 0, 0, 5));
+        put_u32(&mut body, 2234);
+        put_u32(&mut body, 555); // token
+        put_bool(&mut body, false); // privileged
+        put_u32(&mut body, 0); // obfuscation type
+        put_u32(&mut body, 0); // obfuscated port
+        session.handle(&NetRx { payload: body }, &writer);
+
+        let pierces = writer.pierces();
+        assert_eq!(pierces.len(), 1);
+        assert_eq!(pierces[0].username, "carol");
+        assert_eq!(pierces[0].ip, "10.0.0.5");
+        assert_eq!(pierces[0].port, 2234);
+        assert_eq!(pierces[0].token, 555);
     }
 
     #[test]
