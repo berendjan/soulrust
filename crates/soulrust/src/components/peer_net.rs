@@ -15,14 +15,13 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rust_messenger::traits;
 use rust_messenger::traits::extended::Sender;
-use soulseek_proto::frame::{MAX_LARGE_PEER_MESSAGE_LEN, MAX_PEER_INIT_MESSAGE_LEN};
+use soulseek_proto::frame::{MAX_PEER_INIT_MESSAGE_LEN, MAX_PEER_MESSAGE_LEN};
 use soulseek_proto::peer::PeerInitMessage;
-use soulseek_proto::peer_message::{
-    FolderContentsResponse, PeerMessage, SharedDirectory, UserInfoResponse,
-};
+use soulseek_proto::peer_message::{PeerMessage, UserInfoResponse};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -30,20 +29,22 @@ use crate::config::AppContext;
 use crate::messages::{HandlerId, PeerActivity};
 use crate::shares::ShareIndex;
 
+/// Drop a peer connection that sends nothing for this long, so idle/slow peers
+/// can't pin connection + task resources indefinitely.
+const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub struct PeerNet {
     listen_port: u16,
-    /// Read-mostly share snapshot, shared with each connection task. (Rescans
-    /// will swap the Arc; not implemented yet.)
-    shares: Arc<ShareIndex>,
+    /// Folders to share; scanned on the reactor thread (not here) so a large or
+    /// slow filesystem walk can't block messenger startup.
+    folders: Vec<PathBuf>,
 }
 
 impl PeerNet {
     pub fn new<W: traits::core::Writer>(ctx: &AppContext, _writer: &W) -> Self {
-        let folders: Vec<PathBuf> =
-            ctx.config.sharing.folders.iter().map(PathBuf::from).collect();
         PeerNet {
             listen_port: ctx.config.server.listen_port as u16,
-            shares: Arc::new(ShareIndex::scan(&folders)),
+            folders: ctx.config.sharing.folders.iter().map(PathBuf::from).collect(),
         }
     }
 }
@@ -54,58 +55,69 @@ impl traits::core::Handler for PeerNet {
 
     fn on_start<W: traits::core::Writer>(&mut self, writer: &W) {
         let port = self.listen_port;
-        let shares = self.shares.clone();
+        let folders = std::mem::take(&mut self.folders);
         let writer = writer.clone();
         std::thread::Builder::new()
             .name("soulrust-peer-net".into())
-            .spawn(move || run_reactor(port, shares, writer))
+            .spawn(move || run_reactor(port, folders, writer))
             .expect("spawning peer-net reactor thread");
     }
 }
 
-fn activity<W: traits::core::Writer>(writer: &W, note: String) {
+/// One-time/low-frequency status onto the bus (listener bound, fatal errors).
+/// Per-connection and per-request activity goes to stderr instead — it is
+/// peer-driven and unbounded, and must never be able to outrun the bounded bus
+/// reader and trigger a "fell behind" panic in the core worker.
+fn status<W: traits::core::Writer>(writer: &W, note: String) {
     PeerNet::send(&PeerActivity { note }, writer);
 }
 
-fn run_reactor<W: traits::core::Writer>(port: u16, shares: Arc<ShareIndex>, writer: W) {
+fn run_reactor<W: traits::core::Writer>(port: u16, folders: Vec<PathBuf>, writer: W) {
     let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(err) => {
-            activity(&writer, format!("peer reactor failed to start: {err}"));
+            status(&writer, format!("peer reactor failed to start: {err}"));
             return;
         }
     };
-    runtime.block_on(reactor_loop(port, shares, writer));
+    runtime.block_on(reactor_loop(port, folders, writer));
 }
 
-async fn reactor_loop<W: traits::core::Writer>(port: u16, shares: Arc<ShareIndex>, writer: W) {
+async fn reactor_loop<W: traits::core::Writer>(port: u16, folders: Vec<PathBuf>, writer: W) {
+    // Scan here, on the reactor thread, off the startup path. Warm the cached
+    // browse frame so the first browse request doesn't pay the build+compress.
+    let shares = Arc::new(ShareIndex::scan(&folders));
+    let _ = shares.browse_frame();
+
     let listener = match TcpListener::bind(("0.0.0.0", port)).await {
         Ok(listener) => listener,
         Err(err) => {
             // Non-fatal: the rest of the app still runs (we just won't be
             // reachable by peers). Common in dev when the port is taken.
-            activity(&writer, format!("cannot listen for peers on port {port}: {err}"));
+            status(&writer, format!("cannot listen for peers on port {port}: {err}"));
             return;
         }
     };
-    activity(&writer, format!("listening for peers on port {port}"));
+    status(&writer, format!("sharing {} file(s); listening for peers on port {port}", shares.num_files()));
 
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
                 let shares = shares.clone();
-                let writer = writer.clone();
                 tokio::spawn(async move {
-                    let result =
-                        serve_connection(stream, &shares, |note| activity(&writer, note)).await;
-                    if let Err(err) = result {
-                        activity(&writer, format!("peer {addr} connection ended: {err}"));
+                    if let Err(err) =
+                        serve_connection(stream, &shares, |note| eprintln!("[peer-net {addr}] {note}"))
+                            .await
+                    {
+                        eprintln!("[peer-net {addr}] connection ended: {err}");
                     }
                 });
             }
             Err(err) => {
-                activity(&writer, format!("peer accept failed: {err}"));
-                break;
+                // Transient errors (EMFILE, ECONNABORTED) must not kill the
+                // listener for the process lifetime — log, back off, retry.
+                eprintln!("[peer-net] accept error: {err}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
     }
@@ -136,6 +148,20 @@ async fn read_frame<R: AsyncRead + Unpin>(
     Ok(Some(payload))
 }
 
+/// [`read_frame`] with an idle timeout: returns `Ok(None)` if the peer sends
+/// nothing for `idle`, so a silent/slow connection is dropped rather than
+/// leaking its task and socket.
+async fn read_frame_timeout<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max_len: usize,
+    idle: Duration,
+) -> std::io::Result<Option<Vec<u8>>> {
+    match tokio::time::timeout(idle, read_frame(reader, max_len)).await {
+        Ok(result) => result,
+        Err(_elapsed) => Ok(None),
+    }
+}
+
 /// Serves one accepted peer connection: read the peer-init handshake, then
 /// answer browse / user-info / folder-contents requests from `shares` until the
 /// peer disconnects. `on_activity` reports notable events (a bus emit in
@@ -149,7 +175,9 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     F: FnMut(String),
 {
-    let Some(init_payload) = read_frame(&mut stream, MAX_PEER_INIT_MESSAGE_LEN).await? else {
+    let Some(init_payload) =
+        read_frame_timeout(&mut stream, MAX_PEER_INIT_MESSAGE_LEN, PEER_IDLE_TIMEOUT).await?
+    else {
         return Ok(());
     };
     let peer = match PeerInitMessage::decode(&init_payload) {
@@ -159,13 +187,17 @@ where
     };
     on_activity(format!("peer {peer} connected"));
 
-    while let Some(payload) = read_frame(&mut stream, MAX_LARGE_PEER_MESSAGE_LEN).await? {
+    // Incoming requests are small; cap them at the medium peer limit rather than
+    // the 448 MiB large-response cap (which is for browse/search *responses*).
+    while let Some(payload) =
+        read_frame_timeout(&mut stream, MAX_PEER_MESSAGE_LEN, PEER_IDLE_TIMEOUT).await?
+    {
         let Ok(message) = PeerMessage::decode(&payload) else {
             break; // undecodable frame; drop the connection
         };
         match message {
             PeerMessage::SharedFileListRequest => {
-                stream.write_all(&shares.browse().to_frame()).await?;
+                stream.write_all(shares.browse_frame()).await?;
                 on_activity(format!("served browse to {peer}"));
             }
             PeerMessage::UserInfoRequest => {
@@ -181,12 +213,7 @@ where
                 on_activity(format!("served user info to {peer}"));
             }
             PeerMessage::FolderContentsRequest(request) => {
-                let files = shares.folder_contents(&request.directory);
-                let response = FolderContentsResponse {
-                    token: request.token,
-                    directory: request.directory.clone(),
-                    folders: vec![SharedDirectory { path: request.directory, files }],
-                };
+                let response = shares.folder_response(request.token, &request.directory);
                 stream.write_all(&response.to_frame()).await?;
                 on_activity(format!("served folder contents to {peer}"));
             }
@@ -213,7 +240,7 @@ mod tests {
     }
 
     async fn read_one_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Vec<u8> {
-        read_frame(reader, MAX_LARGE_PEER_MESSAGE_LEN).await.unwrap().unwrap()
+        read_frame(reader, MAX_PEER_MESSAGE_LEN).await.unwrap().unwrap()
     }
 
     /// Runs `serve_connection` on one end of an in-memory duplex while a "peer"

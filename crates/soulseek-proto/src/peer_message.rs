@@ -167,8 +167,9 @@ fn read_directories(r: &mut Reader) -> Result<Vec<SharedDirectory>, DecodeError>
     for _ in 0..count {
         // Nicotine+ normalizes the separator when decoding every directory path
         // (`_parse_result_list`: `self.unpack_string().replace("/", "\\")`,
-        // slskmessages.py:3371), so the backslash form is canonical for any
-        // follow-up request (e.g. FolderContentsRequest) that must path-match.
+        // slskmessages.py:3371): `\` is the canonical Soulseek path separator, so
+        // a peer that used `/` decodes to the same backslash form we display and
+        // store. (Request paths a peer sends back are echoes of this form.)
         let path = r.string()?.replace('/', "\\");
         let files = read_file_list(r)?;
         dirs.push(SharedDirectory { path, files });

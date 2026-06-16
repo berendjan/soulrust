@@ -6,8 +6,11 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-use soulseek_proto::peer_message::{SharedDirectory, SharedFile, SharedFileListResponse};
+use soulseek_proto::peer_message::{
+    FolderContentsResponse, SharedDirectory, SharedFile, SharedFileListResponse,
+};
 
 /// One shared file. `virtual_path` is the backslash-separated path advertised to
 /// peers (e.g. `Music\\Album\\song.mp3`), rooted at the share folder's basename.
@@ -33,6 +36,11 @@ pub struct ShareIndex {
     pub word_index: HashMap<String, Vec<u32>>,
     /// Virtual folder path → the ids of files directly in it.
     pub folders: BTreeMap<String, Vec<u32>>,
+    /// The compressed browse frame, built once on first use and reused (the
+    /// share list is constant between scans). Mirrors Nicotine+ caching
+    /// `SharedFileListResponse.built` so we don't rebuild + re-zlib the whole
+    /// tree on every browse request.
+    browse_frame: OnceLock<Vec<u8>>,
 }
 
 /// Splits a path/filename into lowercased alphanumeric tokens — Nicotine+'s
@@ -145,6 +153,26 @@ impl ShareIndex {
             .get(virtual_folder)
             .map(|ids| ids.iter().map(|&id| self.folder_file(id)).collect())
             .unwrap_or_default()
+    }
+
+    /// The full FolderContentsResponse for a requested folder (the wire reply we
+    /// serve). Keeps all share→wire mapping here next to [`Self::browse`].
+    pub fn folder_response(&self, token: u32, directory: &str) -> FolderContentsResponse {
+        FolderContentsResponse {
+            token,
+            directory: directory.to_owned(),
+            folders: vec![SharedDirectory {
+                path: directory.to_owned(),
+                files: self.folder_contents(directory),
+            }],
+        }
+    }
+
+    /// The cached, compressed browse frame ready to write to a peer socket.
+    /// Built once on first call (the share list is fixed between scans), so
+    /// repeated browses don't rebuild and re-zlib the whole tree.
+    pub fn browse_frame(&self) -> &[u8] {
+        self.browse_frame.get_or_init(|| self.browse().to_frame())
     }
 }
 
