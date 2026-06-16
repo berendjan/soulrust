@@ -52,13 +52,19 @@ pub fn create_search_result_list(
     let first = included.next()?;
     let first_ids = word_index.get(first)?;
 
-    // Single included word with no partials: truncate to the result cap early.
-    let mut results: HashSet<u32> =
-        if terms.included.len() == 1 && terms.partial.is_empty() {
-            first_ids.iter().take(max_results).copied().collect()
-        } else {
-            first_ids.iter().copied().collect()
-        };
+    // Truncate to the result cap early only when the whole query is a single
+    // word. Nicotine+ gates this on `len(included)+len(excluded)+len(partial)
+    // == 1` (search.py:_create_search_result_list `has_single_word`), so an
+    // excluded or partial word must keep the full `start_results` — otherwise
+    // exclusion/intersection would run against a prematurely-truncated set and
+    // drop matches the reference keeps.
+    let single_word =
+        terms.included.len() == 1 && terms.partial.is_empty() && terms.excluded.is_empty();
+    let mut results: HashSet<u32> = if single_word {
+        first_ids.iter().take(max_results).copied().collect()
+    } else {
+        first_ids.iter().copied().collect()
+    };
     if results.is_empty() {
         return None;
     }
@@ -115,11 +121,16 @@ pub fn create_file_info_list(
     let mut ids: Vec<u32> = results.iter().copied().collect();
     ids.sort_by(|&a, &b| index.files[a as usize].virtual_path.cmp(&index.files[b as usize].virtual_path));
 
+    // Nicotine+ caps the candidate set to `max_results` *before* dropping
+    // excluded-phrase files: `islice(results, min(len(results), max_results))`
+    // then `_append_file_info` skips phrase matches
+    // (search.py:_create_file_info_list / _append_file_info). So the response
+    // may carry fewer than `max_results` files when some capped candidates hit
+    // a phrase — we must not reach past the cap to backfill.
+    ids.truncate(max_results);
+
     let mut out = Vec::new();
     for id in ids {
-        if out.len() >= max_results {
-            break;
-        }
         let lower = index.files[id as usize].virtual_path.to_lowercase();
         if phrases.iter().any(|p| lower.contains(p.as_str())) {
             continue;
@@ -187,6 +198,41 @@ mod tests {
     }
 
     #[test]
+    fn single_included_word_truncates_only_without_excluded_or_partial() {
+        // Nicotine+ truncates `start_results[:max_results]` only when the whole
+        // query is a single word: `has_single_word = len(included)+len(excluded)
+        // +len(partial) == 1` (search.py:_create_search_result_list).
+        let wi = word_index();
+
+        // One included word, no excluded/partial → single-word path: the
+        // start results ARE truncated to max_results (first two of iso's ids).
+        assert_eq!(
+            create_search_result_list(&terms(&["iso"], &[], &[]), 2, &wi),
+            Some(HashSet::from([34, 35]))
+        );
+
+        // One included word *with* an excluded word is NOT a single-word query,
+        // so the full `iso` list survives to the exclusion step. With max=2 the
+        // reference keeps {34,35,36,37,38}, then removes linux={35,36} → leaving
+        // {34,37,38}. (A premature truncate-to-2 would wrongly yield just {34}.)
+        assert_eq!(
+            create_search_result_list(&terms(&["iso"], &["linux"], &[]), 2, &wi),
+            Some(HashSet::from([34, 37, 38]))
+        );
+    }
+
+    #[test]
+    fn no_included_word_returns_none() {
+        // Nicotine+ requires at least one complete included word: `start_word =
+        // next(iter(included_words), None); if not start_word: return None`
+        // (search.py:_create_search_result_list). A query of only excluded
+        // and/or partial words yields nothing.
+        let wi = word_index();
+        assert_eq!(create_search_result_list(&terms(&[], &["linux"], &["stem"]), 1500, &wi), None);
+        assert_eq!(create_search_result_list(&terms(&[], &[], &["stem"]), 1500, &wi), None);
+    }
+
+    #[test]
     fn sanitize_classifies_prefixes() {
         let t = sanitize_search_term("Gwen -mp3 *ello -No yes");
         assert_eq!(t.included, vec!["gwen", "yes"]);
@@ -232,6 +278,30 @@ mod tests {
         assert!(names.contains(&"isos\\openbsd.iso"));
         assert!(!names.iter().any(|n| n.contains("distro") || n.to_lowercase().contains("netbsd")));
         assert_eq!(files.len(), 3);
+    }
+
+    #[test]
+    fn excluded_phrase_filter_runs_after_result_cap() {
+        // Nicotine+ caps the candidate set to max_results *first* —
+        // `islice(results, min(len(results), max_results))` — and only then
+        // drops excluded-phrase files in `_append_file_info`. So an excluded
+        // file among the capped candidates shrinks the response below
+        // max_results; the matcher must not reach past the cap to backfill.
+        let index = index_with(&[
+            ("a_bad.iso", 1000), // sorts first, hits the "bad" phrase
+            ("b.iso", 2000),
+            ("c.iso", 3000),
+            ("d.iso", 4000),
+        ]);
+        let results: HashSet<u32> = (0..index.num_files() as u32).collect();
+        let phrases = vec!["bad".to_string()];
+
+        // max_results=2 caps to the first two sorted paths {a_bad.iso, b.iso};
+        // a_bad.iso is excluded, so exactly one file (b.iso) is returned — NOT
+        // backfilled to two with c.iso.
+        let files = create_file_info_list(&results, 2, &phrases, &index);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "b.iso");
     }
 
     #[test]

@@ -18,6 +18,12 @@ pub struct SharedFileEntry {
     pub size: u64,
 }
 
+/// Substituted for a literal backslash in a real filename. The Soulseek network
+/// uses `\` as the path separator, so a backslash in a basename (valid on
+/// non-Windows filesystems) would corrupt the advertised path. Matches
+/// Nicotine+'s `Shares.BACKSLASH_SENTINEL` (shares.py).
+const BACKSLASH_SENTINEL: &str = "@@BACKSLASH@@";
+
 /// The scanned shares, indexed for search and browse.
 #[derive(Debug, Default)]
 pub struct ShareIndex {
@@ -75,8 +81,11 @@ impl ShareIndex {
         self.files.len()
     }
 
-    /// The wire `SharedFile` for a file id (full virtual path as the name, as
-    /// Soulseek folder streams carry it). Attributes are deferred (empty).
+    /// The wire `SharedFile` for a file id as carried in a *search* response:
+    /// the name is the full virtual path, since the requester has no enclosing
+    /// directory context. Matches Nicotine+ `search.py:_create_file_info_list`,
+    /// which serves `file_path_index` entries whose name is `virtual_file_path`.
+    /// Attributes are deferred (empty).
     pub fn shared_file(&self, id: u32) -> SharedFile {
         let entry = &self.files[id as usize];
         SharedFile {
@@ -87,15 +96,33 @@ impl ShareIndex {
         }
     }
 
+    /// The wire `SharedFile` as carried inside a *folder stream* (browse and
+    /// FolderContentsResponse): the name is the **basename** only, since the
+    /// enclosing directory is already named by the stream entry. Matches
+    /// Nicotine+ `shares.py:scan_shared_folder`, which stores
+    /// `basename_file_data[0] = basename_escaped` in each folder stream.
+    fn folder_file(&self, id: u32) -> SharedFile {
+        let entry = &self.files[id as usize];
+        let basename = entry.virtual_path.rsplit('\\').next().unwrap_or(&entry.virtual_path);
+        SharedFile {
+            name: basename.to_owned(),
+            size: entry.size,
+            extension: String::new(),
+            attributes: Vec::new(),
+        }
+    }
+
     /// The full browsable share tree (a `SharedFileListResponse` we serve to a
-    /// peer that browses us). Public shares only for now.
+    /// peer that browses us). Public shares only for now. Every scanned folder
+    /// appears — including empty and intermediate ones — as Nicotine+ stores a
+    /// (possibly empty) stream for each folder it visits.
     pub fn browse(&self) -> SharedFileListResponse {
         let directories = self
             .folders
             .iter()
             .map(|(path, ids)| SharedDirectory {
                 path: path.clone(),
-                files: ids.iter().map(|&id| self.shared_file(id)).collect(),
+                files: ids.iter().map(|&id| self.folder_file(id)).collect(),
             })
             .collect();
         SharedFileListResponse { directories, private_directories: Vec::new() }
@@ -105,12 +132,17 @@ impl ShareIndex {
     pub fn folder_contents(&self, virtual_folder: &str) -> Vec<SharedFile> {
         self.folders
             .get(virtual_folder)
-            .map(|ids| ids.iter().map(|&id| self.shared_file(id)).collect())
+            .map(|ids| ids.iter().map(|&id| self.folder_file(id)).collect())
             .unwrap_or_default()
     }
 }
 
 fn walk(dir: &Path, virtual_prefix: &str, index: &mut ShareIndex) {
+    // Every scanned folder gets a (possibly empty) entry, so intermediate and
+    // empty folders still appear in the browse tree — Nicotine+ stores a stream
+    // for each folder it visits (shares.py:scan_shared_folder).
+    index.folders.entry(virtual_prefix.to_owned()).or_default();
+
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -124,13 +156,20 @@ fn walk(dir: &Path, virtual_prefix: &str, index: &mut ShareIndex) {
         if name.starts_with('.') {
             continue; // hidden file or folder
         }
-        let virtual_path = format!("{virtual_prefix}\\{name}");
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
         if file_type.is_dir() {
+            // Folder names keep raw backslashes (Nicotine+'s real2virtual does
+            // not escape them); the file basename below is what gets escaped.
+            let virtual_path = format!("{virtual_prefix}\\{name}");
             walk(&entry.path(), &virtual_path, index);
         } else if file_type.is_file() {
+            // A literal backslash in a basename would read as a path separator
+            // on the wire, so substitute the sentinel — Nicotine+ does the same
+            // before building `virtual_file_path` (shares.py:scan_shared_folder).
+            let basename = name.replace('\\', BACKSLASH_SENTINEL);
+            let virtual_path = format!("{virtual_prefix}\\{basename}");
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
             index.add_file(entry.path(), virtual_path, size);
         }
@@ -193,6 +232,29 @@ mod tests {
     }
 
     #[test]
+    fn word_index_dedupes_repeated_tokens_per_file() {
+        // Nicotine+ indexes the union `set(folder_words + basename_words)` once
+        // per file (shares.py:scan_shared_folder), so a token repeated across
+        // the folder path and filename appends the file id only once.
+        let root = std::env::temp_dir()
+            .join(format!("soulrust-shares-{}-dedup", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        // Share root "demo" and a "demo" subfolder: "demo" appears in the root,
+        // the subfolder, and the filename.
+        let share = root.join("demo");
+        std::fs::create_dir_all(share.join("demo")).unwrap();
+        std::fs::write(share.join("demo").join("demo.mp3"), b"q").unwrap();
+
+        let index = ShareIndex::scan(&[share.clone()]);
+        assert_eq!(index.num_files(), 1);
+        // Even though "demo" occurs three times in "demo\\demo\\demo.mp3", the
+        // single file id is recorded just once.
+        assert_eq!(index.word_index["demo"], vec![0]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn browse_groups_files_by_folder() {
         let music = build_share("browse");
         let index = ShareIndex::scan(&[music.clone()]);
@@ -204,12 +266,83 @@ mod tests {
 
         let album = listing.directories.iter().find(|d| d.path == "Music\\Album").unwrap();
         assert_eq!(album.files.len(), 1);
-        assert_eq!(album.files[0].name, "Music\\Album\\track.flac");
+        // Folder streams carry the basename only, not the full virtual path:
+        // Nicotine+ stores `basename_file_data[0] = basename_escaped` per folder
+        // (shares.py:scan_shared_folder). The full path is reserved for search
+        // responses (search.py:_create_file_info_list).
+        assert_eq!(album.files[0].name, "track.flac");
 
         // folder_contents agrees with the browse tree.
         let contents = index.folder_contents("Music\\Album");
         assert_eq!(contents, album.files);
 
         std::fs::remove_dir_all(music.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn browse_includes_empty_and_intermediate_folders() {
+        // Nicotine+ stores a (possibly empty) stream for every folder it scans;
+        // test_shares.py asserts `public_streams["Shares\\folder2"]` is an empty
+        // stream (b"\x00\x00\x00\x00") even though folder2 holds only subfolders.
+        let root = std::env::temp_dir()
+            .join(format!("soulrust-shares-{}-emptyfolders", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let share = root.join("Shares");
+        // folder2 has no direct files, only the subfolder `test` which holds one.
+        std::fs::create_dir_all(share.join("folder2").join("test")).unwrap();
+        std::fs::create_dir_all(share.join("empty")).unwrap();
+        std::fs::write(share.join("folder2").join("test").join("nothing"), b"x").unwrap();
+
+        let index = ShareIndex::scan(&[share.clone()]);
+        let listing = index.browse();
+        let folders: Vec<&str> = listing.directories.iter().map(|d| d.path.as_str()).collect();
+
+        // The root, an intermediate folder with no direct files, a leaf-only
+        // empty folder, and the populated subfolder all appear.
+        assert!(folders.contains(&"Shares"));
+        assert!(folders.contains(&"Shares\\folder2"));
+        assert!(folders.contains(&"Shares\\empty"));
+        assert!(folders.contains(&"Shares\\folder2\\test"));
+
+        // The intermediate/empty folders carry zero files (the wire stream
+        // would be a uint32 count of 0).
+        let folder2 = listing.directories.iter().find(|d| d.path == "Shares\\folder2").unwrap();
+        assert!(folder2.files.is_empty());
+        let empty = listing.directories.iter().find(|d| d.path == "Shares\\empty").unwrap();
+        assert!(empty.files.is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn backslash_in_filename_is_replaced_with_sentinel() {
+        // A backslash is a valid character in a basename on non-Windows
+        // filesystems, but the Soulseek path separator on the wire. Nicotine+
+        // substitutes `Shares.BACKSLASH_SENTINEL` ("@@BACKSLASH@@") for it
+        // before building the virtual path (shares.py:scan_shared_folder), so
+        // the file stays one file rather than reading as a nested folder.
+        let root = std::env::temp_dir()
+            .join(format!("soulrust-shares-{}-backslash", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let share = root.join("Music");
+        std::fs::create_dir_all(&share).unwrap();
+        std::fs::write(share.join("AC\\DC.mp3"), b"zz").unwrap();
+
+        let index = ShareIndex::scan(&[share.clone()]);
+        assert_eq!(index.num_files(), 1);
+
+        // Full virtual path (search response) keeps the sentinel, so the file
+        // sits directly in `Music`, not in a phantom `AC` subfolder.
+        assert_eq!(index.files[0].virtual_path, "Music\\AC@@BACKSLASH@@DC.mp3");
+
+        // Folder stream (browse) carries the escaped basename.
+        let listing = index.browse();
+        let music = listing.directories.iter().find(|d| d.path == "Music").unwrap();
+        assert_eq!(music.files.len(), 1);
+        assert_eq!(music.files[0].name, "AC@@BACKSLASH@@DC.mp3");
+        // No phantom `Music\AC` folder was created.
+        assert!(!listing.directories.iter().any(|d| d.path == "Music\\AC"));
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
