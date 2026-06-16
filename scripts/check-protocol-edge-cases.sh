@@ -50,6 +50,8 @@ UNITS=(
   "server|crates/soulseek-proto/src/server.rs|pynicotine/slskmessages.py|client<->server messages we implement (Login request/response, SetWaitPort, GetPeerAddress request/response, FileSearch): exact field layouts, the login success vs failure branches, optional/absent trailing fields, obfuscated-port widths, and unknown server codes"
   "peer|crates/soulseek-proto/src/peer.rs|pynicotine/slskmessages.py|peer-init handshake messages (PeerInit, PierceFirewall): the u8 message code, the P/F/D connection types, the legacy token field, and rejection of unknown codes/connection types"
   "peer_message|crates/soulseek-proto/src/peer_message.rs|pynicotine/slskmessages.py|the browse exchange (GetSharedFileList, SharedFileList): zlib (de)compression of the body, the directory/file/attribute tree layout, the optional trailing private-directories section, empty directories, and guards against decompression bombs and truncated/oversized trees"
+  "shares|crates/soulrust/src/shares/mod.rs|pynicotine/shares.py|scanning folders into a share index: word/token extraction (punctuation translation, lowercasing, de-duplication), virtual-vs-real path mapping, hidden-file/folder exclusion, and the browsable folder/file tree structure"
+  "search|crates/soulrust/src/search_response.rs|pynicotine/search.py|matching an incoming search against shares: included/excluded/partial word handling, the word-index set intersection (_create_search_result_list), result limits, and the server excluded-phrase filtering (_create_file_info_list)"
 )
 
 # ---------------------------------------------------------------------------
@@ -77,7 +79,7 @@ MODEL_ARGS=()
 
 # Build the prompt for one unit.
 build_prompt() {
-  local our_file="$1" nicotine_file="$2" focus="$3"
+  local pkg="$1" our_file="$2" nicotine_file="$3" focus="$4"
   cat <<EOF
 You are auditing the soulrust Soulseek protocol implementation against
 Nicotine+, which is the reference implementation and the de-facto spec of this
@@ -116,9 +118,9 @@ Judgment — these are NOT bugs, do not "fix" them:
 Constraints:
 - Anchor every change on what Nicotine+ actually does; cite the reference
   behaviour in the test comment. Do not invent expected values.
-- Keep changes minimal and within the soulseek-proto crate. If a fix must touch
+- Keep changes minimal and within the $pkg crate. If a fix must touch
   another file in that crate, do it and note it in your summary.
-- Before finishing, run \`cargo test -p soulseek-proto\` until it passes.
+- Before finishing, run \`cargo test -p $pkg\` until it passes.
 
 When done, print a short summary: every PROTOCOL CHANGE line, and the edge-case
 tests you added.
@@ -127,6 +129,8 @@ EOF
 
 run_unit() {
   local key="$1" our_file="$2" nicotine_file="$3" focus="$4"
+  local pkg=soulrust
+  case "$our_file" in *soulseek-proto*) pkg=soulseek-proto ;; esac
   local log="$LOG_DIR/$key.log"
 
   echo "=================================================================="
@@ -137,7 +141,7 @@ run_unit() {
   [ -f "$NICOTINE_DIR/$nicotine_file" ] || die "missing reference: $nicotine_file"
 
   local prompt
-  prompt="$(build_prompt "$our_file" "$nicotine_file" "$focus")"
+  prompt="$(build_prompt "$pkg" "$our_file" "$nicotine_file" "$focus")"
 
   if [ "$DRY_RUN" = "1" ]; then
     echo "--- prompt ---"
@@ -201,7 +205,7 @@ echo "=================================================================="
 if grep -rhn "PROTOCOL CHANGE:" "$LOG_DIR" 2>/dev/null; then
   echo
   echo "Review the diff below before trusting these changes:"
-  git -C "$REPO_ROOT" --no-pager diff --stat -- crates/soulseek-proto/ || true
+  git -C "$REPO_ROOT" --no-pager diff --stat -- crates/ || true
 else
   echo "None reported — only coverage tests were added (or nothing changed)."
 fi
