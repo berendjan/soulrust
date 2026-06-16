@@ -32,6 +32,8 @@ sys.path.insert(0, NICOTINE_DIR)
 
 try:
     from pynicotine.slskmessages import (
+        BranchLevel,
+        BranchRoot,
         ConnectToPeer,
         DistribBranchLevel,
         DistribBranchRoot,
@@ -39,7 +41,11 @@ try:
         DistribEmbeddedMessage,
         DistribPing,
         DistribSearch,
+        EmbeddedMessage,
         ExcludedSearchPhrases,
+        ParentMinSpeed,
+        ParentSpeedRatio,
+        PossibleParents,
         FileListMessage,
         FileOffset,
         FileSearch,
@@ -255,6 +261,33 @@ def decode_vectors():
         emb,
     ))
 
+    # Server distributed/parent-management messages Nicotine+ only parses.
+    pms = s_u32(1500)
+    assert parsed(ParentMinSpeed, pms).speed == 1500
+    out.append(("PARENT_MIN_SPEED_BODY", "ParentMinSpeed: speed=1500", pms))
+
+    psr = s_u32(50)
+    assert parsed(ParentSpeedRatio, psr).ratio == 50
+    out.append(("PARENT_SPEED_RATIO_BODY", "ParentSpeedRatio: ratio=50", psr))
+
+    pp = s_u32(1) + s_str("parent1") + s_ip("10.0.0.1") + s_u32(2234)
+    msg = parsed(PossibleParents, pp)
+    assert "parent1" in msg.list, msg
+    out.append((
+        "POSSIBLE_PARENTS_BODY",
+        'PossibleParents: 1 parent ("parent1", 10.0.0.1, 2234)',
+        pp,
+    ))
+
+    em = s_u8(3) + ds  # server EmbeddedMessage wrapping a DistribSearch (code 3)
+    msg = parsed(EmbeddedMessage, em)
+    assert msg.distrib_code == 3 and bytes(msg.distrib_message) == ds, msg
+    out.append((
+        "EMBEDDED_MESSAGE_BODY",
+        "EmbeddedMessage (server code 93): inner u8 code 3 then a DistribSearch body",
+        em,
+    ))
+
     return out
 
 
@@ -310,6 +343,12 @@ VECTORS = [
     ("CONNECT_TO_PEER_REQUEST_BODY",
      'ConnectToPeer(token=0x01020304, user="alice", conn_type="P") — uncompressed body',
      ConnectToPeer(token=0x01020304, user="alice", conn_type="P").make_network_message()),
+    ("BRANCH_LEVEL_BODY",
+     "BranchLevel(value=3) — we report our distributed tree depth (server code 126)",
+     BranchLevel(value=3).make_network_message()),
+    ("BRANCH_ROOT_BODY",
+     'BranchRoot(user="alice") — we report our branch root (server code 127)',
+     BranchRoot(user="alice").make_network_message()),
     # --- file transfers (peer codes 40/41/43/44/46/50/51 + raw F-connection) ---
     ("TRANSFER_REQUEST_UPLOAD_BODY",
      'TransferRequest(direction=UPLOAD=1, token=0xABCD, file="Music\\\\song.mp3", '

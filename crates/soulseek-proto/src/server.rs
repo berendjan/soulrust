@@ -17,6 +17,13 @@ pub mod code {
     pub const GET_PEER_ADDRESS: u32 = 3;
     pub const CONNECT_TO_PEER: u32 = 18;
     pub const FILE_SEARCH: u32 = 26;
+    // Distributed search network (parent/child tree management).
+    pub const PARENT_MIN_SPEED: u32 = 83;
+    pub const PARENT_SPEED_RATIO: u32 = 84;
+    pub const EMBEDDED_MESSAGE: u32 = 93;
+    pub const POSSIBLE_PARENTS: u32 = 102;
+    pub const BRANCH_LEVEL: u32 = 126;
+    pub const BRANCH_ROOT: u32 = 127;
     pub const EXCLUDED_SEARCH_PHRASES: u32 = 160;
 }
 
@@ -265,6 +272,101 @@ impl ExcludedSearchPhrases {
     }
 }
 
+/// Server code 126 — BranchLevel: we tell the server our depth in the
+/// distributed search tree (0 when we are our own root). Client→server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BranchLevel {
+    pub level: u32,
+}
+
+impl ServerRequest for BranchLevel {
+    const CODE: u32 = code::BRANCH_LEVEL;
+    fn encode_body(&self, buf: &mut Vec<u8>) {
+        put_u32(buf, self.level);
+    }
+}
+
+/// Server code 127 — BranchRoot: we tell the server the username at the root of
+/// our branch (ourselves until we adopt a parent). Client→server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchRoot {
+    pub root: String,
+}
+
+impl ServerRequest for BranchRoot {
+    const CODE: u32 = code::BRANCH_ROOT;
+    fn encode_body(&self, buf: &mut Vec<u8>) {
+        put_string(buf, &self.root);
+    }
+}
+
+/// Server code 83 — ParentMinSpeed: the minimum upload speed the server requires
+/// before a client is eligible to be a parent. Server→client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParentMinSpeed {
+    pub speed: u32,
+}
+
+impl ParentMinSpeed {
+    pub fn decode(r: &mut Reader) -> Result<Self, DecodeError> {
+        Ok(ParentMinSpeed { speed: r.u32()? })
+    }
+}
+
+/// Server code 84 — ParentSpeedRatio: divisor applied to our speed to compute
+/// how many distributed children we may take. Server→client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParentSpeedRatio {
+    pub ratio: u32,
+}
+
+impl ParentSpeedRatio {
+    pub fn decode(r: &mut Reader) -> Result<Self, DecodeError> {
+        Ok(ParentSpeedRatio { ratio: r.u32()? })
+    }
+}
+
+/// One candidate parent the server offers for the distributed tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PossibleParent {
+    pub username: String,
+    pub ip: Ipv4Addr,
+    pub port: u32,
+}
+
+/// Server code 102 — PossibleParents: candidate parents to connect to so we can
+/// join the distributed search tree. Server→client.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PossibleParents {
+    pub parents: Vec<PossibleParent>,
+}
+
+impl PossibleParents {
+    pub fn decode(r: &mut Reader) -> Result<Self, DecodeError> {
+        let count = r.u32()? as usize;
+        let mut parents = Vec::with_capacity(count.min(MAX_LIST_PREALLOC));
+        for _ in 0..count {
+            parents.push(PossibleParent { username: r.string()?, ip: r.ipv4()?, port: r.u32()? });
+        }
+        Ok(PossibleParents { parents })
+    }
+}
+
+/// Server code 93 — EmbeddedMessage: a distributed message the server injects
+/// directly (a `u8` inner code then that message's body, in practice a
+/// DistribSearch). Server→client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedMessage {
+    pub distrib_code: u8,
+    pub distrib_message: Vec<u8>,
+}
+
+impl EmbeddedMessage {
+    pub fn decode(r: &mut Reader) -> Result<Self, DecodeError> {
+        Ok(EmbeddedMessage { distrib_code: r.u8()?, distrib_message: r.rest().to_vec() })
+    }
+}
+
 /// A decoded server→client message. Unrecognized codes are surfaced rather
 /// than dropped so callers can log or count them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,6 +376,10 @@ pub enum ServerMessage {
     ConnectToPeer(ConnectToPeer),
     FileSearch(FileSearchBroadcast),
     ExcludedSearchPhrases(ExcludedSearchPhrases),
+    ParentMinSpeed(ParentMinSpeed),
+    ParentSpeedRatio(ParentSpeedRatio),
+    PossibleParents(PossibleParents),
+    EmbeddedMessage(EmbeddedMessage),
     Unknown { code: u32, body: Vec<u8> },
 }
 
@@ -292,6 +398,18 @@ impl ServerMessage {
             code::FILE_SEARCH => ServerMessage::FileSearch(FileSearchBroadcast::decode(&mut r)?),
             code::EXCLUDED_SEARCH_PHRASES => {
                 ServerMessage::ExcludedSearchPhrases(ExcludedSearchPhrases::decode(&mut r)?)
+            }
+            code::PARENT_MIN_SPEED => {
+                ServerMessage::ParentMinSpeed(ParentMinSpeed::decode(&mut r)?)
+            }
+            code::PARENT_SPEED_RATIO => {
+                ServerMessage::ParentSpeedRatio(ParentSpeedRatio::decode(&mut r)?)
+            }
+            code::POSSIBLE_PARENTS => {
+                ServerMessage::PossibleParents(PossibleParents::decode(&mut r)?)
+            }
+            code::EMBEDDED_MESSAGE => {
+                ServerMessage::EmbeddedMessage(EmbeddedMessage::decode(&mut r)?)
             }
             _ => {
                 let mut body = Vec::with_capacity(r.remaining());

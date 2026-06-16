@@ -14,8 +14,8 @@ use soulseek_proto::peer_message::{
     FolderContentsRequest, GetSharedFileList, PeerMessage, UserInfoRequest, UserInfoResponse,
 };
 use soulseek_proto::server::{
-    ConnectToPeerRequest, FileSearchRequest, GetPeerAddressRequest, LoginRequest, LoginResponse,
-    ServerMessage, ServerRequest, SetWaitPort,
+    BranchLevel, BranchRoot, ConnectToPeerRequest, FileSearchRequest, GetPeerAddressRequest,
+    LoginRequest, LoginResponse, ServerMessage, ServerRequest, SetWaitPort,
 };
 use soulseek_proto::distributed::{
     DistribBranchLevel, DistribBranchRoot, DistribChildDepth, DistribEmbedded, DistribPing,
@@ -512,5 +512,41 @@ fn our_decoder_accepts_nicotines_distrib_embedded() {
     // The inner bytes are exactly the DistribSearch body, and decode back.
     assert_eq!(embedded.inner_message, vectors::DISTRIB_SEARCH_BODY);
     let inner = DistribSearch::decode(&mut Reader::new(&embedded.inner_message)).unwrap();
+    assert_eq!(inner.query, "deep purple");
+}
+
+// --- server distributed/parent-management messages ---------------------------
+
+#[test]
+fn branch_level_and_root_bodies_match_nicotine() {
+    assert_eq!(&BranchLevel { level: 3 }.to_frame()[8..], vectors::BRANCH_LEVEL_BODY);
+    assert_eq!(&BranchRoot { root: "alice".into() }.to_frame()[8..], vectors::BRANCH_ROOT_BODY);
+}
+
+#[test]
+fn our_decoder_accepts_nicotines_parent_management_messages() {
+    let msg = ServerMessage::decode(&server_payload(83, vectors::PARENT_MIN_SPEED_BODY)).unwrap();
+    let ServerMessage::ParentMinSpeed(p) = msg else { panic!("expected parent min speed") };
+    assert_eq!(p.speed, 1500);
+
+    let msg = ServerMessage::decode(&server_payload(84, vectors::PARENT_SPEED_RATIO_BODY)).unwrap();
+    let ServerMessage::ParentSpeedRatio(p) = msg else { panic!("expected parent speed ratio") };
+    assert_eq!(p.ratio, 50);
+
+    let msg = ServerMessage::decode(&server_payload(102, vectors::POSSIBLE_PARENTS_BODY)).unwrap();
+    let ServerMessage::PossibleParents(pp) = msg else { panic!("expected possible parents") };
+    assert_eq!(pp.parents.len(), 1);
+    assert_eq!(pp.parents[0].username, "parent1");
+    assert_eq!(pp.parents[0].ip, Ipv4Addr::new(10, 0, 0, 1));
+    assert_eq!(pp.parents[0].port, 2234);
+}
+
+#[test]
+fn our_decoder_accepts_nicotines_embedded_message() {
+    let msg = ServerMessage::decode(&server_payload(93, vectors::EMBEDDED_MESSAGE_BODY)).unwrap();
+    let ServerMessage::EmbeddedMessage(em) = msg else { panic!("expected embedded message") };
+    assert_eq!(em.distrib_code, 3, "wraps a DistribSearch");
+    // The inner bytes decode back to a DistribSearch.
+    let inner = DistribSearch::decode(&mut Reader::new(&em.distrib_message)).unwrap();
     assert_eq!(inner.query, "deep purple");
 }
