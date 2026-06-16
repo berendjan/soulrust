@@ -100,6 +100,15 @@ impl ShareIndex {
         self.files.len()
     }
 
+    /// Resolve a peer-requested virtual path to the real file on disk and its
+    /// size, for serving an upload. `None` if we do not share that path.
+    pub fn resolve(&self, virtual_path: &str) -> Option<(&Path, u64)> {
+        self.files
+            .iter()
+            .find(|entry| entry.virtual_path == virtual_path)
+            .map(|entry| (entry.real_path.as_path(), entry.size))
+    }
+
     /// The wire `SharedFile` for a file id as carried in a *search* response:
     /// the name is the full virtual path, since the requester has no enclosing
     /// directory context. Matches Nicotine+ `search.py:_create_file_info_list`,

@@ -3,6 +3,7 @@ pub mod github;
 pub mod net_edge;
 pub mod peer_net;
 pub mod session;
+pub mod transfer_io;
 pub mod ui;
 pub mod updater;
 pub mod web_bridge;
