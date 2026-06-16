@@ -22,8 +22,9 @@ use crate::messages::{
     DownloadQueuePosition, ExtractRequest, ExtractResult, GetConfigReq, HttpHtml, HttpRender,
     IncomingSearch, NetConn,
     NetRx, NetTx, PeerActivity, PeerBrowseConnect, PeerDownloadConnect, PeerPierce,
-    PeerDistribConnect, PeerUploadConnect, ResolveUploadPeer, SetConfigReq, SetConfigResult,
-    SetExcludedPhrases, SessionEvent, StartDownload, StartSearch, StartSearchResult, UpdateDownloaded,
+    PeerDistribConnect, PeerUploadConnect, ResolveUploadPeer, SearchResultReceived, SetConfigReq,
+    SetConfigResult, SetExcludedPhrases, SessionEvent, StartDownload, StartSearch, StartSearchResult,
+    UpdateDownloaded,
     UpdaterStatusChanged, UploadComplete, UploadFailed,
 };
 
@@ -73,6 +74,8 @@ rust_messenger::Messenger! {
             Session, IncomingSearch: [ peer_net ],
             Session, SetExcludedPhrases: [ peer_net ],
             Session, PeerPierce: [ peer_net ],
+            // requesting: filtered inbound search results -> ui
+            PeerNet, SearchResultReceived: [ ui ],
             // downloads: bridge -> session resolves address -> peer_net -> ui log
             WebBridge, StartDownload: [ session ],
             Session, PeerDownloadConnect: [ peer_net ],

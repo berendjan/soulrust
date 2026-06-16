@@ -383,6 +383,18 @@ impl<W: traits::core::Writer> SharedBridge<W> {
         if let Some(v) = get("bind_addr") {
             config.ui.bind_addr = v;
         }
+        if let Some(v) = get("min_result_files") {
+            config.sharing.min_result_files =
+                v.parse().map_err(|_| format!("invalid minimum files: {v}"))?;
+        }
+        if let Some(v) = get("min_peer_upload_speed") {
+            config.sharing.min_peer_upload_speed =
+                v.parse().map_err(|_| format!("invalid minimum upload speed: {v}"))?;
+        }
+        if let Some(v) = get("max_peer_queue_length") {
+            config.sharing.max_peer_queue_length =
+                v.parse().map_err(|_| format!("invalid maximum queue length: {v}"))?;
+        }
 
         let result = match self.round_trip(|corr| {
             WebBridge::send(&SetConfigReq { corr, config: config.clone() }, &self.writer);
@@ -570,6 +582,12 @@ fn render_config_page(config: &Config, banner: Option<String>) -> String {
 <div class="card"><h2 style="margin-top:0">Web UI</h2>
 <label>bind address <input type="text" name="bind_addr" value="{bind_addr}"></label>
 </div>
+<div class="card"><h2 style="margin-top:0">Search result filters</h2>
+<p class="muted" style="margin-top:0">Drop weak responses to your searches before they reach the results list.</p>
+<label>minimum files per result <input type="text" name="min_result_files" value="{min_files}"></label>
+<label>minimum peer upload speed (B/s, 0 = any) <input type="text" name="min_peer_upload_speed" value="{min_speed}"></label>
+<label>maximum peer queue length (0 = no limit) <input type="text" name="max_peer_queue_length" value="{max_queue}"></label>
+</div>
 <p><button class="btn" type="submit">Save</button></p>
 </form>"#,
         banner = banner.unwrap_or_default(),
@@ -582,6 +600,9 @@ fn render_config_page(config: &Config, banner: Option<String>) -> String {
         auto_apply = checked(config.update.auto_apply),
         repo = escape(&config.update.repo),
         bind_addr = escape(&config.ui.bind_addr),
+        min_files = config.sharing.min_result_files,
+        min_speed = config.sharing.min_peer_upload_speed,
+        max_queue = config.sharing.max_peer_queue_length,
     );
     shell("soulrust — settings", "config", &body)
 }

@@ -70,6 +70,7 @@ rust_messenger::messenger_id_enum!(
         PeerDistribConnect = 38,
         SetExcludedPhrases = 39,
         DownloadQueuePosition = 40,
+        SearchResultReceived = 41,
     }
 );
 
@@ -362,6 +363,26 @@ pub struct SetExcludedPhrases {
     pub phrases: Vec<String>,
 }
 
+/// One file in an inbound search result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResultFile {
+    pub name: String,
+    pub size: u64,
+}
+
+/// peer_net → ui: a peer's response to one of our searches that cleared the
+/// requester-side filter (min files / min speed / max queue). Correlated to the
+/// originating search by `token`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResultReceived {
+    pub token: u32,
+    pub username: String,
+    pub free_slots: bool,
+    pub upload_speed: u32,
+    pub in_queue: u32,
+    pub files: Vec<SearchResultFile>,
+}
+
 /// session → peer_net: a server ConnectToPeer — a (likely firewalled) peer
 /// wants to reach us. We connect to `ip:port` and send PierceFirewall(token).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -544,6 +565,7 @@ impl_bus_message!(
     PeerDistribConnect => MessageId::PeerDistribConnect,
     SetExcludedPhrases => MessageId::SetExcludedPhrases,
     DownloadQueuePosition => MessageId::DownloadQueuePosition,
+    SearchResultReceived => MessageId::SearchResultReceived,
 );
 
 #[cfg(test)]

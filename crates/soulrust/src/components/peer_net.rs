@@ -43,9 +43,9 @@ use crate::messages::{
     BrowseDir, BrowseFailed, BrowseFile, BrowseListing, DownloadComplete, DownloadFailed,
     DownloadQueuePosition, HandlerId, IncomingSearch, NetTx, PeerActivity, PeerBrowseConnect,
     PeerDistribConnect, PeerDownloadConnect, PeerPierce, PeerUploadConnect, ResolveUploadPeer,
-    SetExcludedPhrases, UploadComplete, UploadFailed,
+    SearchResultFile, SearchResultReceived, SetExcludedPhrases, UploadComplete, UploadFailed,
 };
-use crate::search_response;
+use crate::search_response::{self, SearchFilter};
 use crate::shares::ShareIndex;
 use crate::transfers::uploads::{TransferId, UploadQueue};
 
@@ -130,6 +130,16 @@ enum PeerCommand {
     /// A connection task received a PlaceInQueueResponse for one of our queued
     /// downloads; forward the position to the UI (the task has no bus Writer).
     QueuePosition { username: String, filename: String, place: u32 },
+    /// A connection task received a filter-passing search result; forward it to
+    /// the UI (the task has no bus Writer).
+    SearchResult {
+        token: u32,
+        username: String,
+        free_slots: bool,
+        upload_speed: u32,
+        in_queue: u32,
+        files: Vec<SearchResultFile>,
+    },
 }
 
 /// Downloads in flight, shared across connections (the negotiation and the file
@@ -193,6 +203,9 @@ struct ConnCtx {
     /// we can answer a downloader's PlaceInQueueRequest and report an honest
     /// queue depth in search responses.
     upload_queue: Mutex<UploadQueue>,
+    /// Requester-side filter applied to inbound search results before they reach
+    /// the UI (min files / min peer speed / max queue length).
+    search_filter: SearchFilter,
 }
 
 /// What a finished connection produced, for the accept loop to report on the bus.
@@ -211,6 +224,7 @@ pub struct PeerNet {
     max_search_results: usize,
     download_dir: PathBuf,
     incomplete_dir: PathBuf,
+    search_filter: SearchFilter,
     cmd_tx: UnboundedSender<PeerCommand>,
     cmd_rx: Option<UnboundedReceiver<PeerCommand>>,
 }
@@ -232,6 +246,11 @@ impl PeerNet {
             max_search_results: ctx.config.sharing.max_search_results as usize,
             download_dir,
             incomplete_dir,
+            search_filter: SearchFilter {
+                min_files: ctx.config.sharing.min_result_files,
+                min_upload_speed: ctx.config.sharing.min_peer_upload_speed,
+                max_queue_length: ctx.config.sharing.max_peer_queue_length,
+            },
             cmd_tx,
             cmd_rx: Some(cmd_rx),
         }
@@ -250,6 +269,7 @@ impl traits::core::Handler for PeerNet {
             max_results: self.max_search_results,
             download_dir: std::mem::take(&mut self.download_dir),
             incomplete_dir: std::mem::take(&mut self.incomplete_dir),
+            search_filter: self.search_filter,
         };
         let cmd_rx = self.cmd_rx.take().expect("on_start called once");
         let cmd_tx = self.cmd_tx.clone();
@@ -269,6 +289,7 @@ struct ReactorConfig {
     max_results: usize,
     download_dir: PathBuf,
     incomplete_dir: PathBuf,
+    search_filter: SearchFilter,
 }
 
 impl traits::core::Handle<PeerBrowseConnect> for PeerNet {
@@ -380,6 +401,7 @@ fn run_reactor<W: traits::core::Writer>(
             next_token: AtomicU32::new(1),
             excluded_phrases: Mutex::new(Vec::new()),
             upload_queue: Mutex::new(UploadQueue::new(false)),
+            search_filter: config.search_filter,
         });
 
         let listener = match TcpListener::bind(("0.0.0.0", port)).await {
@@ -577,6 +599,12 @@ async fn command_loop<W: traits::core::Writer>(
             }
             PeerCommand::QueuePosition { username, filename, place } => {
                 PeerNet::send(&DownloadQueuePosition { username, filename, place }, &writer);
+            }
+            PeerCommand::SearchResult { token, username, free_slots, upload_speed, in_queue, files } => {
+                PeerNet::send(
+                    &SearchResultReceived { token, username, free_slots, upload_speed, in_queue, files },
+                    &writer,
+                );
             }
         }
     }
@@ -1116,6 +1144,28 @@ where
                     place: resp.place,
                 });
             }
+            PeerMessage::FileSearchResponse(resp) => {
+                // We are the searcher: a peer answered one of our searches. Apply
+                // the requester-side filter (min files / speed / queue) and only
+                // forward survivors to the UI, where they're correlated to the
+                // originating search by token.
+                let accepted = ctx.search_filter.accepts(&resp);
+                if accepted {
+                    let files = resp
+                        .files
+                        .into_iter()
+                        .map(|f| SearchResultFile { name: f.name, size: f.size })
+                        .collect();
+                    let _ = ctx.cmd_tx.send(PeerCommand::SearchResult {
+                        token: resp.token,
+                        username: resp.username,
+                        free_slots: resp.free_slots,
+                        upload_speed: resp.upload_speed,
+                        in_queue: resp.in_queue,
+                        files,
+                    });
+                }
+            }
             _ => {} // not-yet-handled messages
         }
     }
@@ -1432,6 +1482,7 @@ mod tests {
             next_token: AtomicU32::new(1),
             excluded_phrases: Mutex::new(Vec::new()),
             upload_queue: Mutex::new(UploadQueue::new(false)),
+            search_filter: SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 },
         })
     }
 
@@ -1646,6 +1697,7 @@ mod tests {
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
                 upload_queue: Mutex::new(UploadQueue::new(false)),
+                search_filter: SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 },
             });
             ctx.downloads.lock().unwrap().by_token.insert(
                 42,
@@ -1778,6 +1830,7 @@ mod tests {
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
                 upload_queue: Mutex::new(UploadQueue::new(false)),
+                search_filter: SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 },
             });
             ctx.downloads.lock().unwrap().by_token.insert(
                 7,
@@ -1907,6 +1960,7 @@ mod tests {
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
                 upload_queue: Mutex::new(UploadQueue::new(false)),
+                search_filter: SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 },
             });
             ctx.downloads.lock().unwrap().by_token.insert(
                 42,
@@ -2085,6 +2139,7 @@ mod tests {
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
                 upload_queue: Mutex::new(UploadQueue::new(false)),
+                search_filter: SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 },
             });
             let serve = tokio::spawn(async move {
                 serve_distrib(&mut server, &ctx, "parent", &mut |_| {}).await
@@ -2131,6 +2186,7 @@ mod tests {
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
                 upload_queue: Mutex::new(UploadQueue::new(false)),
+                search_filter: SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 },
             });
             let tid = ctx.upload_queue.lock().unwrap().enqueue("bob");
             ctx.uploads.lock().unwrap().by_token.insert(
@@ -2290,6 +2346,7 @@ mod tests {
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
                 upload_queue: Mutex::new(UploadQueue::new(false)),
+                search_filter: SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 },
             });
             let ctx_serve = ctx.clone();
             let serve = tokio::spawn(async move {
@@ -2311,6 +2368,95 @@ mod tests {
                 }
                 other => panic!("expected QueuePosition, got ok={}", other.is_ok()),
             }
+        });
+    }
+
+    /// A ConnCtx with a live command receiver and a given search filter, for the
+    /// inbound-search-result tests.
+    fn ctx_with_filter(filter: SearchFilter) -> (Arc<ConnCtx>, UnboundedReceiver<PeerCommand>) {
+        let (cmd_tx, cmd_rx) = unbounded_channel();
+        let ctx = Arc::new(ConnCtx {
+            shares: Arc::new(test_index()),
+            queue: Arc::new(Mutex::new(PendingDeliveries::default())),
+            downloads: Mutex::new(Downloads::default()),
+            uploads: Mutex::new(Uploads::default()),
+            our_username: "me".into(),
+            download_dir: std::env::temp_dir(),
+            incomplete_dir: std::env::temp_dir(),
+            cmd_tx,
+            next_token: AtomicU32::new(1),
+            excluded_phrases: Mutex::new(Vec::new()),
+            upload_queue: Mutex::new(UploadQueue::new(false)),
+            search_filter: filter,
+        });
+        (ctx, cmd_rx)
+    }
+
+    fn inbound_response(token: u32, files: usize, speed: u32, queue: u32) -> FileSearchResponse {
+        use soulseek_proto::peer_message::SharedFile;
+        FileSearchResponse {
+            username: "peer".into(),
+            token,
+            files: (0..files)
+                .map(|i| SharedFile { name: format!("Music\\hit{i}.mp3"), size: 100, ..Default::default() })
+                .collect(),
+            free_slots: true,
+            upload_speed: speed,
+            in_queue: queue,
+            private_files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn inbound_search_result_passing_filter_is_forwarded() {
+        // As the searcher, a peer's response that clears the filter is relayed to
+        // the reactor (which turns it into a SearchResultReceived for the UI).
+        runtime().block_on(async {
+            let (mut client, server) = tokio::io::duplex(64 * 1024);
+            let (ctx, mut cmd_rx) =
+                ctx_with_filter(SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 });
+            let ctx_serve = ctx.clone();
+            let serve = tokio::spawn(async move {
+                serve_connection(server, &ctx_serve, Some("peer".into()), |_| {}).await
+            });
+
+            client.write_all(&inbound_response(42, 1, 500, 0).to_frame()).await.unwrap();
+            drop(client);
+            serve.await.unwrap().unwrap();
+
+            match cmd_rx.try_recv() {
+                Ok(PeerCommand::SearchResult { token, username, upload_speed, files, .. }) => {
+                    assert_eq!(token, 42);
+                    assert_eq!(username, "peer");
+                    assert_eq!(upload_speed, 500);
+                    assert_eq!(files.len(), 1);
+                    assert_eq!(files[0].name, "Music\\hit0.mp3");
+                }
+                other => panic!("expected SearchResult, got ok={}", other.is_ok()),
+            }
+        });
+    }
+
+    #[test]
+    fn inbound_search_result_failing_filter_is_dropped() {
+        // A response below the minimum upload speed never reaches the reactor.
+        runtime().block_on(async {
+            let (mut client, server) = tokio::io::duplex(64 * 1024);
+            let (ctx, mut cmd_rx) = ctx_with_filter(SearchFilter {
+                min_files: 1,
+                min_upload_speed: 1_000,
+                max_queue_length: 0,
+            });
+            let ctx_serve = ctx.clone();
+            let serve = tokio::spawn(async move {
+                serve_connection(server, &ctx_serve, Some("peer".into()), |_| {}).await
+            });
+
+            client.write_all(&inbound_response(7, 3, 10, 0).to_frame()).await.unwrap();
+            drop(client);
+            serve.await.unwrap().unwrap();
+
+            assert!(cmd_rx.try_recv().is_err(), "slow peer's result is filtered out");
         });
     }
 }

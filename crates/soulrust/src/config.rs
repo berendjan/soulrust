@@ -92,6 +92,14 @@ pub struct SharingConfig {
     /// `usize`) so a config written on one platform parses identically on
     /// another.
     pub max_search_results: u32,
+    /// Requester-side filtering of inbound search results: drop a peer's
+    /// response with fewer than this many files (1 = keep any non-empty).
+    pub min_result_files: u32,
+    /// Drop a peer's response whose advertised upload speed is below this
+    /// (bytes/s; 0 = no minimum).
+    pub min_peer_upload_speed: u32,
+    /// Drop a peer's response whose queue is longer than this (0 = no limit).
+    pub max_peer_queue_length: u32,
 }
 
 impl Default for SharingConfig {
@@ -104,6 +112,9 @@ impl Default for SharingConfig {
             fifo_queue: false,
             respond_to_searches: true,
             max_search_results: 100,
+            min_result_files: 1,
+            min_peer_upload_speed: 0,
+            max_peer_queue_length: 0,
         }
     }
 }

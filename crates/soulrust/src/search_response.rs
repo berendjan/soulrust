@@ -5,9 +5,34 @@
 
 use std::collections::{HashMap, HashSet};
 
-use soulseek_proto::peer_message::SharedFile;
+use soulseek_proto::peer_message::{FileSearchResponse, SharedFile};
 
 use crate::shares::ShareIndex;
+
+/// Requester-side filtering of inbound search results, mirroring Soulseek.NET's
+/// `SearchOptions` (minimum file count, minimum peer upload speed, maximum peer
+/// queue length). A response that fails any criterion is dropped before it ever
+/// reaches the UI, so a flood of empty/slow/backed-up peers can't bury the good
+/// hits. Pure, so the thresholds are exhaustively testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchFilter {
+    /// Minimum number of files a response must carry (treated as at least 1, so
+    /// an empty response is always dropped).
+    pub min_files: u32,
+    /// Minimum advertised upload speed (0 = no minimum).
+    pub min_upload_speed: u32,
+    /// Maximum advertised queue length (0 = no limit).
+    pub max_queue_length: u32,
+}
+
+impl SearchFilter {
+    /// Whether an inbound response clears every configured threshold.
+    pub fn accepts(&self, response: &FileSearchResponse) -> bool {
+        (response.files.len() as u32) >= self.min_files.max(1)
+            && response.upload_speed >= self.min_upload_speed
+            && (self.max_queue_length == 0 || response.in_queue <= self.max_queue_length)
+    }
+}
 
 /// A parsed search query: plain (included) words, `-`excluded words, and
 /// `*`partial (suffix) words.
@@ -356,6 +381,42 @@ mod tests {
         assert_eq!(hits[0].name, "Music\\Gwen\\Stefani\\hit.mp3");
         // A second word absent from every file yields no results.
         assert!(respond("gwen nonexistent", 100, &[], &index).is_empty());
+    }
+
+    fn response_with(files: usize, speed: u32, queue: u32) -> FileSearchResponse {
+        FileSearchResponse {
+            username: "peer".into(),
+            token: 1,
+            files: (0..files).map(|i| SharedFile { name: format!("f{i}"), ..Default::default() }).collect(),
+            free_slots: true,
+            upload_speed: speed,
+            in_queue: queue,
+            private_files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn search_filter_enforces_thresholds() {
+        // No constraints (min_files coerced to 1): any non-empty response passes,
+        // an empty one never does.
+        let open = SearchFilter { min_files: 0, min_upload_speed: 0, max_queue_length: 0 };
+        assert!(open.accepts(&response_with(1, 0, 9_999)));
+        assert!(!open.accepts(&response_with(0, 0, 0)), "empty response always dropped");
+
+        // Minimum file count.
+        let min_files = SearchFilter { min_files: 3, min_upload_speed: 0, max_queue_length: 0 };
+        assert!(!min_files.accepts(&response_with(2, 0, 0)));
+        assert!(min_files.accepts(&response_with(3, 0, 0)));
+
+        // Minimum upload speed.
+        let min_speed = SearchFilter { min_files: 1, min_upload_speed: 100, max_queue_length: 0 };
+        assert!(!min_speed.accepts(&response_with(1, 99, 0)));
+        assert!(min_speed.accepts(&response_with(1, 100, 0)));
+
+        // Maximum queue length (0 = unlimited; otherwise inclusive).
+        let max_queue = SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 5 };
+        assert!(max_queue.accepts(&response_with(1, 0, 5)));
+        assert!(!max_queue.accepts(&response_with(1, 0, 6)));
     }
 
     #[test]
