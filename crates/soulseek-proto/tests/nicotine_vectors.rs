@@ -6,14 +6,16 @@
 //! that our decoder accepts Nicotine+'s real SharedFileListResponse — making the
 //! reference implementation the executed oracle, not a human reading of it.
 
+use std::net::Ipv4Addr;
+
 use soulseek_proto::frame::split_frame;
 use soulseek_proto::peer::{ConnectionType, PeerInit, PierceFirewall};
 use soulseek_proto::peer_message::{
-    FolderContentsRequest, GetSharedFileList, PeerMessage, UserInfoResponse,
+    FolderContentsRequest, GetSharedFileList, PeerMessage, UserInfoRequest, UserInfoResponse,
 };
 use soulseek_proto::server::{
-    ConnectToPeerRequest, FileSearchRequest, GetPeerAddressRequest, LoginRequest, ServerRequest,
-    SetWaitPort,
+    ConnectToPeerRequest, FileSearchRequest, GetPeerAddressRequest, LoginRequest, LoginResponse,
+    ServerMessage, ServerRequest, SetWaitPort,
 };
 
 mod vectors {
@@ -161,4 +163,115 @@ fn our_decoder_accepts_nicotines_file_search_response() {
     assert_eq!(resp.files[0].name, "Music\\hit.mp3");
     assert_eq!(resp.files[0].size, 4096);
     assert!(resp.private_files.is_empty());
+}
+
+#[test]
+fn user_info_request_body_matches_nicotine() {
+    // UserInfoRequest has an empty body; our frame is [u32 len][u32 code].
+    let frame = UserInfoRequest.to_frame();
+    assert_eq!(&frame[8..], vectors::USER_INFO_REQUEST_BODY);
+}
+
+#[test]
+fn our_decoder_accepts_nicotines_folder_contents_response() {
+    // Nicotine+'s real FolderContentsResponse (peer code 37). Exercises the
+    // token + requested dir + single folder layout with NO trailing field — the
+    // divergence we just fixed (we used to emit an extra u32).
+    let (payload, rest) = split_frame(vectors::FOLDER_CONTENTS_RESPONSE_FRAME).unwrap().unwrap();
+    assert!(rest.is_empty());
+
+    let PeerMessage::FolderContents(fc) = PeerMessage::decode(payload).unwrap() else {
+        panic!("expected folder contents");
+    };
+    assert_eq!(fc.token, 1234);
+    assert_eq!(fc.directory, "Music\\Album");
+    assert_eq!(fc.folders.len(), 1);
+    assert_eq!(fc.folders[0].path, "Music\\Album");
+    assert_eq!(fc.folders[0].files[0].name, "song.mp3");
+    assert_eq!(fc.folders[0].files[0].size, 5_242_880);
+}
+
+// --- Server->client / broadcast decode oracle ---------------------------------
+// Bodies built by hand and validated by Nicotine+'s own parser (see
+// scripts/gen-nicotine-vectors.py::decode_vectors). ServerMessage::decode takes
+// a [u32 code][body] payload, so prepend the message code.
+
+fn server_payload(code: u32, body: &[u8]) -> Vec<u8> {
+    let mut payload = code.to_le_bytes().to_vec();
+    payload.extend_from_slice(body);
+    payload
+}
+
+#[test]
+fn our_decoder_accepts_nicotines_get_peer_address_response() {
+    let msg = ServerMessage::decode(&server_payload(3, vectors::GET_PEER_ADDRESS_RESPONSE_BODY))
+        .unwrap();
+    let ServerMessage::GetPeerAddress(resp) = msg else {
+        panic!("expected a get-peer-address response");
+    };
+    assert_eq!(resp.username, "alice");
+    assert_eq!(resp.ip, Ipv4Addr::new(198, 51, 100, 7));
+    assert_eq!(resp.port, 2234);
+    assert_eq!(resp.obfuscation_type, 0);
+    assert_eq!(resp.obfuscated_port, 0);
+}
+
+#[test]
+fn our_decoder_accepts_nicotines_connect_to_peer() {
+    let msg = ServerMessage::decode(&server_payload(18, vectors::CONNECT_TO_PEER_BODY)).unwrap();
+    let ServerMessage::ConnectToPeer(conn) = msg else {
+        panic!("expected a connect-to-peer");
+    };
+    assert_eq!(conn.username, "bob");
+    assert_eq!(conn.connection_type, ConnectionType::Peer);
+    assert_eq!(conn.ip, Ipv4Addr::new(10, 0, 0, 5));
+    assert_eq!(conn.port, 5000);
+    assert_eq!(conn.token, 0x0102_0304);
+    assert!(!conn.privileged);
+}
+
+#[test]
+fn our_decoder_accepts_nicotines_login_success() {
+    let msg = ServerMessage::decode(&server_payload(1, vectors::LOGIN_RESPONSE_SUCCESS_BODY))
+        .unwrap();
+    let ServerMessage::Login(LoginResponse::Success { greeting, own_ip, is_supporter, .. }) = msg
+    else {
+        panic!("expected a successful login");
+    };
+    assert_eq!(greeting, "Welcome to Soulseek!");
+    assert_eq!(own_ip, Ipv4Addr::new(203, 0, 113, 9));
+    assert!(is_supporter);
+}
+
+#[test]
+fn our_decoder_accepts_nicotines_login_failure() {
+    let msg = ServerMessage::decode(&server_payload(1, vectors::LOGIN_RESPONSE_FAILURE_BODY))
+        .unwrap();
+    let ServerMessage::Login(LoginResponse::Failure { reason, detail }) = msg else {
+        panic!("expected a failed login");
+    };
+    assert_eq!(reason, "INVALIDPASS");
+    assert_eq!(detail.as_deref(), Some("invalid password"));
+}
+
+#[test]
+fn our_decoder_accepts_nicotines_file_search_broadcast() {
+    let msg = ServerMessage::decode(&server_payload(26, vectors::FILE_SEARCH_BROADCAST_BODY))
+        .unwrap();
+    let ServerMessage::FileSearch(broadcast) = msg else {
+        panic!("expected a file-search broadcast");
+    };
+    assert_eq!(broadcast.username, "searcher");
+    assert_eq!(broadcast.token, 0xABCD);
+    assert_eq!(broadcast.query, "deep purple");
+}
+
+#[test]
+fn our_decoder_accepts_nicotines_excluded_search_phrases() {
+    let msg = ServerMessage::decode(&server_payload(160, vectors::EXCLUDED_SEARCH_PHRASES_BODY))
+        .unwrap();
+    let ServerMessage::ExcludedSearchPhrases(excluded) = msg else {
+        panic!("expected excluded search phrases");
+    };
+    assert_eq!(excluded.phrases, ["explicit", "banned phrase"]);
 }

@@ -15,6 +15,7 @@ Re-run it whenever the Nicotine+ checkout is updated.
 """
 
 import os
+import socket
 import struct
 import sys
 import zlib
@@ -32,10 +33,12 @@ sys.path.insert(0, NICOTINE_DIR)
 try:
     from pynicotine.slskmessages import (
         ConnectToPeer,
+        ExcludedSearchPhrases,
         FileListMessage,
         FileSearch,
         FileSearchResponse,
         FolderContentsRequest,
+        FolderContentsResponse,
         GetPeerAddress,
         Login,
         PeerInit,
@@ -43,6 +46,7 @@ try:
         SetWaitPort,
         SharedFileListRequest,
         SlskMessage,
+        UserInfoRequest,
         UserInfoResponse,
     )
 except ImportError as err:
@@ -83,6 +87,133 @@ def shared_file_list_frame() -> bytes:
     return frame_u32(5, zlib.compress(bytes(inflated)))
 
 
+def folder_contents_frame() -> bytes:
+    """Build a FolderContentsResponse (peer code 37) using Nicotine+'s own
+    make_network_message: token, requested dir, then one folder (ndir=1, dir,
+    its file list) — and NO trailing field. `shares` is the precomputed
+    per-folder bytes (file count + packed file infos), exactly as Nicotine+
+    stores a scanned folder stream."""
+    file_list = SlskMessage.pack_uint32(1)  # one file in the folder
+    # fileinfo = (basename, size, h_quality, h_duration); None attrs => no attrs.
+    file_list += FileListMessage.pack_file_info(("song.mp3", 5242880, None, None))
+    body = FolderContentsResponse(
+        directory="Music\\Album", token=1234, shares=bytes(file_list)
+    ).make_network_message()  # already zlib-compressed
+    return frame_u32(37, body)
+
+
+# ---------------------------------------------------------------------------
+# Decode oracle for server->client / broadcast messages.
+#
+# Nicotine+'s `make_network_message` only packs the direction it *sends* (client
+# requests + peer responses), so the server->client responses and relayed
+# broadcasts we only ever decode have no packer to borrow. Instead we lay the
+# bytes out with the wire primitives, then run Nicotine+'s OWN
+# `parse_network_message` over them and assert it recovers the expected fields —
+# making the reference the executed oracle for our *decoder*. The Rust test then
+# decodes the identical bytes and asserts the same fields.
+
+def s_str(text: str) -> bytes:
+    raw = text.encode("utf-8")
+    return struct.pack("<I", len(raw)) + raw
+
+
+def s_u32(value: int) -> bytes:
+    return struct.pack("<I", value)
+
+
+def s_u16(value: int) -> bytes:
+    return struct.pack("<H", value)
+
+
+def s_bool(value: bool) -> bytes:
+    return struct.pack("<B", 1 if value else 0)
+
+
+def s_ip(dotted: str) -> bytes:
+    # Nicotine+'s unpack_ip reverses the 4 bytes before inet_ntoa, so the wire
+    # carries the octets reversed (little-endian u32 of the address).
+    return socket.inet_aton(dotted)[::-1]
+
+
+def parsed(cls, data: bytes):
+    """Run Nicotine+'s parser over `data` and return the message object."""
+    message = cls(msg_content=memoryview(bytes(data)))
+    message.parse_network_message()
+    return message
+
+
+def decode_vectors():
+    """Build + Nicotine+-validate each server->client / broadcast body."""
+    out = []
+
+    gpa = s_str("alice") + s_ip("198.51.100.7") + s_u32(2234) + s_u32(0) + s_u16(0)
+    msg = parsed(GetPeerAddress, gpa)
+    assert (msg.user, msg.ip_address, msg.port) == ("alice", "198.51.100.7", 2234), msg
+    out.append((
+        "GET_PEER_ADDRESS_RESPONSE_BODY",
+        'GetPeerAddress response: user="alice", ip=198.51.100.7, port=2234, '
+        "obfuscation_type=0, obfuscated_port=0 (u16)",
+        gpa,
+    ))
+
+    ctp = (s_str("bob") + s_str("P") + s_ip("10.0.0.5") + s_u32(5000)
+           + s_u32(0x01020304) + s_bool(False) + s_u32(0) + s_u32(0))
+    msg = parsed(ConnectToPeer, ctp)
+    assert (msg.user, msg.conn_type, msg.ip_address, msg.port, msg.token) == (
+        "bob", "P", "10.0.0.5", 5000, 0x01020304), msg
+    out.append((
+        "CONNECT_TO_PEER_BODY",
+        'ConnectToPeer (server->client): user="bob", conn_type="P", ip=10.0.0.5, '
+        "port=5000, token=0x01020304, privileged=False, obfuscation_type=0, "
+        "obfuscated_port=0 (u32)",
+        ctp,
+    ))
+
+    ok = (s_bool(True) + s_str("Welcome to Soulseek!") + s_ip("203.0.113.9")
+          + s_str("dbc93f24d8f3f109deed23c3e2f8b74c") + s_bool(True))
+    msg = parsed(Login, ok)
+    assert msg.success is True and msg.banner == "Welcome to Soulseek!", msg
+    out.append((
+        "LOGIN_RESPONSE_SUCCESS_BODY",
+        'Login response (success): greeting="Welcome to Soulseek!", '
+        "own_ip=203.0.113.9, password md5 checksum, is_supporter=True",
+        ok,
+    ))
+
+    fail = s_bool(False) + s_str("INVALIDPASS") + s_str("invalid password")
+    msg = parsed(Login, fail)
+    assert msg.success is False and msg.rejection_reason == "INVALIDPASS", msg
+    out.append((
+        "LOGIN_RESPONSE_FAILURE_BODY",
+        'Login response (failure): reason="INVALIDPASS", detail="invalid password" '
+        "(the optional trailing rejection_detail)",
+        fail,
+    ))
+
+    fs = s_str("searcher") + s_u32(0xABCD) + s_str("deep purple")
+    msg = parsed(FileSearch, fs)
+    assert (msg.search_username, msg.token, msg.searchterm) == (
+        "searcher", 0xABCD, "deep purple"), msg
+    out.append((
+        "FILE_SEARCH_BROADCAST_BODY",
+        'FileSearch as relayed by the server: search_username="searcher", '
+        'token=0xABCD, searchterm="deep purple"',
+        fs,
+    ))
+
+    esp = s_u32(2) + s_str("explicit") + s_str("banned phrase")
+    msg = parsed(ExcludedSearchPhrases, esp)
+    assert msg.phrases == ["explicit", "banned phrase"], msg
+    out.append((
+        "EXCLUDED_SEARCH_PHRASES_BODY",
+        'ExcludedSearchPhrases: 2 phrases ["explicit", "banned phrase"]',
+        esp,
+    ))
+
+    return out
+
+
 # Each entry: (rust const name, comment, bytes). Bodies come straight from
 # Nicotine+'s make_network_message(); the shared file list is a full frame.
 VECTORS = [
@@ -119,6 +250,13 @@ VECTORS = [
     ("FOLDER_CONTENTS_REQUEST_BODY",
      'FolderContentsRequest(directory="Music\\\\Album", token=1234) — uncompressed body',
      FolderContentsRequest(directory="Music\\Album", token=1234).make_network_message()),
+    ("FOLDER_CONTENTS_RESPONSE_FRAME",
+     "FolderContentsResponse (peer code 37), full compressed frame; token 1234, "
+     'dir "Music\\\\Album", one folder with one file — no trailing field',
+     folder_contents_frame()),
+    ("USER_INFO_REQUEST_BODY",
+     "UserInfoRequest() — empty body",
+     UserInfoRequest().make_network_message()),
     ("FILE_SEARCH_RESPONSE_FRAME",
      "FileSearchResponse (peer code 9), full compressed frame; user 'peer', one file",
      frame_u32(9, FileSearchResponse(
@@ -129,6 +267,10 @@ VECTORS = [
      'ConnectToPeer(token=0x01020304, user="alice", conn_type="P") — uncompressed body',
      ConnectToPeer(token=0x01020304, user="alice", conn_type="P").make_network_message()),
 ]
+
+# Server->client / broadcast bodies, laid out by hand and validated by running
+# Nicotine+'s own parser over them (see decode_vectors).
+VECTORS += decode_vectors()
 
 
 def main():
