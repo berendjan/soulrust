@@ -8,7 +8,9 @@
 
 use soulseek_proto::frame::split_frame;
 use soulseek_proto::peer::{ConnectionType, PeerInit, PierceFirewall};
-use soulseek_proto::peer_message::{GetSharedFileList, PeerMessage};
+use soulseek_proto::peer_message::{
+    FolderContentsRequest, GetSharedFileList, PeerMessage, UserInfoResponse,
+};
 use soulseek_proto::server::{
     FileSearchRequest, GetPeerAddressRequest, LoginRequest, ServerRequest, SetWaitPort,
 };
@@ -106,4 +108,45 @@ fn our_decoder_accepts_nicotines_shared_file_list() {
     assert_eq!(resp.private_directories[0].path, "Buddies");
     assert_eq!(resp.private_directories[0].files[0].name, "Buddies\\secret.flac");
     assert_eq!(resp.private_directories[0].files[0].size, 999);
+}
+
+#[test]
+fn user_info_response_body_matches_nicotine() {
+    // Uncompressed body; our frame is [u32 len][u32 code][body], so strip 8.
+    let frame = UserInfoResponse {
+        description: "soulrust user".into(),
+        picture: None,
+        total_uploads: 42,
+        queue_size: 3,
+        slots_available: true,
+        upload_allowed: 1,
+    }
+    .to_frame();
+    assert_eq!(&frame[8..], vectors::USER_INFO_RESPONSE_BODY);
+}
+
+#[test]
+fn folder_contents_request_body_matches_nicotine() {
+    let frame = FolderContentsRequest { token: 1234, directory: "Music\\Album".into() }.to_frame();
+    assert_eq!(&frame[8..], vectors::FOLDER_CONTENTS_REQUEST_BODY);
+}
+
+#[test]
+fn our_decoder_accepts_nicotines_file_search_response() {
+    // Nicotine+'s real zlib-compressed FileSearchResponse (peer code 9).
+    let (payload, rest) = split_frame(vectors::FILE_SEARCH_RESPONSE_FRAME).unwrap().unwrap();
+    assert!(rest.is_empty());
+
+    let PeerMessage::FileSearchResponse(resp) = PeerMessage::decode(payload).unwrap() else {
+        panic!("expected a file search response");
+    };
+    assert_eq!(resp.username, "peer");
+    assert_eq!(resp.token, 0x2222);
+    assert!(resp.free_slots);
+    assert_eq!(resp.upload_speed, 5000);
+    assert_eq!(resp.in_queue, 0);
+    assert_eq!(resp.files.len(), 1);
+    assert_eq!(resp.files[0].name, "Music\\hit.mp3");
+    assert_eq!(resp.files[0].size, 4096);
+    assert!(resp.private_files.is_empty());
 }

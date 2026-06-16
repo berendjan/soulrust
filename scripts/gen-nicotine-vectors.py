@@ -33,6 +33,8 @@ try:
     from pynicotine.slskmessages import (
         FileListMessage,
         FileSearch,
+        FileSearchResponse,
+        FolderContentsRequest,
         GetPeerAddress,
         Login,
         PeerInit,
@@ -40,6 +42,7 @@ try:
         SetWaitPort,
         SharedFileListRequest,
         SlskMessage,
+        UserInfoResponse,
     )
 except ImportError as err:
     sys.exit(f"cannot import pynicotine from {NICOTINE_DIR}: {err}\n"
@@ -107,6 +110,20 @@ VECTORS = [
      "SharedFileListResponse (peer code 5), full compressed frame; one public "
      "and one private folder, each with one file",
      shared_file_list_frame()),
+    ("USER_INFO_RESPONSE_BODY",
+     'UserInfoResponse(descr="soulrust user", pic=None, totalupl=42, queuesize=3, '
+     "slotsavail=True, uploadallowed=1) — uncompressed body",
+     UserInfoResponse(descr="soulrust user", pic=None, totalupl=42, queuesize=3,
+                      slotsavail=True, uploadallowed=1).make_network_message()),
+    ("FOLDER_CONTENTS_REQUEST_BODY",
+     'FolderContentsRequest(directory="Music\\\\Album", token=1234) — uncompressed body',
+     FolderContentsRequest(directory="Music\\Album", token=1234).make_network_message()),
+    ("FILE_SEARCH_RESPONSE_FRAME",
+     "FileSearchResponse (peer code 9), full compressed frame; user 'peer', one file",
+     frame_u32(9, FileSearchResponse(
+         search_username="peer", token=0x2222,
+         shares=[("Music\\hit.mp3", 4096, None, None)],
+         freeulslots=True, ulspeed=5000, inqueue=0, private_shares=[]).make_network_message())),
 ]
 
 
