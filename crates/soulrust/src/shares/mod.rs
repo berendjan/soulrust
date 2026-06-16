@@ -12,6 +12,8 @@ use soulseek_proto::peer_message::{
     FolderContentsResponse, SharedDirectory, SharedFile, SharedFileListResponse,
 };
 
+pub mod audio;
+
 /// One shared file. `virtual_path` is the backslash-separated path advertised to
 /// peers (e.g. `Music\\Album\\song.mp3`), rooted at the share folder's basename.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +21,9 @@ pub struct SharedFileEntry {
     pub real_path: PathBuf,
     pub virtual_path: String,
     pub size: u64,
+    /// Soulseek `(type, value)` audio attributes (bitrate/duration/sample
+    /// rate/bit depth), extracted at scan time. Empty for non-audio files.
+    pub attributes: Vec<(u32, u32)>,
 }
 
 /// Substituted for a literal backslash in a real filename. The Soulseek network
@@ -73,10 +78,17 @@ impl ShareIndex {
     /// for tools/tests that build an index directly, using the exact same word
     /// and folder indexing a real scan does (so they can't drift).
     pub fn add_virtual(&mut self, virtual_path: &str, size: u64) {
-        self.add_file(PathBuf::from(virtual_path), virtual_path.to_owned(), size);
+        // No real file to inspect, so no audio attributes.
+        self.add_file(PathBuf::from(virtual_path), virtual_path.to_owned(), size, Vec::new());
     }
 
-    fn add_file(&mut self, real_path: PathBuf, virtual_path: String, size: u64) {
+    fn add_file(
+        &mut self,
+        real_path: PathBuf,
+        virtual_path: String,
+        size: u64,
+        attributes: Vec<(u32, u32)>,
+    ) {
         let id = self.files.len() as u32;
 
         // Dedup tokens per file without a per-file HashSet or token clones: all
@@ -96,7 +108,7 @@ impl ShareIndex {
         self.folders.entry(folder).or_default().push(id);
 
         self.by_virtual.insert(virtual_path.clone(), id);
-        self.files.push(SharedFileEntry { real_path, virtual_path, size });
+        self.files.push(SharedFileEntry { real_path, virtual_path, size, attributes });
     }
 
     pub fn num_files(&self) -> usize {
@@ -121,7 +133,7 @@ impl ShareIndex {
             name: entry.virtual_path.clone(),
             size: entry.size,
             extension: String::new(),
-            attributes: Vec::new(),
+            attributes: entry.attributes.clone(),
         }
     }
 
@@ -137,7 +149,7 @@ impl ShareIndex {
             name: basename.to_owned(),
             size: entry.size,
             extension: String::new(),
-            attributes: Vec::new(),
+            attributes: entry.attributes.clone(),
         }
     }
 
@@ -231,7 +243,10 @@ fn walk(dir: &Path, virtual_prefix: &str, index: &mut ShareIndex, visited: &mut 
             // before building `virtual_file_path` (shares.py:scan_shared_folder).
             let basename = name.replace('\\', BACKSLASH_SENTINEL);
             let virtual_path = format!("{virtual_prefix}\\{basename}");
-            index.add_file(path, virtual_path, meta.len());
+            // Extract audio attributes (bitrate/duration/…) at scan time so
+            // peers can filter and sort our files; non-audio files get none.
+            let attributes = audio::attributes_of(&path);
+            index.add_file(path, virtual_path, meta.len(), attributes);
         }
     }
 }
@@ -254,6 +269,57 @@ mod tests {
         std::fs::write(music.join(".secret.mp3"), b"xxxx").unwrap();
         std::fs::write(music.join(".hidden").join("nope.mp3"), b"yyyy").unwrap();
         music
+    }
+
+    /// Writes a minimal 16-bit mono PCM WAV (silence) so a scan can extract real
+    /// audio attributes without a binary fixture.
+    fn write_test_wav(path: &Path, sample_rate: u32, secs: u32) {
+        let (bits, channels) = (16u16, 1u16);
+        let byte_rate = sample_rate * u32::from(channels) * u32::from(bits) / 8;
+        let data_len = byte_rate * secs;
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&channels.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&byte_rate.to_le_bytes());
+        wav.extend_from_slice(&(channels * bits / 8).to_le_bytes());
+        wav.extend_from_slice(&bits.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        wav.resize(wav.len() + data_len as usize, 0); // silent samples
+        std::fs::write(path, wav).unwrap();
+    }
+
+    #[test]
+    fn scanned_audio_file_carries_attributes_to_the_wire() {
+        // A real audio file's attributes flow through scan into both the search
+        // (full-path) and folder-stream (basename) SharedFile representations.
+        let root = std::env::temp_dir().join(format!("soulrust-shares-{}-attrs", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let music = root.join("Music");
+        std::fs::create_dir_all(&music).unwrap();
+        write_test_wav(&music.join("tone.wav"), 8_000, 1);
+        std::fs::write(music.join("readme.txt"), b"not audio").unwrap();
+
+        let index = ShareIndex::scan(std::slice::from_ref(&music));
+        let id_of = |suffix: &str| {
+            index.files.iter().position(|f| f.virtual_path.ends_with(suffix)).unwrap() as u32
+        };
+        let wav = id_of("tone.wav");
+        let txt = id_of("readme.txt");
+
+        // Lossless WAV: duration(1), sample rate(4), bit depth(5).
+        let expected = vec![(1, 1), (4, 8_000), (5, 16)];
+        assert_eq!(index.shared_file(wav).attributes, expected, "search response carries attributes");
+        assert_eq!(index.folder_file(wav).attributes, expected, "folder stream carries attributes");
+        assert!(index.shared_file(txt).attributes.is_empty(), "non-audio file has none");
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
