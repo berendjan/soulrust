@@ -14,8 +14,9 @@ use soulseek_proto::peer_message::{
     FolderContentsRequest, GetSharedFileList, PeerMessage, UserInfoRequest, UserInfoResponse,
 };
 use soulseek_proto::server::{
-    BranchLevel, BranchRoot, ConnectToPeerRequest, FileSearchRequest, GetPeerAddressRequest,
-    LoginRequest, LoginResponse, ServerMessage, ServerRequest, SetWaitPort,
+    AcceptChildren, BranchLevel, BranchRoot, ConnectToPeerRequest, FileSearchRequest,
+    GetPeerAddressRequest, HaveNoParent, LoginRequest, LoginResponse, ServerMessage, ServerRequest,
+    SetWaitPort,
 };
 use soulseek_proto::distributed::{
     DistribBranchLevel, DistribBranchRoot, DistribChildDepth, DistribEmbedded, DistribPing,
@@ -521,6 +522,12 @@ fn our_decoder_accepts_nicotines_distrib_embedded() {
 fn branch_level_and_root_bodies_match_nicotine() {
     assert_eq!(&BranchLevel { level: 3 }.to_frame()[8..], vectors::BRANCH_LEVEL_BODY);
     assert_eq!(&BranchRoot { root: "alice".into() }.to_frame()[8..], vectors::BRANCH_ROOT_BODY);
+}
+
+#[test]
+fn have_no_parent_and_accept_children_bodies_match_nicotine() {
+    assert_eq!(&HaveNoParent { no_parent: true }.to_frame()[8..], vectors::HAVE_NO_PARENT_BODY);
+    assert_eq!(&AcceptChildren { accept: false }.to_frame()[8..], vectors::ACCEPT_CHILDREN_BODY);
 }
 
 #[test]

@@ -47,6 +47,12 @@ pub const FILE_SEARCH_RESPONSE_FRAME: &[u8] = &[0x37, 0x00, 0x00, 0x00, 0x09, 0x
 /// ConnectToPeer(token=0x01020304, user="alice", conn_type="P") — uncompressed body
 pub const CONNECT_TO_PEER_REQUEST_BODY: &[u8] = &[0x04, 0x03, 0x02, 0x01, 0x05, 0x00, 0x00, 0x00, 0x61, 0x6c, 0x69, 0x63, 0x65, 0x01, 0x00, 0x00, 0x00, 0x50];
 
+/// HaveNoParent(noparent=True) — we ask the server for a parent (server code 71)
+pub const HAVE_NO_PARENT_BODY: &[u8] = &[0x01];
+
+/// AcceptChildren(enabled=False) — we decline distributed children (server code 100)
+pub const ACCEPT_CHILDREN_BODY: &[u8] = &[0x00];
+
 /// BranchLevel(value=3) — we report our distributed tree depth (server code 126)
 pub const BRANCH_LEVEL_BODY: &[u8] = &[0x03, 0x00, 0x00, 0x00];
 

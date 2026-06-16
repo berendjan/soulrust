@@ -10,8 +10,8 @@ use rust_messenger::traits::extended::Sender;
 use soulseek_proto::distributed::{self, DistribSearch};
 use soulseek_proto::peer::ConnectionType;
 use soulseek_proto::server::{
-    BranchLevel, BranchRoot, FileSearchRequest, GetPeerAddressRequest, LoginRequest, ServerMessage,
-    ServerRequest, SetWaitPort,
+    AcceptChildren, BranchLevel, BranchRoot, FileSearchRequest, GetPeerAddressRequest,
+    HaveNoParent, LoginRequest, ServerMessage, ServerRequest, SetWaitPort,
 };
 use soulseek_proto::Reader;
 
@@ -46,6 +46,10 @@ pub struct Session {
     /// Usernames whose address we're resolving so peer_net can open an upload
     /// connection. A GetPeerAddress response emits PeerUploadConnect for these.
     pending_upload_resolves: HashSet<String>,
+    /// The distributed parent we've asked peer_net to adopt, if any. We adopt at
+    /// most one (Nicotine+ does the same) rather than stacking a connection per
+    /// PossibleParents message.
+    distrib_parent: Option<String>,
 }
 
 /// A download queued before we knew the peer's address.
@@ -69,6 +73,7 @@ impl Session {
             pending_browses: HashSet::new(),
             pending_downloads: HashMap::new(),
             pending_upload_resolves: HashSet::new(),
+            distrib_parent: None,
         }
     }
 
@@ -98,6 +103,8 @@ impl traits::core::Handle<NetConn> for Session {
             }
             NetConnEvent::Failed { reason } | NetConnEvent::Closed { reason } => {
                 self.state = SessionState::Disconnected;
+                // Forget the distributed parent so a reconnect re-adopts one.
+                self.distrib_parent = None;
                 Self::emit(SessionEventKind::Disconnected { reason: reason.clone() }, writer);
             }
         }
@@ -130,13 +137,17 @@ impl traits::core::Handle<NetRx> for Session {
                     obfuscated_port: 0,
                 };
                 Self::send(&NetTx { frame: wait_port.to_frame() }, writer);
-                // Declare our position in the distributed search tree: until we
-                // adopt a parent we are our own branch root at level 0.
-                Self::send(&NetTx { frame: BranchLevel { level: 0 }.to_frame() }, writer);
+                // Join the distributed search tree, in Nicotine+'s order: ask for
+                // a parent (so the server sends PossibleParents and routes
+                // searches to us), declare we're our own root at level 0, and
+                // decline children for now (we don't forward down-tree yet).
+                Self::send(&NetTx { frame: HaveNoParent { no_parent: true }.to_frame() }, writer);
                 Self::send(
                     &NetTx { frame: BranchRoot { root: self.username.clone() }.to_frame() },
                     writer,
                 );
+                Self::send(&NetTx { frame: BranchLevel { level: 0 }.to_frame() }, writer);
+                Self::send(&NetTx { frame: AcceptChildren { accept: false }.to_frame() }, writer);
                 Self::emit(
                     SessionEventKind::LoggedIn { greeting, own_ip: own_ip.to_string() },
                     writer,
@@ -191,17 +202,21 @@ impl traits::core::Handle<NetRx> for Session {
                 }
             }
             ServerMessage::PossibleParents(possible) => {
-                // Try to adopt the first candidate as our distributed parent;
-                // peer_net opens the D connection.
-                if let Some(parent) = possible.parents.into_iter().next() {
-                    Self::send(
-                        &PeerDistribConnect {
-                            username: parent.username,
-                            ip: parent.ip.to_string(),
-                            port: parent.port as u16,
-                        },
-                        writer,
-                    );
+                // Adopt at most one parent. The server resends PossibleParents
+                // periodically; without this guard each message would stack up
+                // another D connection.
+                if self.distrib_parent.is_none() {
+                    if let Some(parent) = possible.parents.into_iter().next() {
+                        self.distrib_parent = Some(parent.username.clone());
+                        Self::send(
+                            &PeerDistribConnect {
+                                username: parent.username,
+                                ip: parent.ip.to_string(),
+                                port: parent.port as u16,
+                            },
+                            writer,
+                        );
+                    }
                 }
             }
             ServerMessage::ParentMinSpeed(_) | ServerMessage::ParentSpeedRatio(_) => {
@@ -624,7 +639,8 @@ mod tests {
         session.handle(&NetRx { payload: login_success_payload() }, &writer);
 
         let frames = writer.frames();
-        assert_eq!(frames.len(), 4, "login + set wait port + branch level + branch root");
+        // login + wait port + the 4 distributed-tree join messages.
+        assert_eq!(frames.len(), 6, "login + wait port + HaveNoParent/BranchRoot/BranchLevel/AcceptChildren");
         let expected_wait_port =
             SetWaitPort { port: 2234, obfuscation_type: 0, obfuscated_port: 0 }.to_frame();
         assert_eq!(frames[1], expected_wait_port);
@@ -699,10 +715,10 @@ mod tests {
         );
 
         let frames = writer.frames();
-        // login + wait port + branch level + branch root + 2 searches
-        assert_eq!(frames.len(), 6);
-        assert_eq!(frames[4], FileSearchRequest { token: 1, query: "A One".into() }.to_frame());
-        assert_eq!(frames[5], FileSearchRequest { token: 2, query: "B Two".into() }.to_frame());
+        // login + wait port + 4 distributed-join messages + 2 searches
+        assert_eq!(frames.len(), 8);
+        assert_eq!(frames[6], FileSearchRequest { token: 1, query: "A One".into() }.to_frame());
+        assert_eq!(frames[7], FileSearchRequest { token: 2, query: "B Two".into() }.to_frame());
 
         let results = writer.search_results();
         assert_eq!(results[0].started.len(), 2);
@@ -824,18 +840,61 @@ mod tests {
 
     #[test]
     fn login_declares_our_branch_position() {
-        // On login we tell the server we're our own branch root at level 0.
+        // On login we join the distributed tree: ask for a parent, declare we're
+        // our own root at level 0, and decline children.
         let writer = CapturingWriter::default();
         let _session = logged_in_session(&writer);
         let frames = writer.frames();
         assert!(
-            frames.contains(&BranchLevel { level: 0 }.to_frame()),
-            "BranchLevel(0) sent on login"
+            frames.contains(&HaveNoParent { no_parent: true }.to_frame()),
+            "HaveNoParent(true) makes the server engage us in the distributed tree"
         );
+        assert!(frames.contains(&BranchLevel { level: 0 }.to_frame()), "BranchLevel(0) on login");
         assert!(
             frames.contains(&BranchRoot { root: "testuser".into() }.to_frame()),
-            "BranchRoot(self) sent on login"
+            "BranchRoot(self) on login"
         );
+        assert!(
+            frames.contains(&AcceptChildren { accept: false }.to_frame()),
+            "AcceptChildren(false) — we don't forward down-tree yet"
+        );
+    }
+
+    #[test]
+    fn possible_parents_adopts_at_most_one_and_ignores_empty() {
+        use soulseek_proto::wire::{put_ipv4, put_string, put_u32};
+        let writer = CapturingWriter::default();
+        let mut session = logged_in_session(&writer);
+
+        let parents_payload = |entries: &[(&str, Ipv4Addr, u32)]| {
+            let mut body = Vec::new();
+            put_u32(&mut body, 102);
+            put_u32(&mut body, entries.len() as u32);
+            for (user, ip, port) in entries {
+                put_string(&mut body, user);
+                put_ipv4(&mut body, *ip);
+                put_u32(&mut body, *port);
+            }
+            body
+        };
+
+        // Empty list -> no connect.
+        session.handle(&NetRx { payload: parents_payload(&[]) }, &writer);
+        assert!(writer.distrib_connects().is_empty(), "empty PossibleParents adopts nothing");
+
+        // First non-empty list -> one connect.
+        session.handle(
+            &NetRx { payload: parents_payload(&[("p1", Ipv4Addr::new(10, 0, 0, 1), 1)]) },
+            &writer,
+        );
+        // A second message (server resends) -> still only one parent adopted.
+        session.handle(
+            &NetRx { payload: parents_payload(&[("p2", Ipv4Addr::new(10, 0, 0, 2), 2)]) },
+            &writer,
+        );
+        let connects = writer.distrib_connects();
+        assert_eq!(connects.len(), 1, "we adopt at most one parent");
+        assert_eq!(connects[0].username, "p1");
     }
 
     #[test]

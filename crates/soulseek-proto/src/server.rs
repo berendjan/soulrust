@@ -9,7 +9,7 @@ use std::net::Ipv4Addr;
 
 use crate::frame::frame_u32;
 use crate::peer::ConnectionType;
-use crate::wire::{put_string, put_u32, DecodeError, Reader};
+use crate::wire::{put_bool, put_string, put_u32, DecodeError, Reader};
 
 pub mod code {
     pub const LOGIN: u32 = 1;
@@ -18,9 +18,11 @@ pub mod code {
     pub const CONNECT_TO_PEER: u32 = 18;
     pub const FILE_SEARCH: u32 = 26;
     // Distributed search network (parent/child tree management).
+    pub const HAVE_NO_PARENT: u32 = 71;
     pub const PARENT_MIN_SPEED: u32 = 83;
     pub const PARENT_SPEED_RATIO: u32 = 84;
     pub const EMBEDDED_MESSAGE: u32 = 93;
+    pub const ACCEPT_CHILDREN: u32 = 100;
     pub const POSSIBLE_PARENTS: u32 = 102;
     pub const BRANCH_LEVEL: u32 = 126;
     pub const BRANCH_ROOT: u32 = 127;
@@ -272,6 +274,35 @@ impl ExcludedSearchPhrases {
     }
 }
 
+/// Server code 71 — HaveNoParent: tell the server whether we need a distributed
+/// parent. We send `true` on login so the server starts offering PossibleParents
+/// (and routing searches to us as a branch root). Client→server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HaveNoParent {
+    pub no_parent: bool,
+}
+
+impl ServerRequest for HaveNoParent {
+    const CODE: u32 = code::HAVE_NO_PARENT;
+    fn encode_body(&self, buf: &mut Vec<u8>) {
+        put_bool(buf, self.no_parent);
+    }
+}
+
+/// Server code 100 — AcceptChildren: tell the server whether we'll take
+/// distributed children. Client→server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptChildren {
+    pub accept: bool,
+}
+
+impl ServerRequest for AcceptChildren {
+    const CODE: u32 = code::ACCEPT_CHILDREN;
+    fn encode_body(&self, buf: &mut Vec<u8>) {
+        put_bool(buf, self.accept);
+    }
+}
+
 /// Server code 126 — BranchLevel: we tell the server our depth in the
 /// distributed search tree (0 when we are our own root). Client→server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -426,7 +457,7 @@ impl ServerMessage {
 mod tests {
     use super::*;
     use crate::frame::split_frame;
-    use crate::wire::{put_bool, put_ipv4, put_u16};
+    use crate::wire::{put_bool, put_ipv4, put_u16, put_u8};
 
     #[test]
     fn login_request_frame_is_byte_exact() {
@@ -724,6 +755,54 @@ mod tests {
                 is_supporter: true,
             })
         );
+    }
+
+    #[test]
+    fn login_flags_follow_unpack_bool_any_nonzero_is_true() {
+        // Nicotine+ reads BOTH the success flag and is_supporter with
+        // unpack_bool, which is `bool(self._message[self._offset])`
+        // (slskmessages.py): any nonzero byte is true, not only 0x01. A server
+        // sending e.g. 0x02 for the leading success flag must still select the
+        // Success branch, and a trailing is_supporter of 0x02 must decode true.
+        // The existing success/failure tests only exercise the 0x00/0x01 flag
+        // bytes; this pins the any-nonzero boundary at the message level so a
+        // decoder that compared `== 1` would be caught.
+        let mut body = Vec::new();
+        put_u32(&mut body, code::LOGIN);
+        put_u8(&mut body, 0x02); // success flag: nonzero => Success branch
+        put_string(&mut body, "Welcome to Soulseek!");
+        put_ipv4(&mut body, Ipv4Addr::new(203, 0, 113, 7));
+        put_string(&mut body, "0123456789abcdef0123456789abcdef");
+        put_u8(&mut body, 0x02); // is_supporter: nonzero => true
+        assert_eq!(
+            ServerMessage::decode(&body).unwrap(),
+            ServerMessage::Login(LoginResponse::Success {
+                greeting: "Welcome to Soulseek!".into(),
+                own_ip: Ipv4Addr::new(203, 0, 113, 7),
+                password_md5: "0123456789abcdef0123456789abcdef".into(),
+                is_supporter: true,
+            })
+        );
+    }
+
+    #[test]
+    fn file_search_request_packs_query_verbatim() {
+        // Our encoder mirrors Nicotine+'s FileSearch.make_network_message
+        // exactly: pack_uint32(token) + pack_string(searchterm), with no
+        // transformation of the query bytes. Nicotine+ DOES drop standalone "-"
+        // tokens and collapse whitespace ("artist - title" -> "artist title"),
+        // but it does that in FileSearch.__init__ (query preprocessing), NOT in
+        // make_network_message — so that normalization is an upstream/caller
+        // concern, outside this codec. Pin that the query field is
+        // length-prefixed and packed byte-for-byte as given, including an
+        // embedded standalone dash that Nicotine+'s __init__ would have stripped.
+        let mut body = Vec::new();
+        FileSearchRequest { token: 7, query: "artist - title".into() }.encode_body(&mut body);
+
+        let mut expected = Vec::new();
+        put_u32(&mut expected, 7);
+        put_string(&mut expected, "artist - title");
+        assert_eq!(body, expected);
     }
 
     #[test]

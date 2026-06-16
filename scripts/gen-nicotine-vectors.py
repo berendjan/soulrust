@@ -32,9 +32,11 @@ sys.path.insert(0, NICOTINE_DIR)
 
 try:
     from pynicotine.slskmessages import (
+        AcceptChildren,
         BranchLevel,
         BranchRoot,
         ConnectToPeer,
+        HaveNoParent,
         DistribBranchLevel,
         DistribBranchRoot,
         DistribChildDepth,
@@ -343,6 +345,12 @@ VECTORS = [
     ("CONNECT_TO_PEER_REQUEST_BODY",
      'ConnectToPeer(token=0x01020304, user="alice", conn_type="P") — uncompressed body',
      ConnectToPeer(token=0x01020304, user="alice", conn_type="P").make_network_message()),
+    ("HAVE_NO_PARENT_BODY",
+     "HaveNoParent(noparent=True) — we ask the server for a parent (server code 71)",
+     HaveNoParent(noparent=True).make_network_message()),
+    ("ACCEPT_CHILDREN_BODY",
+     "AcceptChildren(enabled=False) — we decline distributed children (server code 100)",
+     AcceptChildren(enabled=False).make_network_message()),
     ("BRANCH_LEVEL_BODY",
      "BranchLevel(value=3) — we report our distributed tree depth (server code 126)",
      BranchLevel(value=3).make_network_message()),
