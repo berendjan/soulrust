@@ -407,6 +407,13 @@ pub enum PeerMessage {
     FolderContents(FolderContentsResponse),
     UserInfoRequest,
     UserInfoResponse(UserInfoResponse),
+    QueueUpload(crate::transfer::QueueUpload),
+    TransferRequest(crate::transfer::TransferRequest),
+    TransferResponse(crate::transfer::TransferResponse),
+    PlaceInQueueRequest(crate::transfer::PlaceInQueueRequest),
+    PlaceInQueueResponse(crate::transfer::PlaceInQueueResponse),
+    UploadDenied(crate::transfer::UploadDenied),
+    UploadFailed(crate::transfer::UploadFailed),
     Unknown { code: u32, body: Vec<u8> },
 }
 
@@ -439,6 +446,27 @@ impl PeerMessage {
             code::USER_INFO_REQUEST => Ok(PeerMessage::UserInfoRequest),
             code::USER_INFO_RESPONSE => {
                 Ok(PeerMessage::UserInfoResponse(UserInfoResponse::decode(&mut r)?))
+            }
+            crate::transfer::code::QUEUE_UPLOAD => {
+                Ok(PeerMessage::QueueUpload(crate::transfer::QueueUpload::decode(&mut r)?))
+            }
+            crate::transfer::code::TRANSFER_REQUEST => {
+                Ok(PeerMessage::TransferRequest(crate::transfer::TransferRequest::decode(&mut r)?))
+            }
+            crate::transfer::code::TRANSFER_RESPONSE => {
+                Ok(PeerMessage::TransferResponse(crate::transfer::TransferResponse::decode(&mut r)?))
+            }
+            crate::transfer::code::PLACE_IN_QUEUE_REQUEST => Ok(PeerMessage::PlaceInQueueRequest(
+                crate::transfer::PlaceInQueueRequest::decode(&mut r)?,
+            )),
+            crate::transfer::code::PLACE_IN_QUEUE_RESPONSE => Ok(PeerMessage::PlaceInQueueResponse(
+                crate::transfer::PlaceInQueueResponse::decode(&mut r)?,
+            )),
+            crate::transfer::code::UPLOAD_DENIED => {
+                Ok(PeerMessage::UploadDenied(crate::transfer::UploadDenied::decode(&mut r)?))
+            }
+            crate::transfer::code::UPLOAD_FAILED => {
+                Ok(PeerMessage::UploadFailed(crate::transfer::UploadFailed::decode(&mut r)?))
             }
             _ => {
                 let mut body = Vec::with_capacity(r.remaining());

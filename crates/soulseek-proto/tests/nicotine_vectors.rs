@@ -17,6 +17,10 @@ use soulseek_proto::server::{
     ConnectToPeerRequest, FileSearchRequest, GetPeerAddressRequest, LoginRequest, LoginResponse,
     ServerMessage, ServerRequest, SetWaitPort,
 };
+use soulseek_proto::transfer::{
+    FileOffset, FileTransferInit, PlaceInQueueRequest, PlaceInQueueResponse, QueueUpload,
+    TransferDirection, TransferRequest, TransferResponse, UploadDenied, UploadFailed,
+};
 
 mod vectors {
     include!("fixtures/nicotine_vectors.rs");
@@ -274,4 +278,73 @@ fn our_decoder_accepts_nicotines_excluded_search_phrases() {
         panic!("expected excluded search phrases");
     };
     assert_eq!(excluded.phrases, ["explicit", "banned phrase"]);
+}
+
+// --- file transfers -----------------------------------------------------------
+// Peer-message transfer bodies; our frame is [u32 len][u32 code][body], so strip
+// the 8-byte header to compare against Nicotine+'s make_network_message body.
+
+#[test]
+fn transfer_request_bodies_match_nicotine() {
+    let upload = TransferRequest {
+        direction: TransferDirection::Upload,
+        token: 0xABCD,
+        file: "Music\\song.mp3".into(),
+        filesize: Some(5_242_880),
+    }
+    .to_frame();
+    assert_eq!(&upload[8..], vectors::TRANSFER_REQUEST_UPLOAD_BODY);
+
+    let download = TransferRequest {
+        direction: TransferDirection::Download,
+        token: 7,
+        file: "x".into(),
+        filesize: None,
+    }
+    .to_frame();
+    assert_eq!(&download[8..], vectors::TRANSFER_REQUEST_DOWNLOAD_BODY);
+}
+
+#[test]
+fn transfer_response_bodies_match_nicotine() {
+    let allowed = TransferResponse { token: 9, allowed: true, filesize: Some(4096), reason: None }
+        .to_frame();
+    assert_eq!(&allowed[8..], vectors::TRANSFER_RESPONSE_ALLOWED_BODY);
+
+    let rejected = TransferResponse {
+        token: 9,
+        allowed: false,
+        filesize: None,
+        reason: Some("Queued".into()),
+    }
+    .to_frame();
+    assert_eq!(&rejected[8..], vectors::TRANSFER_RESPONSE_REJECTED_BODY);
+}
+
+#[test]
+fn queue_and_place_in_queue_bodies_match_nicotine() {
+    let queue = QueueUpload { file: "Music\\song.mp3".into() }.to_frame();
+    assert_eq!(&queue[8..], vectors::QUEUE_UPLOAD_BODY);
+
+    let request = PlaceInQueueRequest { file: "a\\b.mp3".into() }.to_frame();
+    assert_eq!(&request[8..], vectors::PLACE_IN_QUEUE_REQUEST_BODY);
+
+    let response = PlaceInQueueResponse { filename: "a\\b.mp3".into(), place: 3 }.to_frame();
+    assert_eq!(&response[8..], vectors::PLACE_IN_QUEUE_RESPONSE_BODY);
+}
+
+#[test]
+fn upload_denied_and_failed_bodies_match_nicotine() {
+    let denied = UploadDenied { file: "a.mp3".into(), reason: "Not shared".into() }.to_frame();
+    assert_eq!(&denied[8..], vectors::UPLOAD_DENIED_BODY);
+
+    let failed = UploadFailed { file: "a.mp3".into() }.to_frame();
+    assert_eq!(&failed[8..], vectors::UPLOAD_FAILED_BODY);
+}
+
+#[test]
+fn f_connection_messages_match_nicotine() {
+    // Raw bytes: no length prefix, no code — compare directly.
+    assert_eq!(FileTransferInit { token: 0xABCD }.to_bytes(), vectors::FILE_TRANSFER_INIT_BYTES);
+    assert_eq!(FileOffset { offset: 1_048_576 }.to_bytes(), vectors::FILE_OFFSET_BYTES);
 }

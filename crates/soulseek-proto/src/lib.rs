@@ -29,6 +29,7 @@ pub mod frame;
 pub mod peer;
 pub mod peer_message;
 pub mod server;
+pub mod transfer;
 pub mod wire;
 
 pub use frame::{
