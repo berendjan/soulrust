@@ -340,4 +340,38 @@ mod tests {
         // No included word in the index → no results, not an error.
         assert!(respond("nonexistentword", 100, &[], &index).is_empty());
     }
+
+    #[test]
+    fn multiple_included_words_intersect() {
+        // All included words must be present (a set intersection), like
+        // Nicotine+'s _create_search_result_list.
+        let index = index_with(&[
+            ("Music\\Gwen\\Stefani\\hit.mp3", 1),
+            ("Music\\Gwen\\Other\\clip.mp3", 2),
+        ]);
+        // Both files contain "gwen", only the first also contains "stefani".
+        assert_eq!(respond("gwen", 100, &[], &index).len(), 2);
+        let hits = respond("gwen stefani", 100, &[], &index);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "Music\\Gwen\\Stefani\\hit.mp3");
+        // A second word absent from every file yields no results.
+        assert!(respond("gwen nonexistent", 100, &[], &index).is_empty());
+    }
+
+    #[test]
+    fn partial_words_match_by_suffix() {
+        // A `*term` partial matches any indexed word ending in `term`, narrowing
+        // the included results (Nicotine+'s partial-word handling).
+        let index = index_with(&[
+            ("Music\\song.mp3", 1),
+            ("Music\\song.flac", 2),
+        ]);
+        // "song" matches both; the partial "*mp3" keeps only the .mp3 (its
+        // extension tokenizes to the word "mp3").
+        let hits = respond("song *mp3", 100, &[], &index);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "Music\\song.mp3");
+        // A partial that matches nothing drops all results.
+        assert!(respond("song *xyz", 100, &[], &index).is_empty());
+    }
 }
