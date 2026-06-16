@@ -1,0 +1,5 @@
+[package]
+name = "direct_messenger"
+version = "0.1.0"
+edition = "2021"
+description = "Compile-time message-routing call graph: generates Sender/MessengerRoute trait impls from a declarative route table, so a missing or mistyped route is a compile error and request/response is a typed return value (no correlation ids)."
