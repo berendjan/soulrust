@@ -125,7 +125,7 @@ fn browse_over_stream<S: Read + Write>(
                     let consumed = pending.len() - rest.len();
                     match PeerMessage::decode(payload) {
                         Ok(PeerMessage::SharedFileList(response)) => return Ok(response),
-                        Ok(PeerMessage::Unknown { .. }) => {}
+                        Ok(_) => {} // ignore other peer messages while awaiting the list
                         Err(err) => return Err(format!("decoding peer message: {err}")),
                     }
                     pending.drain(..consumed);

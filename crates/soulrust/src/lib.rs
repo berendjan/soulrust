@@ -14,5 +14,8 @@ pub mod components;
 pub mod config;
 pub mod extract;
 pub mod messages;
+pub mod search_response;
+pub mod shares;
+pub mod transfers;
 pub mod version;
 pub mod wiring;

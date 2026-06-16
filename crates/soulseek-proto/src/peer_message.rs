@@ -9,11 +9,16 @@
 use std::io::Read;
 
 use crate::frame::frame_u32;
-use crate::wire::{put_string, put_u32, put_u64, put_u8, DecodeError, Reader};
+use crate::wire::{put_bool, put_string, put_u32, put_u64, put_u8, DecodeError, Reader};
 
 pub mod code {
     pub const GET_SHARED_FILE_LIST: u32 = 4;
     pub const SHARED_FILE_LIST: u32 = 5;
+    pub const FILE_SEARCH_RESPONSE: u32 = 9;
+    pub const USER_INFO_REQUEST: u32 = 15;
+    pub const USER_INFO_RESPONSE: u32 = 16;
+    pub const FOLDER_CONTENTS_REQUEST: u32 = 36;
+    pub const FOLDER_CONTENTS_RESPONSE: u32 = 37;
 }
 
 /// Upper bound on a *decompressed* shared file list. A hostile peer can send a
@@ -104,29 +109,60 @@ impl SharedFileListResponse {
     }
 }
 
+/// One file entry as it appears in every share/search/folder listing
+/// (Nicotine+'s `FileListMessage.pack_file_info`).
+fn read_file(r: &mut Reader) -> Result<SharedFile, DecodeError> {
+    let _code = r.u8()?; // always 1, unused
+    let name = r.string()?;
+    // Nicotine+'s `unpack_file_size` workaround for the Soulseek NS >2 GiB bug,
+    // not a plain u64.
+    let size = r.file_size()?;
+    let extension = r.string()?;
+    let attr_count = r.u32()? as usize;
+    let mut attributes = Vec::with_capacity(attr_count.min(MAX_PREALLOC));
+    for _ in 0..attr_count {
+        let attr_type = r.u32()?;
+        let value = r.u32()?;
+        attributes.push((attr_type, value));
+    }
+    Ok(SharedFile { name, size, extension, attributes })
+}
+
+fn write_file(buf: &mut Vec<u8>, file: &SharedFile) {
+    put_u8(buf, 1);
+    put_string(buf, &file.name);
+    put_u64(buf, file.size);
+    put_string(buf, &file.extension);
+    put_u32(buf, file.attributes.len() as u32);
+    for &(attr_type, value) in &file.attributes {
+        put_u32(buf, attr_type);
+        put_u32(buf, value);
+    }
+}
+
+/// A count-prefixed file list (`[u32 nfiles][file…]`).
+fn read_file_list(r: &mut Reader) -> Result<Vec<SharedFile>, DecodeError> {
+    let count = r.u32()? as usize;
+    let mut files = Vec::with_capacity(count.min(MAX_PREALLOC));
+    for _ in 0..count {
+        files.push(read_file(r)?);
+    }
+    Ok(files)
+}
+
+fn write_file_list(buf: &mut Vec<u8>, files: &[SharedFile]) {
+    put_u32(buf, files.len() as u32);
+    for file in files {
+        write_file(buf, file);
+    }
+}
+
 fn read_directories(r: &mut Reader) -> Result<Vec<SharedDirectory>, DecodeError> {
     let count = r.u32()? as usize;
     let mut dirs = Vec::with_capacity(count.min(MAX_PREALLOC));
     for _ in 0..count {
         let path = r.string()?;
-        let file_count = r.u32()? as usize;
-        let mut files = Vec::with_capacity(file_count.min(MAX_PREALLOC));
-        for _ in 0..file_count {
-            let _code = r.u8()?; // always 1, unused
-            let name = r.string()?;
-            // Nicotine+'s `unpack_file_size` workaround for the Soulseek NS
-            // >2 GiB bug, not a plain u64.
-            let size = r.file_size()?;
-            let extension = r.string()?;
-            let attr_count = r.u32()? as usize;
-            let mut attributes = Vec::with_capacity(attr_count.min(MAX_PREALLOC));
-            for _ in 0..attr_count {
-                let attr_type = r.u32()?;
-                let value = r.u32()?;
-                attributes.push((attr_type, value));
-            }
-            files.push(SharedFile { name, size, extension, attributes });
-        }
+        let files = read_file_list(r)?;
         dirs.push(SharedDirectory { path, files });
     }
     Ok(dirs)
@@ -136,18 +172,7 @@ fn write_directories(buf: &mut Vec<u8>, dirs: &[SharedDirectory]) {
     put_u32(buf, dirs.len() as u32);
     for dir in dirs {
         put_string(buf, &dir.path);
-        put_u32(buf, dir.files.len() as u32);
-        for file in &dir.files {
-            put_u8(buf, 1);
-            put_string(buf, &file.name);
-            put_u64(buf, file.size);
-            put_string(buf, &file.extension);
-            put_u32(buf, file.attributes.len() as u32);
-            for &(attr_type, value) in &file.attributes {
-                put_u32(buf, attr_type);
-                put_u32(buf, value);
-            }
-        }
+        write_file_list(buf, &dir.files);
     }
 }
 
@@ -180,11 +205,202 @@ fn zlib_decompress(data: &[u8]) -> Result<Vec<u8>, DecodeError> {
     Ok(out)
 }
 
+/// Peer code 9 — FileSearchResponse: files of ours that matched a peer's search
+/// (or, when we are the searcher, a peer's matches for us). zlib-compressed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FileSearchResponse {
+    pub username: String,
+    pub token: u32,
+    pub files: Vec<SharedFile>,
+    pub free_slots: bool,
+    pub upload_speed: u32,
+    pub in_queue: u32,
+    pub private_files: Vec<SharedFile>,
+}
+
+impl FileSearchResponse {
+    fn decode_inflated(raw: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(raw);
+        let username = r.string()?;
+        let token = r.u32()?;
+        let files = read_file_list(&mut r)?;
+        let free_slots = r.bool()?;
+        let upload_speed = r.u32()?;
+        let in_queue = r.u32()?;
+        // unknown=0, then optional private list — both conditional, as in
+        // Nicotine+'s parser.
+        if !r.is_empty() {
+            let _unknown = r.u32()?;
+        }
+        let private_files = if r.is_empty() { Vec::new() } else { read_file_list(&mut r)? };
+        Ok(FileSearchResponse {
+            username,
+            token,
+            files,
+            free_slots,
+            upload_speed,
+            in_queue,
+            private_files,
+        })
+    }
+
+    pub fn to_frame(&self) -> Vec<u8> {
+        let mut raw = Vec::new();
+        put_string(&mut raw, &self.username);
+        put_u32(&mut raw, self.token);
+        write_file_list(&mut raw, &self.files);
+        put_bool(&mut raw, self.free_slots);
+        put_u32(&mut raw, self.upload_speed);
+        put_u32(&mut raw, self.in_queue);
+        put_u32(&mut raw, 0); // unknown; official clients always send 0
+        if !self.private_files.is_empty() {
+            write_file_list(&mut raw, &self.private_files);
+        }
+        frame_u32(code::FILE_SEARCH_RESPONSE, &zlib_compress(&raw))
+    }
+}
+
+/// Peer code 36 — FolderContentsRequest: "send me the files in this folder".
+/// Not compressed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FolderContentsRequest {
+    pub token: u32,
+    pub directory: String,
+}
+
+impl FolderContentsRequest {
+    pub fn to_frame(&self) -> Vec<u8> {
+        let mut body = Vec::new();
+        put_u32(&mut body, self.token);
+        put_string(&mut body, &self.directory);
+        frame_u32(code::FOLDER_CONTENTS_REQUEST, &body)
+    }
+
+    fn decode(r: &mut Reader) -> Result<Self, DecodeError> {
+        Ok(FolderContentsRequest { token: r.u32()?, directory: r.string()? })
+    }
+}
+
+/// Peer code 37 — FolderContentsResponse: the files in the requested folder.
+/// zlib-compressed. Nicotine+ always emits exactly the one requested directory.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FolderContentsResponse {
+    pub token: u32,
+    pub directory: String,
+    pub files: Vec<SharedFile>,
+}
+
+impl FolderContentsResponse {
+    fn decode_inflated(raw: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(raw);
+        let token = r.u32()?;
+        let directory = r.string()?;
+        let dir_count = r.u32()? as usize;
+        let mut files = Vec::new();
+        let mut inner_dir = directory.clone();
+        for i in 0..dir_count {
+            let path = r.string()?;
+            let list = read_file_list(&mut r)?;
+            if i == 0 {
+                inner_dir = path;
+                files = list;
+            }
+        }
+        let directory = if dir_count > 0 { inner_dir } else { directory };
+        Ok(FolderContentsResponse { token, directory, files })
+    }
+
+    pub fn to_frame(&self) -> Vec<u8> {
+        let mut raw = Vec::new();
+        put_u32(&mut raw, self.token);
+        put_string(&mut raw, &self.directory);
+        put_u32(&mut raw, 1); // exactly one directory, as Nicotine+ sends
+        put_string(&mut raw, &self.directory);
+        write_file_list(&mut raw, &self.files);
+        put_u32(&mut raw, 0); // trailing field Nicotine+ appends
+        frame_u32(code::FOLDER_CONTENTS_RESPONSE, &zlib_compress(&raw))
+    }
+}
+
+/// Peer code 15 — UserInfoRequest: "tell me about yourself". No body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserInfoRequest;
+
+impl UserInfoRequest {
+    pub fn to_frame(&self) -> Vec<u8> {
+        frame_u32(code::USER_INFO_REQUEST, &[])
+    }
+}
+
+/// Peer code 16 — UserInfoResponse. Not compressed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UserInfoResponse {
+    pub description: String,
+    pub picture: Option<Vec<u8>>,
+    pub total_uploads: u32,
+    pub queue_size: u32,
+    pub slots_available: bool,
+    pub upload_allowed: u32,
+}
+
+impl UserInfoResponse {
+    pub fn to_frame(&self) -> Vec<u8> {
+        let mut body = Vec::new();
+        put_string(&mut body, &self.description);
+        match &self.picture {
+            Some(pic) => {
+                put_bool(&mut body, true);
+                put_u32(&mut body, pic.len() as u32);
+                body.extend_from_slice(pic);
+            }
+            None => put_bool(&mut body, false),
+        }
+        put_u32(&mut body, self.total_uploads);
+        put_u32(&mut body, self.queue_size);
+        put_bool(&mut body, self.slots_available);
+        put_u32(&mut body, self.upload_allowed);
+        frame_u32(code::USER_INFO_RESPONSE, &body)
+    }
+
+    fn decode(r: &mut Reader) -> Result<Self, DecodeError> {
+        let description = r.string()?;
+        let picture = if r.bool()? {
+            let len = r.u32()? as usize;
+            let mut pic = Vec::with_capacity(len.min(MAX_PREALLOC));
+            for _ in 0..len {
+                pic.push(r.u8()?);
+            }
+            Some(pic)
+        } else {
+            None
+        };
+        let total_uploads = r.u32()?;
+        let queue_size = r.u32()?;
+        let slots_available = r.bool()?;
+        // Some clients omit the trailing upload_allowed field.
+        let upload_allowed = if r.remaining() >= 4 { r.u32()? } else { 0 };
+        Ok(UserInfoResponse {
+            description,
+            picture,
+            total_uploads,
+            queue_size,
+            slots_available,
+            upload_allowed,
+        })
+    }
+}
+
 /// A decoded peer message. Unknown codes are preserved rather than dropped, so
 /// callers can log or count them — matching [`crate::server::ServerMessage`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerMessage {
+    SharedFileListRequest,
     SharedFileList(SharedFileListResponse),
+    FileSearchResponse(FileSearchResponse),
+    FolderContentsRequest(FolderContentsRequest),
+    FolderContents(FolderContentsResponse),
+    UserInfoRequest,
+    UserInfoResponse(UserInfoResponse),
     Unknown { code: u32, body: Vec<u8> },
 }
 
@@ -194,12 +410,29 @@ impl PeerMessage {
     pub fn decode(payload: &[u8]) -> Result<Self, DecodeError> {
         let mut r = Reader::new(payload);
         let code = r.u32()?;
+        // For zlib-compressed messages, the rest of the payload after the 4-byte
+        // code is a single zlib stream.
+        let compressed = &payload[4.min(payload.len())..];
         match code {
+            code::GET_SHARED_FILE_LIST => Ok(PeerMessage::SharedFileListRequest),
             code::SHARED_FILE_LIST => {
-                // The remainder of the payload is a single zlib stream.
-                let compressed = &payload[payload.len() - r.remaining()..];
                 let raw = zlib_decompress(compressed)?;
                 Ok(PeerMessage::SharedFileList(SharedFileListResponse::decode_inflated(&raw)?))
+            }
+            code::FILE_SEARCH_RESPONSE => {
+                let raw = zlib_decompress(compressed)?;
+                Ok(PeerMessage::FileSearchResponse(FileSearchResponse::decode_inflated(&raw)?))
+            }
+            code::FOLDER_CONTENTS_REQUEST => {
+                Ok(PeerMessage::FolderContentsRequest(FolderContentsRequest::decode(&mut r)?))
+            }
+            code::FOLDER_CONTENTS_RESPONSE => {
+                let raw = zlib_decompress(compressed)?;
+                Ok(PeerMessage::FolderContents(FolderContentsResponse::decode_inflated(&raw)?))
+            }
+            code::USER_INFO_REQUEST => Ok(PeerMessage::UserInfoRequest),
+            code::USER_INFO_RESPONSE => {
+                Ok(PeerMessage::UserInfoResponse(UserInfoResponse::decode(&mut r)?))
             }
             _ => {
                 let mut body = Vec::with_capacity(r.remaining());
@@ -380,6 +613,92 @@ mod tests {
             PeerMessage::decode(payload).unwrap(),
             PeerMessage::SharedFileList(original)
         );
+    }
+
+    fn sample_file(name: &str, size: u64) -> SharedFile {
+        SharedFile {
+            name: name.into(),
+            size,
+            extension: String::new(),
+            attributes: vec![(0, 320), (1, 184)], // bitrate, length
+        }
+    }
+
+    fn decode_frame(frame: &[u8]) -> PeerMessage {
+        let (payload, rest) = split_frame(frame).unwrap().unwrap();
+        assert!(rest.is_empty());
+        PeerMessage::decode(payload).unwrap()
+    }
+
+    #[test]
+    fn file_search_response_round_trips_with_private_files() {
+        let original = FileSearchResponse {
+            username: "us".into(),
+            token: 0xCAFE_F00D,
+            files: vec![sample_file("Music\\a.mp3", 5_000_000), sample_file("Music\\b.flac", 30_000_000)],
+            free_slots: true,
+            upload_speed: 123_456,
+            in_queue: 2,
+            private_files: vec![sample_file("Buddies\\c.mp3", 1)],
+        };
+        assert_eq!(decode_frame(&original.to_frame()), PeerMessage::FileSearchResponse(original));
+    }
+
+    #[test]
+    fn file_search_response_round_trips_without_private_files() {
+        let original = FileSearchResponse {
+            username: "us".into(),
+            token: 7,
+            files: vec![sample_file("x.mp3", 10)],
+            free_slots: false,
+            upload_speed: 0,
+            in_queue: 0,
+            private_files: vec![],
+        };
+        assert_eq!(decode_frame(&original.to_frame()), PeerMessage::FileSearchResponse(original));
+    }
+
+    #[test]
+    fn folder_contents_request_and_response_round_trip() {
+        let request = FolderContentsRequest { token: 42, directory: "Music\\Album".into() };
+        assert_eq!(decode_frame(&request.to_frame()), PeerMessage::FolderContentsRequest(request));
+
+        let response = FolderContentsResponse {
+            token: 42,
+            directory: "Music\\Album".into(),
+            files: vec![sample_file("Music\\Album\\song.mp3", 4096)],
+        };
+        assert_eq!(decode_frame(&response.to_frame()), PeerMessage::FolderContents(response));
+    }
+
+    #[test]
+    fn user_info_request_and_response_round_trip() {
+        assert_eq!(decode_frame(&UserInfoRequest.to_frame()), PeerMessage::UserInfoRequest);
+
+        let with_pic = UserInfoResponse {
+            description: "hi there".into(),
+            picture: Some(vec![1, 2, 3, 4]),
+            total_uploads: 9,
+            queue_size: 3,
+            slots_available: true,
+            upload_allowed: 1,
+        };
+        assert_eq!(decode_frame(&with_pic.to_frame()), PeerMessage::UserInfoResponse(with_pic));
+
+        let no_pic = UserInfoResponse {
+            description: "no pic".into(),
+            picture: None,
+            total_uploads: 0,
+            queue_size: 0,
+            slots_available: false,
+            upload_allowed: 0,
+        };
+        assert_eq!(decode_frame(&no_pic.to_frame()), PeerMessage::UserInfoResponse(no_pic));
+    }
+
+    #[test]
+    fn shared_file_list_request_decodes() {
+        assert_eq!(decode_frame(&GetSharedFileList.to_frame()), PeerMessage::SharedFileListRequest);
     }
 
     #[test]

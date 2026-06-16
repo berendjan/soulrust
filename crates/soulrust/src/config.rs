@@ -75,6 +75,37 @@ impl Default for UiConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SharingConfig {
+    /// Folders whose files we share with the network (public shares).
+    pub folders: Vec<String>,
+    pub download_dir: String,
+    pub incomplete_dir: String,
+    /// Concurrent upload slots.
+    pub upload_slots: u32,
+    /// FIFO queue ordering instead of per-user round-robin.
+    pub fifo_queue: bool,
+    /// Whether to answer incoming searches with our shared files.
+    pub respond_to_searches: bool,
+    /// Hard cap on files returned for a single incoming search.
+    pub max_search_results: usize,
+}
+
+impl Default for SharingConfig {
+    fn default() -> Self {
+        SharingConfig {
+            folders: Vec::new(),
+            download_dir: String::new(),
+            incomplete_dir: String::new(),
+            upload_slots: 2,
+            fifo_queue: false,
+            respond_to_searches: true,
+            max_search_results: 100,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -82,6 +113,7 @@ pub struct Config {
     pub spotify: SpotifyConfig,
     pub update: UpdateConfig,
     pub ui: UiConfig,
+    pub sharing: SharingConfig,
 }
 
 /// `$XDG_CONFIG_HOME/soulrust.yaml`, falling back to `~/.config/soulrust.yaml`.
