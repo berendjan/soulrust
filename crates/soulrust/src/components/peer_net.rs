@@ -66,6 +66,16 @@ const MAX_LISTING_BYTES: usize = 512 * 1024;
 /// evicted.
 const MAX_PENDING_DELIVERIES: usize = 1024;
 
+/// Bound on in-flight transfer registries (pending/active uploads and
+/// downloads). A peer that spams `QueueUpload` and never approves would
+/// otherwise grow `uploads.by_token` without limit; when full, the oldest entry
+/// (lowest token) is evicted.
+const MAX_PENDING_TRANSFERS: usize = 1024;
+
+/// Cap on a download's on-disk basename, so a hostile peer can't push a path
+/// past the filesystem limit. Matches the 255-byte limit Nicotine+ enforces.
+const MAX_BASENAME_BYTES: usize = 255;
+
 fn file_cost(name: &str) -> usize {
     name.len() + 16
 }
@@ -780,8 +790,9 @@ where
                 Ok(PeerInitMessage::PeerInit(init)) => {
                     if init.connection_type == ConnectionType::File {
                         // An uploader opened an F connection to deliver a file we
-                        // queued for download; receive it.
-                        return recv_file(&mut stream, ctx, &mut on_activity).await;
+                        // queued for download; receive it (matched by token AND
+                        // this peer-init username).
+                        return recv_file(&mut stream, ctx, &init.username, &mut on_activity).await;
                     }
                     (init.username, Vec::new())
                 }
@@ -846,13 +857,16 @@ where
                 let key = (peer.clone(), request.file.clone());
                 let accepted = {
                     let mut downloads = ctx.downloads.lock().unwrap();
-                    if downloads.pending.remove(&key).is_some() {
+                    // Trust the size WE recorded when queueing, not the uploader's
+                    // TransferRequest.filesize (which a malicious peer could set to
+                    // 0 to make us report an empty file as a complete download).
+                    if let Some(size) = downloads.pending.remove(&key) {
                         downloads.by_token.insert(
                             request.token,
                             ActiveDownload {
                                 username: peer.clone(),
                                 filename: request.file.clone(),
-                                size: request.filesize.unwrap_or(0),
+                                size,
                             },
                         );
                         true
@@ -877,16 +891,29 @@ where
                 match ctx.shares.resolve(&queue.file) {
                     Some((path, size)) => {
                         let token = ctx.next_token.fetch_add(1, Ordering::Relaxed);
-                        ctx.uploads.lock().unwrap().by_token.insert(
-                            token,
-                            PendingUpload {
-                                username: peer.clone(),
-                                filename: queue.file.clone(),
-                                real_path: path.to_owned(),
-                                size,
-                                approved: false,
-                            },
-                        );
+                        {
+                            let mut uploads = ctx.uploads.lock().unwrap();
+                            uploads.by_token.insert(
+                                token,
+                                PendingUpload {
+                                    username: peer.clone(),
+                                    filename: queue.file.clone(),
+                                    real_path: path.to_owned(),
+                                    size,
+                                    approved: false,
+                                },
+                            );
+                            // Bound the registry: a peer that offers files and
+                            // never approves can't grow it without limit (evict
+                            // the oldest, lowest-token pending upload).
+                            while uploads.by_token.len() > MAX_PENDING_TRANSFERS {
+                                if let Some(&oldest) = uploads.by_token.keys().min() {
+                                    uploads.by_token.remove(&oldest);
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
                         let request = TransferRequest {
                             direction: TransferDirection::Upload,
                             token,
@@ -937,6 +964,7 @@ where
 async fn recv_file<S, F>(
     stream: &mut S,
     ctx: &ConnCtx,
+    peer_username: &str,
     on_activity: &mut F,
 ) -> std::io::Result<ConnOutcome>
 where
@@ -953,18 +981,27 @@ where
     }
     let token = FileTransferInit::decode(&token_buf).map(|m| m.token).unwrap_or(0);
 
-    let Some(active) = ctx.downloads.lock().unwrap().by_token.remove(&token) else {
-        // We never negotiated this token — drop the connection.
+    // Match the token AND the connecting peer's username: transfer tokens are
+    // uploader-chosen and unscoped, so without the username check a peer could
+    // collect a download we negotiated with someone else. Verify before
+    // consuming, so a mismatch leaves the entry for the legitimate uploader.
+    let active = {
+        let mut downloads = ctx.downloads.lock().unwrap();
+        match downloads.by_token.get(&token) {
+            Some(d) if d.username == peer_username => downloads.by_token.remove(&token),
+            _ => None,
+        }
+    };
+    let Some(active) = active else {
+        // Unknown token, or a different peer than we negotiated with — drop it.
         return Ok(ConnOutcome::Done);
     };
     on_activity(format!("receiving {} from {} (token {token})", active.filename, active.username));
 
-    // Build incomplete + final paths from the basename of the virtual path.
-    let basename = active.filename.rsplit('\\').next().unwrap_or(&active.filename).to_owned();
+    let basename = download_basename(&active.filename);
     let incomplete = ctx.incomplete_dir.join(format!("INCOMPLETE-{token}-{basename}"));
-    let final_path = ctx.download_dir.join(&basename);
 
-    match receive_to_disk(stream, &incomplete, &final_path, active.size).await {
+    match receive_to_disk(stream, &incomplete, &ctx.download_dir, &basename, active.size).await {
         Ok(path) => Ok(ConnOutcome::Downloaded {
             username: active.username,
             filename: active.filename,
@@ -981,18 +1018,67 @@ where
     }
 }
 
-/// Streams `size` bytes from the connection into `incomplete`, then moves it to
-/// `final_path`. Bytes go straight to disk — never the bus.
+/// The on-disk basename for a downloaded virtual path: the last `\\`-separated
+/// segment, truncated to [`MAX_BASENAME_BYTES`] (preserving the extension where
+/// possible) so a hostile or pathological path can't exceed the filesystem limit.
+fn download_basename(virtual_path: &str) -> String {
+    let raw = virtual_path.rsplit('\\').next().unwrap_or(virtual_path);
+    if raw.len() <= MAX_BASENAME_BYTES {
+        return raw.to_owned();
+    }
+    // Keep the extension if there's a usable stem and the extension itself fits.
+    if let Some((stem, ext)) = raw.rsplit_once('.') {
+        let ext = format!(".{ext}");
+        if !stem.is_empty() && ext.len() < MAX_BASENAME_BYTES {
+            let mut end = (MAX_BASENAME_BYTES - ext.len()).min(stem.len());
+            while end > 0 && !stem.is_char_boundary(end) {
+                end -= 1;
+            }
+            return format!("{}{ext}", &stem[..end]);
+        }
+    }
+    let mut end = MAX_BASENAME_BYTES.min(raw.len());
+    while end > 0 && !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    raw[..end].to_owned()
+}
+
+/// A path in `dir` for `basename` that does not already exist, appending
+/// ` (1)`, ` (2)`, … before the extension on collision (so two downloads with
+/// the same basename don't overwrite each other). Mirrors Nicotine+'s counter.
+async fn unique_download_path(dir: &Path, basename: &str) -> PathBuf {
+    let candidate = dir.join(basename);
+    if tokio::fs::metadata(&candidate).await.is_err() {
+        return candidate;
+    }
+    let (stem, ext) = match basename.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_owned(), format!(".{e}")),
+        _ => (basename.to_owned(), String::new()),
+    };
+    for counter in 1.. {
+        let candidate = dir.join(format!("{stem} ({counter}){ext}"));
+        if tokio::fs::metadata(&candidate).await.is_err() {
+            return candidate;
+        }
+    }
+    unreachable!("counter exhausts u128 before paths")
+}
+
+/// Streams `size` bytes from the connection into `incomplete`, then moves it
+/// into `download_dir` under a non-colliding name derived from `basename`. Bytes
+/// go straight to disk — never the bus.
 async fn receive_to_disk<S>(
     stream: &mut S,
     incomplete: &Path,
-    final_path: &Path,
+    download_dir: &Path,
+    basename: &str,
     size: u64,
 ) -> Result<String, String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    for dir in [incomplete.parent(), final_path.parent()].into_iter().flatten() {
+    for dir in [incomplete.parent(), Some(download_dir)].into_iter().flatten() {
         tokio::fs::create_dir_all(dir).await.map_err(|e| format!("create {}: {e}", dir.display()))?;
     }
     let file = tokio::fs::File::create(incomplete)
@@ -1000,7 +1086,9 @@ where
         .map_err(|e| format!("create {}: {e}", incomplete.display()))?;
     // Fresh transfer from offset 0 (resume is a later refinement).
     transfer_io::download(stream, 0, size, file).await.map_err(|e| format!("receiving: {e}"))?;
-    tokio::fs::rename(incomplete, final_path)
+    // Resolve the collision-free destination only now the bytes are on disk.
+    let final_path = unique_download_path(download_dir, basename).await;
+    tokio::fs::rename(incomplete, &final_path)
         .await
         .map_err(|e| format!("move to final: {e}"))?;
     Ok(final_path.display().to_string())
@@ -1349,6 +1437,120 @@ mod tests {
 
             drop(client);
             serve.await.unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn download_basename_truncates_long_names_preserving_extension() {
+        // Short name: unchanged.
+        assert_eq!(download_basename("Music\\Album\\song.mp3"), "song.mp3");
+        // Over the limit: result fits MAX_BASENAME_BYTES and keeps the extension.
+        let long = format!("Music\\{}.mp3", "a".repeat(400));
+        let basename = download_basename(&long);
+        assert!(basename.len() <= MAX_BASENAME_BYTES);
+        assert!(basename.ends_with(".mp3"), "extension preserved");
+        // Multi-byte chars are truncated on a boundary (no panic, still valid UTF-8).
+        let multibyte = format!("{}.mp3", "片".repeat(200));
+        let basename = download_basename(&multibyte);
+        assert!(basename.len() <= MAX_BASENAME_BYTES);
+        assert!(basename.ends_with(".mp3"));
+    }
+
+    #[test]
+    fn unique_download_path_disambiguates_collisions() {
+        runtime().block_on(async {
+            let dir = std::env::temp_dir().join(format!("soulrust-uniq-{}", std::process::id()));
+            let _ = tokio::fs::create_dir_all(&dir).await;
+            // No existing file: the plain name.
+            let p0 = unique_download_path(&dir, "track.mp3").await;
+            assert_eq!(p0, dir.join("track.mp3"));
+            // Create it, then the next call disambiguates.
+            tokio::fs::write(&p0, b"x").await.unwrap();
+            let p1 = unique_download_path(&dir, "track.mp3").await;
+            assert_eq!(p1, dir.join("track (1).mp3"));
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+        });
+    }
+
+    #[test]
+    fn recv_file_rejects_a_token_from_the_wrong_peer() {
+        // A download negotiated with "alice" must not be collected by a different
+        // peer that guesses the (uploader-chosen) token. The entry is preserved.
+        runtime().block_on(async {
+            let dir = std::env::temp_dir().join(format!("soulrust-wrongpeer-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            let (cmd_tx, cmd_rx) = unbounded_channel();
+            std::mem::forget(cmd_rx);
+            let ctx = Arc::new(ConnCtx {
+                shares: Arc::new(test_index()),
+                queue: Arc::new(Mutex::new(PendingDeliveries::default())),
+                downloads: Mutex::new(Downloads::default()),
+                uploads: Mutex::new(Uploads::default()),
+                our_username: "me".into(),
+                download_dir: dir.clone(),
+                incomplete_dir: dir.clone(),
+                cmd_tx,
+                next_token: AtomicU32::new(1),
+            });
+            ctx.downloads.lock().unwrap().by_token.insert(
+                42,
+                ActiveDownload { username: "alice".into(), filename: "a.mp3".into(), size: 5 },
+            );
+
+            let (mut client, server) = tokio::io::duplex(1024);
+            let ctx_serve = ctx.clone();
+            let serve = tokio::spawn(async move {
+                serve_connection(server, &ctx_serve, None, |_| {}).await
+            });
+            // Mallory opens an F connection and pierces alice's token.
+            let init = PeerInit { username: "mallory".into(), connection_type: ConnectionType::File, token: 0 };
+            client.write_all(&init.to_frame()).await.unwrap();
+            client.write_all(&FileTransferInit { token: 42 }.to_bytes()).await.unwrap();
+            drop(client);
+
+            let outcome = serve.await.unwrap().unwrap();
+            assert!(matches!(outcome, ConnOutcome::Done), "wrong-peer token must be dropped");
+            assert!(
+                ctx.downloads.lock().unwrap().by_token.contains_key(&42),
+                "alice's download is preserved for her real connection"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn accepted_download_uses_our_recorded_size_not_the_uploaders() {
+        // A malicious uploader sends filesize=0 to truncate; we must use the size
+        // we recorded when queueing (5), not theirs.
+        runtime().block_on(async {
+            use soulseek_proto::transfer::TransferRequest;
+            let (mut client, server) = tokio::io::duplex(64 * 1024);
+            let ctx = test_ctx();
+            ctx.downloads.lock().unwrap().pending.insert(("bob".into(), "f.mp3".into()), 5);
+            let ctx_serve = ctx.clone();
+            let serve = tokio::spawn(async move {
+                serve_connection(server, &ctx_serve, Some("bob".into()), |_| {}).await
+            });
+            client
+                .write_all(
+                    &TransferRequest {
+                        direction: TransferDirection::Upload,
+                        token: 9,
+                        file: "f.mp3".into(),
+                        filesize: Some(0), // understated
+                    }
+                    .to_frame(),
+                )
+                .await
+                .unwrap();
+            let _ = PeerMessage::decode(&read_one_frame(&mut client).await).unwrap();
+            drop(client);
+            serve.await.unwrap().unwrap();
+            assert_eq!(
+                ctx.downloads.lock().unwrap().by_token.get(&9).map(|d| d.size),
+                Some(5),
+                "our recorded size is used, not the uploader's filesize"
+            );
         });
     }
 
