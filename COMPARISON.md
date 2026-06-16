@@ -359,3 +359,54 @@ So the destination is **not** `{N-thread, call-graph, Mutex}`. It is one of:
   `oneshot` replacing the corr-id machinery.
 
 Both are coherent; the `{N-thread, call-graph, Mutex}` corner is the one to avoid.
+
+## The implemented actor spike: `crates/actor_messenger`
+
+The actors-over-channels model now exists as a crate. `actor_messenger! { actor
+foo { event …; ask … -> …; } }` generates, per actor, a module with: a typed
+inbox `enum Msg` (`ask` variants carry a `oneshot::Sender`), a cheap-`Clone`
+`Handle` with one `async fn` per message, an `Actor` trait you implement on your
+state struct with **`&mut self`** handlers, and `spawn(actor, buffer) -> Handle`
+(bounded `mpsc`; the task ends when the last `Handle` drops). Components are wired
+by having one actor **hold another's `Handle`** in its state — sending is a
+type-checked method call, and the `oneshot` reply *is* the correlation.
+
+## Why a cycle still deadlocks — and what it shares with the call graph
+
+It is tempting to think async removes the cycle hazard. It does not, because both
+designs enforce the **same invariant**: one writer to a component's state at a
+time. An actor is a *single task* with exclusive `&mut self` that services its
+mailbox **strictly one message at a time** — that is exactly what buys lock-free,
+single-writer state. The run loop pulls one message, runs its handler *to
+completion* (`.await` and all), sends the reply, then loops back to `recv()`.
+
+So in an `ask` cycle:
+
+- A is mid-handler for msg1; it does `b.ask().await` and **parks inside the
+  handler** — it has not returned to `recv()`.
+- B handles that, does `a.ask().await`, and parks too.
+- B's request now sits in A's inbox — but A's task is parked awaiting B, so it
+  never calls `recv()` to pick it up. Both wait forever. No timeout.
+
+"Run through the same actor twice" would mean processing msg2 while msg1 is still
+parked — i.e. **two `&mut self` borrows of one state alive at once**, an aliasing
+violation. The serial mailbox is not a limitation better async would lift; it is
+the price of single-writer state. This is the *same* root cause as the call
+graph's borrow panic — a cycle asks for two writers to one component — surfacing
+differently:
+
+| Design | Shared invariant | How a cycle manifests |
+|---|---|---|
+| `direct_messenger` (call graph) | one writer per component | `borrow_mut()` still held on the outer frame → **panic** |
+| `actor_messenger` (actors) | one writer per component | mailbox never serviced while parked → **deadlock** |
+| `rust-messenger` (bus) | one writer per handler | handler enqueues and returns → **safe** (queued) |
+
+The bus escapes both because a handler never holds its state open across the
+onward send. For the actor model the practical rule is the same discipline:
+**keep cross-actor traffic as `event` (fire-and-forget) and reserve `ask` for
+acyclic, leaf-ward request/response.** An `event`'s `.await` resolves when the
+message is *enqueued* (backpressure), not when the recipient *processes* it, so
+the originator returns to its loop immediately and no reply has to travel back
+through a blocked loop. Allowing concurrent re-entry instead would require
+dropping exclusive `&mut self` for `Arc<Mutex<…>>` — and a re-entrant `ask` cycle
+would then just re-lock the same mutex and deadlock at the lock instead.

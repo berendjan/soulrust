@@ -1,0 +1,15 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "actor_messenger",
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    deps = [
+        "@crates//:tokio",
+    ],
+)
+
+rust_test(
+    name = "actor_messenger_test",
+    crate = ":actor_messenger",
+)

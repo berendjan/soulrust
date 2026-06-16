@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/actor_messenger",
     "crates/direct_messenger",
     "crates/messenger-macro",
     "crates/messenger-tests",

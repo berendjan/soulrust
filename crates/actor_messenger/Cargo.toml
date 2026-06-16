@@ -1,0 +1,8 @@
+[package]
+name = "actor_messenger"
+version = "0.1.0"
+edition = "2021"
+description = "Actors over tokio channels: each component is a task that owns its state (&mut self, no locks) behind an mpsc inbox, with oneshot reply channels for typed request/response (no correlation ids). The async-native form of the message bus."
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "sync", "macros"] }
