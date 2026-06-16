@@ -88,8 +88,10 @@ pub struct SharingConfig {
     pub fifo_queue: bool,
     /// Whether to answer incoming searches with our shared files.
     pub respond_to_searches: bool,
-    /// Hard cap on files returned for a single incoming search.
-    pub max_search_results: usize,
+    /// Hard cap on files returned for a single incoming search. `u32` (not
+    /// `usize`) so a config written on one platform parses identically on
+    /// another.
+    pub max_search_results: u32,
 }
 
 impl Default for SharingConfig {

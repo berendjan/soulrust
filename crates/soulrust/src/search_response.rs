@@ -77,19 +77,25 @@ pub fn create_search_result_list(
         }
     }
 
-    for partial in &terms.partial {
-        let mut partial_results = HashSet::new();
+    if !terms.partial.is_empty() {
+        // One pass over the vocabulary, bucketing matches per partial term,
+        // instead of re-scanning the whole word index once per partial.
+        let mut matched: Vec<HashSet<u32>> = vec![HashSet::new(); terms.partial.len()];
         for (word, ids) in word_index {
-            if word.ends_with(partial.as_str()) {
-                partial_results.extend(ids.iter().copied().filter(|id| results.contains(id)));
+            for (bucket, partial) in matched.iter_mut().zip(&terms.partial) {
+                if word.ends_with(partial.as_str()) {
+                    bucket.extend(ids.iter().copied().filter(|id| results.contains(id)));
+                }
             }
         }
-        if partial_results.is_empty() {
-            return None;
-        }
-        results.retain(|id| partial_results.contains(id));
-        if results.is_empty() {
-            return None;
+        for partial_results in &matched {
+            if partial_results.is_empty() {
+                return None;
+            }
+            results.retain(|id| partial_results.contains(id));
+            if results.is_empty() {
+                return None;
+            }
         }
     }
 
@@ -117,27 +123,31 @@ pub fn create_file_info_list(
     excluded_phrases: &[String],
     index: &ShareIndex,
 ) -> Vec<SharedFile> {
-    let phrases: Vec<String> = excluded_phrases.iter().map(|p| p.to_lowercase()).collect();
+    let path = |id: u32| index.files[id as usize].virtual_path.as_str();
     let mut ids: Vec<u32> = results.iter().copied().collect();
-    ids.sort_by(|&a, &b| index.files[a as usize].virtual_path.cmp(&index.files[b as usize].virtual_path));
 
-    // Nicotine+ caps the candidate set to `max_results` *before* dropping
-    // excluded-phrase files: `islice(results, min(len(results), max_results))`
-    // then `_append_file_info` skips phrase matches
-    // (search.py:_create_file_info_list / _append_file_info). So the response
-    // may carry fewer than `max_results` files when some capped candidates hit
-    // a phrase — we must not reach past the cap to backfill.
-    ids.truncate(max_results);
-
-    let mut out = Vec::new();
-    for id in ids {
-        let lower = index.files[id as usize].virtual_path.to_lowercase();
-        if phrases.iter().any(|p| lower.contains(p.as_str())) {
-            continue;
-        }
-        out.push(index.shared_file(id));
+    // Keep only the `max_results` smallest-by-path ids via a partial sort
+    // (O(n) select + sort of the kept k), rather than fully sorting all matches
+    // just to discard most of them. Nicotine+ caps the candidate set to
+    // `max_results` *before* dropping excluded-phrase files (islice then
+    // _append_file_info), so the response may carry fewer than `max_results`.
+    if ids.len() > max_results {
+        ids.select_nth_unstable_by(max_results, |&a, &b| path(a).cmp(path(b)));
+        ids.truncate(max_results);
     }
-    out
+    ids.sort_by(|&a, &b| path(a).cmp(path(b)));
+
+    if excluded_phrases.is_empty() {
+        return ids.into_iter().map(|id| index.shared_file(id)).collect();
+    }
+    let phrases: Vec<String> = excluded_phrases.iter().map(|p| p.to_lowercase()).collect();
+    ids.into_iter()
+        .filter(|&id| {
+            let lower = path(id).to_lowercase();
+            !phrases.iter().any(|p| lower.contains(p.as_str()))
+        })
+        .map(|id| index.shared_file(id))
+        .collect()
 }
 
 /// Convenience: match `term` against `index` and return the files to put in a
@@ -241,19 +251,12 @@ mod tests {
     }
 
     fn index_with(paths: &[(&str, u64)]) -> ShareIndex {
+        // Use the real indexer (add_virtual) rather than hand-rolling indexing,
+        // so the test matches the index shape a real scan produces (same word
+        // dedup and folder mapping).
         let mut index = ShareIndex::default();
-        for (i, (path, size)) in paths.iter().enumerate() {
-            let _ = i;
-            // Build the index by hand (bypassing the filesystem) for matcher tests.
-            index.files.push(crate::shares::SharedFileEntry {
-                real_path: path.into(),
-                virtual_path: (*path).into(),
-                size: *size,
-            });
-            let id = (index.files.len() - 1) as u32;
-            for token in crate::shares::tokenize(path) {
-                index.word_index.entry(token).or_default().push(id);
-            }
+        for (path, size) in paths {
+            index.add_virtual(path, *size);
         }
         index
     }

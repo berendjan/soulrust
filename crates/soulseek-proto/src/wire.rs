@@ -94,6 +94,12 @@ impl<'a> Reader<'a> {
         Ok(self.u8()? != 0)
     }
 
+    /// Reads `n` raw bytes in a single bounded copy (e.g. a picture blob),
+    /// faulting up front if fewer than `n` remain.
+    pub fn bytes(&mut self, n: usize) -> Result<Vec<u8>, DecodeError> {
+        Ok(self.take(n)?.to_vec())
+    }
+
     /// IPv4 address carried as a u32. The protocol stores it so that the
     /// most significant byte of the integer is the first octet.
     pub fn ipv4(&mut self) -> Result<Ipv4Addr, DecodeError> {

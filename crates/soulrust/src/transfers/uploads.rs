@@ -20,8 +20,9 @@ pub struct UploadQueue {
     // id-indexed transfer fields
     usernames: Vec<String>,
 
-    // queued state
-    queued_order: Vec<TransferId>,            // global insertion order, queued only
+    // queued state. A transfer's id is its global insertion order, so FIFO
+    // ordering is recoverable from ids — no separate ordered list to keep in
+    // sync (or to scan/shift on dequeue).
     queued_users: HashMap<String, Vec<TransferId>>, // per-user queued ids, insertion order
 
     // active state: username -> number of active uploads
@@ -38,7 +39,6 @@ impl UploadQueue {
             fifo,
             privileged: HashSet::new(),
             usernames: Vec::new(),
-            queued_order: Vec::new(),
             queued_users: HashMap::new(),
             active_users: HashMap::new(),
             counter: 0,
@@ -65,7 +65,8 @@ impl UploadQueue {
     /// Number of transfers still tracked (queued + active) — when this reaches
     /// zero there is nothing left to schedule.
     pub fn len(&self) -> usize {
-        self.queued_order.len() + self.active_users.values().sum::<usize>()
+        let queued: usize = self.queued_users.values().map(Vec::len).sum();
+        queued + self.active_users.values().sum::<usize>()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -74,11 +75,9 @@ impl UploadQueue {
 
     /// Enqueue a new upload for `username`. Mirrors `_enqueue_transfer` followed
     /// by `_update_transfer`.
-    pub fn enqueue(&mut self, username: &str, virtual_path: &str) -> TransferId {
+    pub fn enqueue(&mut self, username: &str) -> TransferId {
         let id = self.usernames.len();
         self.usernames.push(username.to_owned());
-        let _ = virtual_path; // distinct per call by construction; not stored
-        self.queued_order.push(id);
         self.queued_users.entry(username.to_owned()).or_default().push(id);
         // `_update_transfer`: a brand-new queued file for a user we have no
         // counter for stamps them in; an extra file for a known user does not
@@ -127,11 +126,15 @@ impl UploadQueue {
         };
 
         let target: Option<String> = if self.fifo {
-            self.queued_order
+            // FIFO = the globally-earliest queued transfer of an eligible user.
+            // Since ids increase with insertion, that's the eligible user whose
+            // first queued id is smallest.
+            self.queued_users
                 .iter()
-                .map(|&id| self.usernames[id].as_str())
-                .find(|u| eligible(u))
-                .map(str::to_owned)
+                .filter(|(u, _)| eligible(u))
+                .filter_map(|(u, ids)| ids.first().map(|&id| (id, u)))
+                .min_by_key(|(id, _)| *id)
+                .map(|(_, u)| u.clone())
         } else {
             self.counters
                 .iter()
@@ -149,9 +152,6 @@ impl UploadQueue {
     /// the user's last queued file, their counter is dropped.
     pub fn dequeue(&mut self, id: TransferId) {
         let username = self.usernames[id].clone();
-        if let Some(pos) = self.queued_order.iter().position(|&i| i == id) {
-            self.queued_order.remove(pos);
-        }
         if let Some(ids) = self.queued_users.get_mut(&username) {
             if let Some(pos) = ids.iter().position(|&i| i == id) {
                 ids.remove(pos);
@@ -239,10 +239,8 @@ mod tests {
         let mut queue = UploadQueue::new(!round_robin);
         queue.set_privileged(["puser1", "puser2"]);
 
-        let mut seq = 0;
         for &username in queued {
-            queue.enqueue(username, &format!("{username}/{seq}"));
-            seq += 1;
+            queue.enqueue(username);
         }
         let mut in_prog: Vec<String> = Vec::new();
         for &username in in_progress {

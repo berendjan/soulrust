@@ -48,23 +48,34 @@ impl ShareIndex {
     /// folders (names beginning with `.`) are skipped, as in `test_shares.py`.
     pub fn scan(folders: &[PathBuf]) -> ShareIndex {
         let mut index = ShareIndex::default();
+        let mut visited = HashSet::new();
         for folder in folders {
             let root = folder
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "share".into());
-            walk(folder, &root, &mut index);
+            walk(folder, &root, &mut index, &mut visited);
         }
         index
+    }
+
+    /// Index a single file by virtual path without touching the filesystem —
+    /// for tools/tests that build an index directly, using the exact same word
+    /// and folder indexing a real scan does (so they can't drift).
+    pub fn add_virtual(&mut self, virtual_path: &str, size: u64) {
+        self.add_file(PathBuf::from(virtual_path), virtual_path.to_owned(), size);
     }
 
     fn add_file(&mut self, real_path: PathBuf, virtual_path: String, size: u64) {
         let id = self.files.len() as u32;
 
-        let mut seen = HashSet::new();
+        // Dedup tokens per file without a per-file HashSet or token clones: all
+        // of this file's tokens push the same id, so a repeat is exactly when
+        // the bucket's last entry is already this id.
         for token in tokenize(&virtual_path) {
-            if seen.insert(token.clone()) {
-                self.word_index.entry(token).or_default().push(id);
+            let bucket = self.word_index.entry(token).or_default();
+            if bucket.last() != Some(&id) {
+                bucket.push(id);
             }
         }
 
@@ -137,7 +148,15 @@ impl ShareIndex {
     }
 }
 
-fn walk(dir: &Path, virtual_prefix: &str, index: &mut ShareIndex) {
+fn walk(dir: &Path, virtual_prefix: &str, index: &mut ShareIndex, visited: &mut HashSet<PathBuf>) {
+    // Cycle guard: a symlink can point back into an ancestor, so skip any
+    // directory (by canonical path) we've already entered.
+    if let Ok(canonical) = std::fs::canonicalize(dir) {
+        if !visited.insert(canonical) {
+            return;
+        }
+    }
+
     // Every scanned folder gets a (possibly empty) entry, so intermediate and
     // empty folders still appear in the browse tree — Nicotine+ stores a stream
     // for each folder it visits (shares.py:scan_shared_folder).
@@ -156,22 +175,25 @@ fn walk(dir: &Path, virtual_prefix: &str, index: &mut ShareIndex) {
         if name.starts_with('.') {
             continue; // hidden file or folder
         }
-        let Ok(file_type) = entry.file_type() else {
+        let path = entry.path();
+        // metadata() follows symlinks (unlike file_type(), which reflects the
+        // raw directory entry), so a symlinked folder or file is shared rather
+        // than silently skipped.
+        let Ok(meta) = std::fs::metadata(&path) else {
             continue;
         };
-        if file_type.is_dir() {
+        if meta.is_dir() {
             // Folder names keep raw backslashes (Nicotine+'s real2virtual does
             // not escape them); the file basename below is what gets escaped.
             let virtual_path = format!("{virtual_prefix}\\{name}");
-            walk(&entry.path(), &virtual_path, index);
-        } else if file_type.is_file() {
+            walk(&path, &virtual_path, index, visited);
+        } else if meta.is_file() {
             // A literal backslash in a basename would read as a path separator
             // on the wire, so substitute the sentinel — Nicotine+ does the same
             // before building `virtual_file_path` (shares.py:scan_shared_folder).
             let basename = name.replace('\\', BACKSLASH_SENTINEL);
             let virtual_path = format!("{virtual_prefix}\\{basename}");
-            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            index.add_file(entry.path(), virtual_path, size);
+            index.add_file(path, virtual_path, meta.len());
         }
     }
 }
@@ -199,7 +221,7 @@ mod tests {
     #[test]
     fn scans_files_skips_hidden_and_builds_virtual_paths() {
         let music = build_share("scan");
-        let index = ShareIndex::scan(&[music.clone()]);
+        let index = ShareIndex::scan(std::slice::from_ref(&music));
 
         let paths: Vec<&str> = index.files.iter().map(|f| f.virtual_path.as_str()).collect();
         assert!(paths.contains(&"Music\\song one.mp3"));
@@ -218,7 +240,7 @@ mod tests {
     #[test]
     fn word_index_tokenizes_folder_and_filename() {
         let music = build_share("words");
-        let index = ShareIndex::scan(&[music.clone()]);
+        let index = ShareIndex::scan(std::slice::from_ref(&music));
 
         // Every token is lowercased and punctuation-split.
         for word in ["music", "song", "one", "mp3", "album", "track", "flac"] {
@@ -245,7 +267,7 @@ mod tests {
         std::fs::create_dir_all(share.join("demo")).unwrap();
         std::fs::write(share.join("demo").join("demo.mp3"), b"q").unwrap();
 
-        let index = ShareIndex::scan(&[share.clone()]);
+        let index = ShareIndex::scan(std::slice::from_ref(&share));
         assert_eq!(index.num_files(), 1);
         // Even though "demo" occurs three times in "demo\\demo\\demo.mp3", the
         // single file id is recorded just once.
@@ -254,10 +276,37 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn follows_symlinked_files_and_folders_without_cycling() {
+        use std::os::unix::fs::symlink;
+        let music = build_share("symlink");
+        let root = music.parent().unwrap().to_path_buf();
+
+        // An external file and folder, symlinked into the share.
+        std::fs::create_dir_all(root.join("external").join("Sub")).unwrap();
+        std::fs::write(root.join("external").join("Sub").join("ext.mp3"), b"zz").unwrap();
+        std::fs::write(root.join("loose.mp3"), b"q").unwrap();
+        symlink(root.join("loose.mp3"), music.join("linked.mp3")).unwrap();
+        symlink(root.join("external"), music.join("LinkedDir")).unwrap();
+        // A symlink back to an ancestor: must not loop forever.
+        symlink(&music, music.join("Album").join("loop")).unwrap();
+
+        let index = ShareIndex::scan(std::slice::from_ref(&music));
+        let paths: Vec<&str> = index.files.iter().map(|f| f.virtual_path.as_str()).collect();
+        assert!(paths.contains(&"Music\\linked.mp3"), "symlinked file must be shared");
+        assert!(
+            paths.contains(&"Music\\LinkedDir\\Sub\\ext.mp3"),
+            "symlinked directory must be traversed"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn browse_groups_files_by_folder() {
         let music = build_share("browse");
-        let index = ShareIndex::scan(&[music.clone()]);
+        let index = ShareIndex::scan(std::slice::from_ref(&music));
         let listing = index.browse();
 
         let folders: Vec<&str> = listing.directories.iter().map(|d| d.path.as_str()).collect();
@@ -293,7 +342,7 @@ mod tests {
         std::fs::create_dir_all(share.join("empty")).unwrap();
         std::fs::write(share.join("folder2").join("test").join("nothing"), b"x").unwrap();
 
-        let index = ShareIndex::scan(&[share.clone()]);
+        let index = ShareIndex::scan(std::slice::from_ref(&share));
         let listing = index.browse();
         let folders: Vec<&str> = listing.directories.iter().map(|d| d.path.as_str()).collect();
 
@@ -328,7 +377,7 @@ mod tests {
         std::fs::create_dir_all(&share).unwrap();
         std::fs::write(share.join("AC\\DC.mp3"), b"zz").unwrap();
 
-        let index = ShareIndex::scan(&[share.clone()]);
+        let index = ShareIndex::scan(std::slice::from_ref(&share));
         assert_eq!(index.num_files(), 1);
 
         // Full virtual path (search response) keeps the sentinel, so the file

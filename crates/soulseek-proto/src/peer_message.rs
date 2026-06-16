@@ -32,6 +32,10 @@ pub const MAX_INFLATED_LEN: usize = 64 * 1024 * 1024;
 /// will still fault cleanly if the count was a lie and the bytes run out.
 const MAX_PREALLOC: usize = 1024;
 
+/// Upper bound on a UserInfo picture blob, so a hostile peer can't make us
+/// allocate an arbitrary buffer from a forged length.
+pub const MAX_PICTURE_LEN: usize = 8 * 1024 * 1024;
+
 /// Peer code 4 — GetSharedFileList: ask a peer for their full share tree.
 /// No body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,13 +285,17 @@ impl FolderContentsRequest {
     }
 }
 
-/// Peer code 37 — FolderContentsResponse: the files in the requested folder.
-/// zlib-compressed. Nicotine+ always emits exactly the one requested directory.
+/// Peer code 37 — FolderContentsResponse: the files in the requested folder(s).
+/// zlib-compressed. Nicotine+ emits exactly the one requested directory, but the
+/// wire format is a directory *list*, so we model and decode all of them rather
+/// than dropping any past the first.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FolderContentsResponse {
     pub token: u32,
+    /// The folder that was requested (the outer field; usually the same path as
+    /// the single directory in `folders`).
     pub directory: String,
-    pub files: Vec<SharedFile>,
+    pub folders: Vec<SharedDirectory>,
 }
 
 impl FolderContentsResponse {
@@ -295,28 +303,16 @@ impl FolderContentsResponse {
         let mut r = Reader::new(raw);
         let token = r.u32()?;
         let directory = r.string()?;
-        let dir_count = r.u32()? as usize;
-        let mut files = Vec::new();
-        let mut inner_dir = directory.clone();
-        for i in 0..dir_count {
-            let path = r.string()?;
-            let list = read_file_list(&mut r)?;
-            if i == 0 {
-                inner_dir = path;
-                files = list;
-            }
-        }
-        let directory = if dir_count > 0 { inner_dir } else { directory };
-        Ok(FolderContentsResponse { token, directory, files })
+        let folders = read_directories(&mut r)?;
+        // Nicotine+ appends a trailing u32 (always 0); ignore whatever remains.
+        Ok(FolderContentsResponse { token, directory, folders })
     }
 
     pub fn to_frame(&self) -> Vec<u8> {
         let mut raw = Vec::new();
         put_u32(&mut raw, self.token);
         put_string(&mut raw, &self.directory);
-        put_u32(&mut raw, 1); // exactly one directory, as Nicotine+ sends
-        put_string(&mut raw, &self.directory);
-        write_file_list(&mut raw, &self.files);
+        write_directories(&mut raw, &self.folders);
         put_u32(&mut raw, 0); // trailing field Nicotine+ appends
         frame_u32(code::FOLDER_CONTENTS_RESPONSE, &zlib_compress(&raw))
     }
@@ -366,11 +362,12 @@ impl UserInfoResponse {
         let description = r.string()?;
         let picture = if r.bool()? {
             let len = r.u32()? as usize;
-            let mut pic = Vec::with_capacity(len.min(MAX_PREALLOC));
-            for _ in 0..len {
-                pic.push(r.u8()?);
+            if len > MAX_PICTURE_LEN {
+                return Err(DecodeError::InvalidValue(format!(
+                    "user-info picture of {len} bytes exceeds {MAX_PICTURE_LEN}"
+                )));
             }
-            Some(pic)
+            Some(r.bytes(len)?)
         } else {
             None
         };
@@ -666,9 +663,23 @@ mod tests {
         let response = FolderContentsResponse {
             token: 42,
             directory: "Music\\Album".into(),
-            files: vec![sample_file("Music\\Album\\song.mp3", 4096)],
+            folders: vec![SharedDirectory {
+                path: "Music\\Album".into(),
+                files: vec![sample_file("song.mp3", 4096)],
+            }],
         };
         assert_eq!(decode_frame(&response.to_frame()), PeerMessage::FolderContents(response));
+
+        // Multiple directories round-trip too (not dropped past the first).
+        let multi = FolderContentsResponse {
+            token: 7,
+            directory: "Root".into(),
+            folders: vec![
+                SharedDirectory { path: "Root\\A".into(), files: vec![sample_file("a.mp3", 1)] },
+                SharedDirectory { path: "Root\\B".into(), files: vec![sample_file("b.mp3", 2)] },
+            ],
+        };
+        assert_eq!(decode_frame(&multi.to_frame()), PeerMessage::FolderContents(multi));
     }
 
     #[test]
