@@ -19,9 +19,11 @@ pub mod code {
     pub const EMBEDDED: u8 = 93;
 }
 
-/// The `identifier` codepoint a [`DistribSearch`] must carry — ASCII 1.
-/// Nicotine+ rejects any other value.
-pub const SEARCH_IDENTIFIER: u32 = 1;
+/// The `identifier` codepoint a [`DistribSearch`] must carry. Nicotine+ decodes
+/// it as `chr(codepoint)` and rejects the message unless it equals the string
+/// `"1"` (slskmessages.py `DistribSearch`; slskproto.py:749, 2381), i.e. the
+/// codepoint of the ASCII character `'1'` — decimal 49 (`0x31`) — not the byte 1.
+pub const SEARCH_IDENTIFIER: u32 = 49;
 
 /// Distrib code 0 — a keepalive ping. No body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +39,7 @@ impl DistribPing {
 /// against our shares (like a server search) and forward it to our children.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DistribSearch {
-    /// Always [`SEARCH_IDENTIFIER`] (ASCII 1) on the wire.
+    /// Always [`SEARCH_IDENTIFIER`] (49, the codepoint of ASCII `'1'`) on the wire.
     pub identifier: u32,
     pub username: String,
     pub token: u32,
@@ -137,9 +139,19 @@ impl DistribEmbedded {
     }
 
     pub fn decode(r: &mut Reader) -> Result<Self, DecodeError> {
-        let inner_code = r.u8()?;
-        let inner_message = r.rest().to_vec();
-        Ok(DistribEmbedded { inner_code, inner_message })
+        // Older SoulseekQt versions sent the inner distrib code as a uint32,
+        // while older Nicotine+ versions sent it as a uint8. Since the framing
+        // layer reads message codes as uint8, Nicotine+'s
+        // `DistribEmbeddedMessage.parse_network_message` (slskmessages.py:4220)
+        // skips the leading 3 zero bytes (`_message[:3] == b"\x00\x00\x00"`)
+        // before reading the uint8 inner code in the legacy uint32 case.
+        let mut body = r.rest();
+        if body.len() >= 3 && body[..3] == [0, 0, 0] {
+            body = &body[3..];
+        }
+        let (&inner_code, inner_message) =
+            body.split_first().ok_or(DecodeError::UnexpectedEof { needed: 1, remaining: 0 })?;
+        Ok(DistribEmbedded { inner_code, inner_message: inner_message.to_vec() })
     }
 }
 
@@ -209,6 +221,24 @@ mod tests {
     }
 
     #[test]
+    fn search_identifier_is_the_codepoint_of_ascii_one() {
+        // Nicotine+ decodes the identifier as chr(codepoint) and rejects the
+        // search unless it equals "1" (slskproto.py:749, 2381). chr(49) == "1",
+        // so the only accepted codepoint is 49 (0x31) — the ASCII '1' character,
+        // not the byte 0x01. Pin that SEARCH_IDENTIFIER encodes 0x31 little-endian.
+        assert_eq!(SEARCH_IDENTIFIER, 49);
+        let search = DistribSearch {
+            identifier: SEARCH_IDENTIFIER,
+            username: String::new(),
+            token: 0,
+            query: String::new(),
+        };
+        let frame = search.to_frame();
+        // frame = [u32 len][u8 code 3][u32 identifier]... — identifier is bytes 5..9.
+        assert_eq!(&frame[5..9], &[0x31, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
     fn branch_level_round_trips_including_negative() {
         for level in [0i32, 3, -1] {
             let msg = DistribBranchLevel { level };
@@ -244,6 +274,27 @@ mod tests {
         assert_eq!(decoded.inner_code, code::SEARCH);
         // The inner bytes decode back to the original search.
         assert_eq!(DistribSearch::decode(&mut Reader::new(&decoded.inner_message)).unwrap(), inner);
+    }
+
+    #[test]
+    fn embedded_skips_legacy_uint32_inner_code() {
+        // Older SoulseekQt versions sent the inner distrib code as a uint32
+        // rather than a uint8. Nicotine+'s DistribEmbeddedMessage.parse_network_message
+        // (slskmessages.py:4220-4228) checks `_message[:3] == b"\x00\x00\x00"`
+        // and, if so, skips those 3 bytes before reading the uint8 code. So an
+        // inner code of 3 laid out as `00 00 00 03` must decode to inner_code 3
+        // with the remaining bytes as the inner message.
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x00, 0x00, 0x00]); // legacy uint32 high bytes
+        put_u8(&mut body, code::SEARCH); // inner code 3, in the uint8 slot
+        body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // inner message bytes
+        let frame = frame_u8(code::EMBEDDED, &body);
+
+        let DistributedMessage::Embedded(decoded) = decode_frame(&frame) else {
+            panic!("expected embedded");
+        };
+        assert_eq!(decoded.inner_code, code::SEARCH);
+        assert_eq!(decoded.inner_message, vec![0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
     #[test]

@@ -231,13 +231,17 @@ def decode_vectors():
     ))
 
     # Distributed (D-connection) messages Nicotine+ only parses.
-    ds = s_u32(1) + s_str("bob") + s_u32(0xABCD) + s_str("deep purple")
+    # The identifier is a uint32 codepoint that Nicotine+ decodes as
+    # chr(codepoint) and rejects unless it equals "1" (slskproto.py:749, 2381),
+    # i.e. the codepoint of ASCII '1' == 49, not the byte 1.
+    ds = s_u32(ord("1")) + s_str("bob") + s_u32(0xABCD) + s_str("deep purple")
     msg = parsed(DistribSearch, ds)
+    assert msg.identifier == "1", msg  # the only value Nicotine+ accepts
     assert (msg.search_username, msg.token, msg.searchterm) == ("bob", 0xABCD, "deep purple"), msg
     out.append((
         "DISTRIB_SEARCH_BODY",
-        'DistribSearch body: identifier=1, username="bob", token=0xABCD, '
-        'query="deep purple" (distrib code 3, u8-coded frame)',
+        'DistribSearch body: identifier=49 (ASCII "1"), username="bob", '
+        'token=0xABCD, query="deep purple" (distrib code 3, u8-coded frame)',
         ds,
     ))
 

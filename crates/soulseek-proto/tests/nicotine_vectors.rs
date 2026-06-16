@@ -497,7 +497,9 @@ fn distributed_bodies_match_nicotine() {
 #[test]
 fn our_decoder_accepts_nicotines_distrib_search() {
     let search = DistribSearch::decode(&mut Reader::new(vectors::DISTRIB_SEARCH_BODY)).unwrap();
-    assert_eq!(search.identifier, 1);
+    // Nicotine+ accepts the search only when chr(identifier) == "1", i.e.
+    // the codepoint 49 (slskproto.py:749, 2381) — not the byte 1.
+    assert_eq!(search.identifier, 49);
     assert_eq!(search.username, "bob");
     assert_eq!(search.token, 0xABCD);
     assert_eq!(search.query, "deep purple");
