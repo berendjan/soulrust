@@ -33,6 +33,12 @@ sys.path.insert(0, NICOTINE_DIR)
 try:
     from pynicotine.slskmessages import (
         ConnectToPeer,
+        DistribBranchLevel,
+        DistribBranchRoot,
+        DistribChildDepth,
+        DistribEmbeddedMessage,
+        DistribPing,
+        DistribSearch,
         ExcludedSearchPhrases,
         FileListMessage,
         FileOffset,
@@ -127,6 +133,10 @@ def s_str(text: str) -> bytes:
     return struct.pack("<I", len(raw)) + raw
 
 
+def s_u8(value: int) -> bytes:
+    return struct.pack("<B", value)
+
+
 def s_u32(value: int) -> bytes:
     return struct.pack("<I", value)
 
@@ -218,6 +228,27 @@ def decode_vectors():
         "EXCLUDED_SEARCH_PHRASES_BODY",
         'ExcludedSearchPhrases: 2 phrases ["explicit", "banned phrase"]',
         esp,
+    ))
+
+    # Distributed (D-connection) messages Nicotine+ only parses.
+    ds = s_u32(1) + s_str("bob") + s_u32(0xABCD) + s_str("deep purple")
+    msg = parsed(DistribSearch, ds)
+    assert (msg.search_username, msg.token, msg.searchterm) == ("bob", 0xABCD, "deep purple"), msg
+    out.append((
+        "DISTRIB_SEARCH_BODY",
+        'DistribSearch body: identifier=1, username="bob", token=0xABCD, '
+        'query="deep purple" (distrib code 3, u8-coded frame)',
+        ds,
+    ))
+
+    emb = s_u8(3) + ds  # inner code 3 (DistribSearch) + its body
+    msg = parsed(DistribEmbeddedMessage, emb)
+    assert msg.distrib_code == 3 and bytes(msg.distrib_message) == ds, msg
+    out.append((
+        "DISTRIB_EMBEDDED_BODY",
+        "DistribEmbeddedMessage body: inner u8 code 3 then the embedded "
+        "DistribSearch body",
+        emb,
     ))
 
     return out
@@ -315,6 +346,19 @@ VECTORS = [
     ("FILE_OFFSET_BYTES",
      "FileOffset(offset=1048576) — raw F-connection bytes: a bare u64, no frame",
      FileOffset(offset=1048576).make_network_message()),
+    # --- distributed (D-connection) messages Nicotine+ packs ---
+    ("DISTRIB_PING_BODY",
+     "DistribPing() — empty body (distrib code 0)",
+     DistribPing().make_network_message()),
+    ("DISTRIB_BRANCH_LEVEL_BODY",
+     "DistribBranchLevel(level=3) — int32 (distrib code 4)",
+     DistribBranchLevel(level=3).make_network_message()),
+    ("DISTRIB_BRANCH_ROOT_BODY",
+     'DistribBranchRoot(root_username="alice") — string (distrib code 5)',
+     DistribBranchRoot(root_username="alice").make_network_message()),
+    ("DISTRIB_CHILD_DEPTH_BODY",
+     "DistribChildDepth(value=5) — u32 (distrib code 7)",
+     DistribChildDepth(value=5).make_network_message()),
 ]
 
 # Server->client / broadcast bodies, laid out by hand and validated by running

@@ -17,6 +17,10 @@ use soulseek_proto::server::{
     ConnectToPeerRequest, FileSearchRequest, GetPeerAddressRequest, LoginRequest, LoginResponse,
     ServerMessage, ServerRequest, SetWaitPort,
 };
+use soulseek_proto::distributed::{
+    DistribBranchLevel, DistribBranchRoot, DistribChildDepth, DistribEmbedded, DistribPing,
+    DistribSearch,
+};
 use soulseek_proto::transfer::{
     FileOffset, FileTransferInit, PlaceInQueueRequest, PlaceInQueueResponse, QueueUpload,
     TransferDirection, TransferRequest, TransferResponse, UploadDenied, UploadFailed,
@@ -474,4 +478,37 @@ fn our_decoder_accepts_nicotines_f_connection_messages() {
     // FileTransferInit (u32 token) and FileOffset (u64 offset) bytes directly.
     assert_eq!(FileTransferInit::decode(vectors::FILE_TRANSFER_INIT_BYTES).unwrap().token, 0xABCD);
     assert_eq!(FileOffset::decode(vectors::FILE_OFFSET_BYTES).unwrap().offset, 1_048_576);
+}
+
+// --- distributed (D-connection) messages -------------------------------------
+// Encode bodies: our frame is [u32 len][u8 code][body], so strip 5 bytes.
+
+#[test]
+fn distributed_bodies_match_nicotine() {
+    assert_eq!(&DistribPing.to_frame()[5..], vectors::DISTRIB_PING_BODY);
+    assert_eq!(&DistribBranchLevel { level: 3 }.to_frame()[5..], vectors::DISTRIB_BRANCH_LEVEL_BODY);
+    assert_eq!(
+        &DistribBranchRoot { root_username: "alice".into() }.to_frame()[5..],
+        vectors::DISTRIB_BRANCH_ROOT_BODY
+    );
+    assert_eq!(&DistribChildDepth { depth: 5 }.to_frame()[5..], vectors::DISTRIB_CHILD_DEPTH_BODY);
+}
+
+#[test]
+fn our_decoder_accepts_nicotines_distrib_search() {
+    let search = DistribSearch::decode(&mut Reader::new(vectors::DISTRIB_SEARCH_BODY)).unwrap();
+    assert_eq!(search.identifier, 1);
+    assert_eq!(search.username, "bob");
+    assert_eq!(search.token, 0xABCD);
+    assert_eq!(search.query, "deep purple");
+}
+
+#[test]
+fn our_decoder_accepts_nicotines_distrib_embedded() {
+    let embedded = DistribEmbedded::decode(&mut Reader::new(vectors::DISTRIB_EMBEDDED_BODY)).unwrap();
+    assert_eq!(embedded.inner_code, 3, "inner message is a DistribSearch");
+    // The inner bytes are exactly the DistribSearch body, and decode back.
+    assert_eq!(embedded.inner_message, vectors::DISTRIB_SEARCH_BODY);
+    let inner = DistribSearch::decode(&mut Reader::new(&embedded.inner_message)).unwrap();
+    assert_eq!(inner.query, "deep purple");
 }

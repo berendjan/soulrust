@@ -45,6 +45,15 @@ impl<'a> Reader<'a> {
         self.remaining() == 0
     }
 
+    /// The unread remainder, consuming it. Used for messages that carry an
+    /// opaque trailing payload (e.g. a distributed embedded message's inner
+    /// bytes).
+    pub fn rest(&mut self) -> &'a [u8] {
+        let slice = &self.buf[self.pos..];
+        self.pos = self.buf.len();
+        slice
+    }
+
     fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
         if self.remaining() < n {
             return Err(DecodeError::UnexpectedEof {

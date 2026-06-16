@@ -25,6 +25,7 @@
 //! - [`peer_message`] — peer messages over an established connection
 //!   (SharedFileList / browse).
 
+pub mod distributed;
 pub mod frame;
 pub mod peer;
 pub mod peer_message;
