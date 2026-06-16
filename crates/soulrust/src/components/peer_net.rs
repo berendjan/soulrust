@@ -12,7 +12,7 @@
 //! over `AsyncRead + AsyncWrite`, so it is unit-testable over an in-memory
 //! duplex without a real socket.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -43,18 +43,53 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// can't pin connection + task resources indefinitely.
 const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Hard cap on a whole outbound browse exchange. A peer that connects and then
+/// trickles frames resets the per-frame idle timer forever; without an overall
+/// deadline the browse task (and the UI's browse-in-progress state) would never
+/// resolve.
+const BROWSE_DEADLINE: Duration = Duration::from_secs(120);
+
 /// Byte budget for a browse listing forwarded onto the bus — it carries
 /// *locations*, not bulk data, and must stay well under the bus ring.
 const MAX_LISTING_BYTES: usize = 512 * 1024;
+
+/// Bound on distinct pending deliveries. A searcher that never connects back
+/// (offline / firewalled / malicious) would otherwise leave its queued frame in
+/// the map forever; when full, the oldest pending delivery (lowest token) is
+/// evicted.
+const MAX_PENDING_DELIVERIES: usize = 1024;
 
 fn file_cost(name: &str) -> usize {
     name.len() + 16
 }
 
-/// Outgoing messages queued for a peer by username, delivered once that peer's
-/// connection is established (e.g. a FileSearchResponse the searcher connects in
-/// to collect).
-type DeliveryQueue = Mutex<HashMap<String, Vec<Vec<u8>>>>;
+/// Outgoing frames awaiting an indirect (pierced) connection, keyed by the relay
+/// token we minted for our `ConnectToPeer` request — the searcher echoes that
+/// token back in its `PierceFirewall` when it connects in to collect them
+/// (mirrors Nicotine+'s `_indirect_token_init_msgs`).
+type DeliveryQueue = Mutex<PendingDeliveries>;
+
+#[derive(Default)]
+struct PendingDeliveries {
+    by_token: BTreeMap<u32, Vec<Vec<u8>>>,
+}
+
+impl PendingDeliveries {
+    /// Queue a frame under a relay token, evicting the oldest pending delivery
+    /// if we are over budget.
+    fn queue(&mut self, token: u32, frame: Vec<u8>) {
+        self.by_token.entry(token).or_default().push(frame);
+        while self.by_token.len() > MAX_PENDING_DELIVERIES {
+            let Some((&oldest, _)) = self.by_token.iter().next() else { break };
+            self.by_token.remove(&oldest);
+        }
+    }
+
+    /// Remove and return the frames queued under a relay token, if any.
+    fn take(&mut self, token: u32) -> Option<Vec<Vec<u8>>> {
+        self.by_token.remove(&token)
+    }
+}
 
 /// Work for the reactor, sent by the bus-facing handlers.
 enum PeerCommand {
@@ -161,7 +196,7 @@ fn run_reactor<W: traits::core::Writer>(
         // Scan here (off the startup path) and warm the cached browse frame.
         let shares = Arc::new(ShareIndex::scan(&folders));
         let _ = shares.browse_frame();
-        let queue: Arc<DeliveryQueue> = Arc::new(Mutex::new(HashMap::new()));
+        let queue: Arc<DeliveryQueue> = Arc::new(Mutex::new(PendingDeliveries::default()));
 
         let listener = match TcpListener::bind(("0.0.0.0", port)).await {
             Ok(listener) => listener,
@@ -233,29 +268,45 @@ async fn command_loop<W: traits::core::Writer>(
                 tokio::spawn(pierce_task(ip, port, token, peer, shares, queue));
             }
             PeerCommand::IncomingSearch { username: searcher, token, query } => {
-                let files = search_response::respond(&query, max_results, &[], &shares);
-                if files.is_empty() {
-                    continue;
-                }
-                let response = FileSearchResponse {
-                    username: username.clone(),
-                    token,
-                    files,
-                    free_slots: true,
-                    upload_speed: 0,
-                    in_queue: 0,
-                    private_files: Vec::new(),
-                };
-                queue.lock().unwrap().entry(searcher.clone()).or_default().push(response.to_frame());
-                // Ask the server to relay a connect request so the searcher
-                // connects in and collects the queued response.
-                let request = ConnectToPeerRequest {
-                    token: connect_token,
-                    username: searcher,
-                    connection_type: ConnectionType::Peer,
-                };
+                let our_token = connect_token;
                 connect_token = connect_token.wrapping_add(1);
-                PeerNet::send(&NetTx { frame: request.to_frame() }, &writer);
+                let shares = shares.clone();
+                let queue = queue.clone();
+                let writer = writer.clone();
+                let our_username = username.clone();
+                let max = max_results;
+                // Matching is CPU-bound (word-index intersection); run it off the
+                // single reactor thread so a burst of network searches can't
+                // head-of-line-block accept / serve / connect dispatch.
+                tokio::spawn(async move {
+                    let files = tokio::task::spawn_blocking(move || {
+                        search_response::respond(&query, max, &[], &shares)
+                    })
+                    .await
+                    .unwrap_or_default();
+                    if files.is_empty() {
+                        return;
+                    }
+                    let response = FileSearchResponse {
+                        username: our_username,
+                        token,
+                        files,
+                        free_slots: true,
+                        upload_speed: 0,
+                        in_queue: 0,
+                        private_files: Vec::new(),
+                    };
+                    // Queue under the relay token, then ask the server to relay a
+                    // connect request: the searcher pierces back with this token
+                    // and serve_connection delivers the queued response.
+                    queue.lock().unwrap().queue(our_token, response.to_frame());
+                    let request = ConnectToPeerRequest {
+                        token: our_token,
+                        username: searcher,
+                        connection_type: ConnectionType::Peer,
+                    };
+                    PeerNet::send(&NetTx { frame: request.to_frame() }, &writer);
+                });
             }
         }
     }
@@ -292,24 +343,37 @@ async fn browse_fetch(
     our_username: &str,
 ) -> Result<SharedFileListResponse, String> {
     let mut stream = connect(ip, port).await.map_err(|e| format!("connect {ip}:{port}: {e}"))?;
-    let init =
-        PeerInit { username: our_username.to_owned(), connection_type: ConnectionType::Peer, token: 0 };
-    stream.write_all(&init.to_frame()).await.map_err(|e| format!("send peer init: {e}"))?;
-    stream
-        .write_all(&GetSharedFileList.to_frame())
-        .await
-        .map_err(|e| format!("send share-list request: {e}"))?;
+    // Bound the whole exchange: a peer that trickles non-list frames keeps
+    // resetting the per-frame idle timer, so only an overall deadline guarantees
+    // the browse resolves.
+    match tokio::time::timeout(BROWSE_DEADLINE, async {
+        let init = PeerInit {
+            username: our_username.to_owned(),
+            connection_type: ConnectionType::Peer,
+            token: 0,
+        };
+        stream.write_all(&init.to_frame()).await.map_err(|e| format!("send peer init: {e}"))?;
+        stream
+            .write_all(&GetSharedFileList.to_frame())
+            .await
+            .map_err(|e| format!("send share-list request: {e}"))?;
 
-    loop {
-        match read_frame_timeout(&mut stream, MAX_LARGE_PEER_MESSAGE_LEN, PEER_IDLE_TIMEOUT).await {
-            Ok(Some(payload)) => match PeerMessage::decode(&payload) {
-                Ok(PeerMessage::SharedFileList(response)) => return Ok(response),
-                Ok(_) => {} // ignore other messages while awaiting the list
-                Err(err) => return Err(format!("decoding peer message: {err}")),
-            },
-            Ok(None) => return Err("peer closed before sending its share list".into()),
-            Err(err) => return Err(format!("reading from peer: {err}")),
+        loop {
+            match read_frame_timeout(&mut stream, MAX_LARGE_PEER_MESSAGE_LEN, PEER_IDLE_TIMEOUT).await {
+                Ok(Some(payload)) => match PeerMessage::decode(&payload) {
+                    Ok(PeerMessage::SharedFileList(response)) => return Ok(response),
+                    Ok(_) => {} // ignore other messages while awaiting the list
+                    Err(err) => return Err(format!("decoding peer message: {err}")),
+                },
+                Ok(None) => return Err("peer closed before sending its share list".into()),
+                Err(err) => return Err(format!("reading from peer: {err}")),
+            }
         }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => Err("peer exceeded the browse time budget".into()),
     }
 }
 
@@ -363,8 +427,25 @@ async fn read_frame<R: AsyncRead + Unpin>(
             "peer sent an oversized frame",
         ));
     }
-    let mut payload = vec![0u8; len];
-    reader.read_exact(&mut payload).await?;
+    // Read incrementally rather than pre-allocating `len` bytes: a peer can
+    // declare up to `max_len` (hundreds of MiB for a browse / search response),
+    // and we must not allocate that on the strength of the length prefix alone —
+    // memory tracks bytes actually delivered.
+    let mut payload = Vec::new();
+    let mut remaining = len;
+    let mut chunk = [0u8; 16 * 1024];
+    while remaining > 0 {
+        let want = remaining.min(chunk.len());
+        let read = reader.read(&mut chunk[..want]).await?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "peer closed mid-frame",
+            ));
+        }
+        payload.extend_from_slice(&chunk[..read]);
+        remaining -= read;
+    }
     Ok(Some(payload))
 }
 
@@ -396,8 +477,8 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     F: FnMut(String),
 {
-    let peer = match known_peer {
-        Some(peer) => peer,
+    let (peer, queued) = match known_peer {
+        Some(peer) => (peer, Vec::new()),
         None => {
             let Some(init_payload) =
                 read_frame_timeout(&mut stream, MAX_PEER_INIT_MESSAGE_LEN, PEER_IDLE_TIMEOUT).await?
@@ -405,17 +486,26 @@ where
                 return Ok(());
             };
             match PeerInitMessage::decode(&init_payload) {
-                Ok(PeerInitMessage::PeerInit(init)) => init.username,
-                Ok(PeerInitMessage::PierceFirewall(_)) => "<indirect>".to_owned(),
+                Ok(PeerInitMessage::PeerInit(init)) => (init.username, Vec::new()),
+                Ok(PeerInitMessage::PierceFirewall(pierce)) => {
+                    // Indirect connect-back: the searcher echoes the relay token
+                    // we minted for our ConnectToPeer. Recover the queued
+                    // delivery by that token (Nicotine+'s
+                    // `_indirect_token_init_msgs`). An unknown/expired token
+                    // means we never asked for this connection — drop it.
+                    let Some(frames) = queue.lock().unwrap().take(pierce.token) else {
+                        return Ok(());
+                    };
+                    (format!("<indirect {}>", pierce.token), frames)
+                }
                 Err(_) => return Ok(()), // not a peer-init we understand
             }
         }
     };
     on_activity(format!("peer {peer} connected"));
 
-    // Deliver anything queued for this peer (e.g. a FileSearchResponse it
-    // connected in to collect). The lock is released before any await.
-    let queued = queue.lock().unwrap().remove(&peer).unwrap_or_default();
+    // Deliver anything the searcher pierced in to collect. The lock was released
+    // above, before any await.
     for frame in queued {
         stream.write_all(&frame).await?;
         on_activity(format!("delivered queued response to {peer}"));
@@ -488,7 +578,7 @@ fn to_listing(username: &str, response: &SharedFileListResponse) -> BrowseListin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soulseek_proto::peer::PeerInit;
+    use soulseek_proto::peer::{PeerInit, PierceFirewall};
     use soulseek_proto::peer_message::{FolderContentsRequest, SharedDirectory, SharedFile, UserInfoRequest};
 
     fn test_index() -> ShareIndex {
@@ -499,7 +589,7 @@ mod tests {
     }
 
     fn empty_queue() -> Arc<DeliveryQueue> {
-        Arc::new(Mutex::new(HashMap::new()))
+        Arc::new(Mutex::new(PendingDeliveries::default()))
     }
 
     async fn read_one_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Vec<u8> {
@@ -541,9 +631,11 @@ mod tests {
     }
 
     #[test]
-    fn delivers_queued_messages_after_handshake() {
-        // A FileSearchResponse queued for "peer" is sent as soon as it connects,
-        // before any request — the search-delivery path.
+    fn delivers_queued_response_to_a_pierced_searcher() {
+        // A FileSearchResponse queued under relay token 7 is delivered when the
+        // searcher connects in and pierces with that token — the real
+        // search-delivery path (the searcher echoes our ConnectToPeer token in a
+        // PierceFirewall, not a PeerInit).
         runtime().block_on(async {
             let (mut client, server) = tokio::io::duplex(64 * 1024);
             let shares = Arc::new(test_index());
@@ -557,13 +649,12 @@ mod tests {
                 in_queue: 0,
                 private_files: vec![],
             };
-            queue.lock().unwrap().entry("peer".into()).or_default().push(response.to_frame());
+            queue.lock().unwrap().queue(7, response.to_frame());
 
             let serve = tokio::spawn(async move {
                 serve_connection(server, &shares, &queue, None, |_| {}).await
             });
-            let init = PeerInit { username: "peer".into(), connection_type: ConnectionType::Peer, token: 0 };
-            client.write_all(&init.to_frame()).await.unwrap();
+            client.write_all(&PierceFirewall { token: 7 }.to_frame()).await.unwrap();
 
             let delivered = PeerMessage::decode(&read_one_frame(&mut client).await).unwrap();
             let PeerMessage::FileSearchResponse(resp) = delivered else { panic!("expected search response") };
@@ -572,6 +663,27 @@ mod tests {
 
             drop(client);
             serve.await.unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn unknown_pierce_token_is_dropped() {
+        // A PierceFirewall carrying a token we never issued (no queued delivery)
+        // is dropped without serving — matches Nicotine+ closing connections for
+        // expired/unknown indirect tokens.
+        runtime().block_on(async {
+            let (mut client, server) = tokio::io::duplex(64 * 1024);
+            let shares = Arc::new(test_index());
+            let queue = empty_queue();
+            let serve = tokio::spawn(async move {
+                serve_connection(server, &shares, &queue, None, |_| {}).await
+            });
+            client.write_all(&PierceFirewall { token: 7 }.to_frame()).await.unwrap();
+            serve.await.unwrap().unwrap();
+
+            // The server closed the connection: the client reads EOF.
+            let mut buf = [0u8; 1];
+            assert_eq!(client.read(&mut buf).await.unwrap(), 0);
         });
     }
 
