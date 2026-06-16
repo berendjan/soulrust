@@ -3,7 +3,7 @@
 //! consumes decoded frame payloads (`NetRx`) and produces outgoing frames
 //! (`NetTx`), which keeps it fully unit-testable with a capturing writer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rust_messenger::traits;
 use rust_messenger::traits::extended::Sender;
@@ -15,9 +15,9 @@ use soulseek_proto::server::{
 
 use crate::config::AppContext;
 use crate::messages::{
-    BrowseAccepted, BrowseFailed, BrowseUser, HandlerId, IncomingSearch, NetConn, NetConnEvent,
-    NetRx, NetTx, PeerBrowseConnect, PeerPierce, SessionEvent, SessionEventKind, StartSearch,
-    StartSearchResult, StartedSearch,
+    BrowseAccepted, BrowseFailed, BrowseUser, DownloadFailed, HandlerId, IncomingSearch, NetConn,
+    NetConnEvent, NetRx, NetTx, PeerBrowseConnect, PeerDownloadConnect, PeerPierce, SessionEvent,
+    SessionEventKind, StartDownload, StartSearch, StartSearchResult, StartedSearch,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +37,15 @@ pub struct Session {
     /// waiting to start a browse. A GetPeerAddress response for one of these
     /// triggers a peer connection rather than just a log note.
     pending_browses: HashSet<String>,
+    /// Downloads waiting on a peer address, keyed by username. A GetPeerAddress
+    /// response drains these into PeerDownloadConnect messages.
+    pending_downloads: HashMap<String, Vec<PendingDownload>>,
+}
+
+/// A download queued before we knew the peer's address.
+struct PendingDownload {
+    filename: String,
+    size: u64,
 }
 
 /// Client identity sent in the Login message.
@@ -52,6 +61,7 @@ impl Session {
             state: SessionState::Disconnected,
             next_token: 1,
             pending_browses: HashSet::new(),
+            pending_downloads: HashMap::new(),
         }
     }
 
@@ -149,9 +159,18 @@ impl traits::core::Handle<NetRx> for Session {
                 );
             }
             ServerMessage::GetPeerAddress(response) => {
-                if self.pending_browses.remove(&response.username) {
-                    // 0.0.0.0:0 is the server's way of saying "unknown/offline".
-                    if response.ip.is_unspecified() || response.port == 0 {
+                // 0.0.0.0:0 is the server's way of saying "unknown/offline".
+                let offline = response.ip.is_unspecified() || response.port == 0;
+                let ip = response.ip.to_string();
+                let port = response.port as u16;
+
+                let was_browse = self.pending_browses.remove(&response.username);
+                let downloads =
+                    self.pending_downloads.remove(&response.username).unwrap_or_default();
+                let handled = was_browse || !downloads.is_empty();
+
+                if was_browse {
+                    if offline {
                         Self::send(
                             &BrowseFailed {
                                 username: response.username.clone(),
@@ -163,13 +182,39 @@ impl traits::core::Handle<NetRx> for Session {
                         Self::send(
                             &PeerBrowseConnect {
                                 username: response.username.clone(),
-                                ip: response.ip.to_string(),
-                                port: response.port as u16,
+                                ip: ip.clone(),
+                                port,
                             },
                             writer,
                         );
                     }
-                } else {
+                }
+
+                for download in downloads {
+                    if offline {
+                        Self::send(
+                            &DownloadFailed {
+                                username: response.username.clone(),
+                                filename: download.filename,
+                                reason: "user is offline or not reachable".into(),
+                            },
+                            writer,
+                        );
+                    } else {
+                        Self::send(
+                            &PeerDownloadConnect {
+                                username: response.username.clone(),
+                                ip: ip.clone(),
+                                port,
+                                filename: download.filename,
+                                size: download.size,
+                            },
+                            writer,
+                        );
+                    }
+                }
+
+                if !handled {
                     Self::emit(
                         SessionEventKind::ProtocolNote {
                             note: format!(
@@ -301,6 +346,43 @@ impl traits::core::Handle<BrowseUser> for Session {
     }
 }
 
+impl traits::core::Handle<StartDownload> for Session {
+    fn handle<W: traits::core::Writer>(&mut self, message: &StartDownload, writer: &W) {
+        let username = message.username.trim();
+        if self.state != SessionState::LoggedIn {
+            Self::send(
+                &DownloadFailed {
+                    username: message.username.clone(),
+                    filename: message.filename.clone(),
+                    reason: "not logged in to the soulseek server".into(),
+                },
+                writer,
+            );
+            return;
+        }
+        if username.is_empty() || message.filename.is_empty() {
+            Self::send(
+                &DownloadFailed {
+                    username: message.username.clone(),
+                    filename: message.filename.clone(),
+                    reason: "a username and filename are required".into(),
+                },
+                writer,
+            );
+            return;
+        }
+
+        // Resolve the peer's address; the GetPeerAddress response drains the
+        // pending download into a PeerDownloadConnect.
+        let request = GetPeerAddressRequest { username: username.to_owned() };
+        Self::send(&NetTx { frame: request.to_frame() }, writer);
+        self.pending_downloads.entry(username.to_owned()).or_default().push(PendingDownload {
+            filename: message.filename.clone(),
+            size: message.size,
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,6 +464,14 @@ mod tests {
 
         fn pierces(&self) -> Vec<PeerPierce> {
             self.decode(MessageId::PeerPierce, PeerPierce::deserialize_from)
+        }
+
+        fn download_connects(&self) -> Vec<PeerDownloadConnect> {
+            self.decode(MessageId::PeerDownloadConnect, PeerDownloadConnect::deserialize_from)
+        }
+
+        fn download_failures(&self) -> Vec<DownloadFailed> {
+            self.decode(MessageId::DownloadFailed, DownloadFailed::deserialize_from)
         }
 
         fn decode<T>(&self, id: MessageId, f: impl Fn(&[u8]) -> T) -> Vec<T> {
@@ -674,6 +764,69 @@ mod tests {
         assert_eq!(searches[0].username, "bob");
         assert_eq!(searches[0].token, 99);
         assert_eq!(searches[0].query, "rust album");
+    }
+
+    #[test]
+    fn start_download_resolves_address_then_emits_peer_download_connect() {
+        let writer = CapturingWriter::default();
+        let mut session = logged_in_session(&writer);
+        session.handle(
+            &StartDownload {
+                username: "alice".into(),
+                filename: "Music\\song.mp3".into(),
+                size: 4096,
+            },
+            &writer,
+        );
+        // Looks the peer up.
+        assert_eq!(
+            writer.frames().last().unwrap(),
+            &GetPeerAddressRequest { username: "alice".into() }.to_frame()
+        );
+
+        // The address response drains the pending download into a connect.
+        session.handle(
+            &NetRx { payload: get_peer_address_payload("alice", Ipv4Addr::new(198, 51, 100, 7), 2234) },
+            &writer,
+        );
+        let connects = writer.download_connects();
+        assert_eq!(connects.len(), 1);
+        assert_eq!(connects[0].username, "alice");
+        assert_eq!(connects[0].ip, "198.51.100.7");
+        assert_eq!(connects[0].port, 2234);
+        assert_eq!(connects[0].filename, "Music\\song.mp3");
+        assert_eq!(connects[0].size, 4096);
+    }
+
+    #[test]
+    fn start_download_from_an_offline_user_fails() {
+        let writer = CapturingWriter::default();
+        let mut session = logged_in_session(&writer);
+        session.handle(
+            &StartDownload { username: "ghost".into(), filename: "a.mp3".into(), size: 1 },
+            &writer,
+        );
+        session.handle(
+            &NetRx { payload: get_peer_address_payload("ghost", Ipv4Addr::UNSPECIFIED, 0) },
+            &writer,
+        );
+        let failures = writer.download_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].filename, "a.mp3");
+        assert!(writer.download_connects().is_empty());
+    }
+
+    #[test]
+    fn start_download_when_not_logged_in_fails_immediately() {
+        let writer = CapturingWriter::default();
+        let mut session = test_session(); // not logged in
+        session.handle(
+            &StartDownload { username: "alice".into(), filename: "a.mp3".into(), size: 1 },
+            &writer,
+        );
+        let failures = writer.download_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].reason, "not logged in to the soulseek server");
     }
 
     #[test]

@@ -59,6 +59,10 @@ rust_messenger::messenger_id_enum!(
         PeerActivity = 27,
         IncomingSearch = 28,
         PeerPierce = 29,
+        StartDownload = 30,
+        PeerDownloadConnect = 31,
+        DownloadComplete = 32,
+        DownloadFailed = 33,
     }
 );
 
@@ -353,6 +357,46 @@ pub struct PeerPierce {
 }
 
 // ---------------------------------------------------------------------------
+// downloads (request a file from a peer)
+
+/// ui / web bridge → session: start downloading `filename` (a peer's virtual
+/// path) from `username`. `size` comes from the search/browse result the user
+/// picked, so we know how many bytes to expect.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartDownload {
+    pub username: String,
+    pub filename: String,
+    pub size: u64,
+}
+
+/// session → peer_net: the resolved address to open a peer connection to and
+/// queue a download. A location, not data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerDownloadConnect {
+    pub username: String,
+    pub ip: String,
+    pub port: u16,
+    pub filename: String,
+    pub size: u64,
+}
+
+/// peer_net → ui: a download finished and was moved to its final path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadComplete {
+    pub username: String,
+    pub filename: String,
+    pub path: String,
+}
+
+/// peer_net → ui: a download could not be completed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadFailed {
+    pub username: String,
+    pub filename: String,
+    pub reason: String,
+}
+
+// ---------------------------------------------------------------------------
 // bus plumbing: Message + ExtendedMessage + deserialize_from for every type
 
 macro_rules! impl_bus_message {
@@ -417,6 +461,10 @@ impl_bus_message!(
     PeerActivity => MessageId::PeerActivity,
     IncomingSearch => MessageId::IncomingSearch,
     PeerPierce => MessageId::PeerPierce,
+    StartDownload => MessageId::StartDownload,
+    PeerDownloadConnect => MessageId::PeerDownloadConnect,
+    DownloadComplete => MessageId::DownloadComplete,
+    DownloadFailed => MessageId::DownloadFailed,
 );
 
 #[cfg(test)]

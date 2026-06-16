@@ -18,10 +18,11 @@ use crate::config::ConfigStore;
 use crate::extract::ExtractorComponent;
 use crate::messages::{
     ApplyUpdateReq, ApplyUpdateResult, BrowseAccepted, BrowseFailed, BrowseHtml, BrowseListing,
-    BrowseRenderReq, BrowseUser, ConfigChanged, ConfigSnapshot, ExtractRequest, ExtractResult,
-    GetConfigReq, HttpHtml, HttpRender, IncomingSearch, NetConn, NetRx, NetTx, PeerActivity,
-    PeerBrowseConnect, PeerPierce, SetConfigReq, SetConfigResult, SessionEvent, StartSearch,
-    StartSearchResult, UpdateDownloaded, UpdaterStatusChanged,
+    BrowseRenderReq, BrowseUser, ConfigChanged, ConfigSnapshot, DownloadComplete, DownloadFailed,
+    ExtractRequest, ExtractResult, GetConfigReq, HttpHtml, HttpRender, IncomingSearch, NetConn,
+    NetRx, NetTx, PeerActivity, PeerBrowseConnect, PeerDownloadConnect, PeerPierce, SetConfigReq,
+    SetConfigResult, SessionEvent, StartDownload, StartSearch, StartSearchResult, UpdateDownloaded,
+    UpdaterStatusChanged,
 };
 
 rust_messenger::Messenger! {
@@ -69,6 +70,12 @@ rust_messenger::Messenger! {
             // serving: incoming searches matched + delivered; firewall pierces
             Session, IncomingSearch: [ peer_net ],
             Session, PeerPierce: [ peer_net ],
+            // downloads: bridge -> session resolves address -> peer_net -> ui log
+            WebBridge, StartDownload: [ session ],
+            Session, PeerDownloadConnect: [ peer_net ],
+            Session, DownloadFailed: [ ui ],
+            PeerNet, DownloadComplete: [ ui ],
+            PeerNet, DownloadFailed: [ ui ],
             // peer network edge: serving activity -> ui log
             PeerNet, PeerActivity: [ ui ],
             // broadcasts
