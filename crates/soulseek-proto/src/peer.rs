@@ -84,7 +84,13 @@ impl PeerInit {
         let mut body = Vec::new();
         put_string(&mut body, &self.username);
         put_string(&mut body, self.connection_type.as_str());
-        put_u32(&mut body, self.token);
+        // Nicotine+ PeerInit.make_network_message writes `pack_uint32(0)` — a
+        // literal constant ("Empty token"), never the instance's token
+        // (slskmessages.py). The legacy token is always zero on the wire today,
+        // so we emit 0 unconditionally rather than re-serialising `self.token`
+        // (which would diverge from Nicotine+ when re-encoding a decoded legacy
+        // frame whose token was non-zero).
+        put_u32(&mut body, 0);
         frame_u8(code::PEER_INIT, &body)
     }
 
@@ -239,6 +245,60 @@ mod tests {
                 token: 12345,
             })
         );
+    }
+
+    #[test]
+    fn peer_init_encode_always_emits_zero_token() {
+        // Nicotine+ PeerInit.make_network_message writes `pack_uint32(0)` — a
+        // literal constant, not the instance's token (slskmessages.py). So even
+        // a PeerInit holding a non-zero legacy token (e.g. one read back off the
+        // wire) must serialise a zero token, matching Nicotine+ exactly.
+        let frame = PeerInit {
+            username: "user".into(),
+            connection_type: ConnectionType::Peer,
+            token: 0xDEAD_BEEF,
+        }
+        .to_frame();
+        assert_eq!(
+            frame,
+            [
+                0x12, 0x00, 0x00, 0x00, // length = code(1) + str(4+4) + str(4+1) + token(4) = 18
+                0x01, // code 1
+                0x04, 0x00, 0x00, 0x00, b'u', b's', b'e', b'r', // username "user"
+                0x01, 0x00, 0x00, 0x00, b'P', // connection type "P"
+                0x00, 0x00, 0x00, 0x00, // token forced to 0 regardless of struct value
+            ]
+        );
+    }
+
+    #[test]
+    fn peer_init_decode_requires_connection_type() {
+        // Nicotine+ PeerInit.parse_network_message calls unpack_string() twice,
+        // unconditionally — target_user then conn_type (slskmessages.py). The
+        // connection-type string is therefore mandatory, unlike the trailing
+        // legacy token which it never reads. A frame ending right after the
+        // username must error, not decode with a defaulted connection type.
+        let mut body = Vec::new();
+        body.push(code::PEER_INIT);
+        put_string(&mut body, "testuser");
+        // deliberately no connection-type string
+        assert!(matches!(
+            PeerInitMessage::decode(&body),
+            Err(DecodeError::UnexpectedEof { .. })
+        ));
+    }
+
+    #[test]
+    fn pierce_firewall_decode_requires_full_token() {
+        // Nicotine+ PierceFireWall.parse_network_message is a single
+        // unpack_uint32() (slskmessages.py): the 4-byte token is mandatory. A
+        // body carrying fewer than four token bytes is truncated and must error
+        // rather than silently reading a short/zero token.
+        let body = [code::PIERCE_FIREWALL, 0x01, 0x02]; // only 2 of 4 token bytes
+        assert!(matches!(
+            PeerInitMessage::decode(&body),
+            Err(DecodeError::UnexpectedEof { .. })
+        ));
     }
 
     #[test]

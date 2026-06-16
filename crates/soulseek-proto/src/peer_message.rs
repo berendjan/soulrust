@@ -309,7 +309,9 @@ impl FolderContentsResponse {
         let token = r.u32()?;
         let directory = r.string()?;
         let folders = read_directories(&mut r)?;
-        // Nicotine+ appends a trailing u32 (always 0); ignore whatever remains.
+        // Nicotine+'s `_parse_remaining_network_message` stops after the folder
+        // list — there is no trailing field. Tolerate (ignore) any extra bytes a
+        // nonconforming peer might append rather than faulting.
         Ok(FolderContentsResponse { token, directory, folders })
     }
 
@@ -317,8 +319,10 @@ impl FolderContentsResponse {
         let mut raw = Vec::new();
         put_u32(&mut raw, self.token);
         put_string(&mut raw, &self.directory);
+        // Nicotine+'s `make_network_message` (slskmessages.py:3699-3714) writes
+        // the token, the requested directory, then the folder list — and stops.
+        // It appends NO trailing field.
         write_directories(&mut raw, &self.folders);
-        put_u32(&mut raw, 0); // trailing field Nicotine+ appends
         frame_u32(code::FOLDER_CONTENTS_RESPONSE, &zlib_compress(&raw))
     }
 }
@@ -499,6 +503,53 @@ mod tests {
             PeerMessage::decode(payload).unwrap(),
             PeerMessage::SharedFileList(original)
         );
+    }
+
+    #[test]
+    fn shared_file_list_inflated_body_is_byte_exact() {
+        // Pin the EXACT inflated bytes our encoder produces against Nicotine+'s
+        // layout, so an encode-side field-order/width regression is caught
+        // directly (round-tripping alone would hide a symmetric encode+decode
+        // bug). Field order follows `FileListMessage.pack_file_info`
+        // (slskmessages.py:400-456) and `SharedFileListResponse.make_network_message`
+        // (slskmessages.py:3314-3348):
+        //   [u32 ndir]
+        //   per dir: [string path][u32 nfiles]
+        //   per file: [u8 1][string name][u64 size][u32 ext_len=0][u32 nattrs][attr…]
+        //   [u32 unknown=0]            <- always sent, even with no private dirs
+        //   (no private section when there are no private dirs)
+        let tree = SharedFileListResponse {
+            directories: vec![SharedDirectory {
+                path: "D".into(),
+                files: vec![SharedFile {
+                    name: "f".into(),
+                    size: 5,
+                    extension: String::new(),
+                    attributes: vec![(0, 320)], // bitrate = 320
+                }],
+            }],
+            private_directories: vec![],
+        };
+
+        let frame = tree.to_frame();
+        let (payload, _) = split_frame(&frame).unwrap().unwrap();
+        // payload = [u32 code][zlib stream]; inflate the stream after the code.
+        let inflated = zlib_decompress(&payload[4..]).unwrap();
+
+        let expected: &[u8] = &[
+            0x01, 0x00, 0x00, 0x00, // ndir = 1
+            0x01, 0x00, 0x00, 0x00, b'D', // path "D" (len 1)
+            0x01, 0x00, 0x00, 0x00, // nfiles = 1
+            0x01, // file code byte, pack_uint8(1)
+            0x01, 0x00, 0x00, 0x00, b'f', // name "f" (len 1)
+            0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // size u64 = 5
+            0x00, 0x00, 0x00, 0x00, // empty ext, pack_uint32(0)
+            0x01, 0x00, 0x00, 0x00, // num_attrs = 1
+            0x00, 0x00, 0x00, 0x00, // attr type 0 (bitrate)
+            0x40, 0x01, 0x00, 0x00, // attr value 320
+            0x00, 0x00, 0x00, 0x00, // unknown field = 0
+        ];
+        assert_eq!(inflated, expected);
     }
 
     #[test]
@@ -765,6 +816,50 @@ mod tests {
             ],
         };
         assert_eq!(decode_frame(&multi.to_frame()), PeerMessage::FolderContents(multi));
+    }
+
+    #[test]
+    fn folder_contents_response_emits_no_trailing_field() {
+        // Nicotine+'s `FolderContentsResponse.make_network_message`
+        // (slskmessages.py:3699-3714) packs the token, the requested directory,
+        // then the folder list (`pack_uint32(1)` + dir string + the folder's file
+        // bytes), and STOPS — it appends no trailing u32. Pin the exact inflated
+        // bytes so the obsolete extra field can't creep back in.
+        let response = FolderContentsResponse {
+            token: 42,
+            directory: "D".into(),
+            folders: vec![SharedDirectory {
+                path: "D".into(),
+                files: vec![SharedFile {
+                    name: "f".into(),
+                    size: 5,
+                    extension: String::new(),
+                    attributes: vec![],
+                }],
+            }],
+        };
+
+        let frame = response.to_frame();
+        let (payload, _) = split_frame(&frame).unwrap().unwrap();
+        let inflated = zlib_decompress(&payload[4..]).unwrap();
+
+        let expected: &[u8] = &[
+            0x2A, 0x00, 0x00, 0x00, // token = 42
+            0x01, 0x00, 0x00, 0x00, b'D', // requested directory "D"
+            0x01, 0x00, 0x00, 0x00, // ndir = 1
+            0x01, 0x00, 0x00, 0x00, b'D', // folder path "D"
+            0x01, 0x00, 0x00, 0x00, // nfiles = 1
+            0x01, // file code byte
+            0x01, 0x00, 0x00, 0x00, b'f', // name "f"
+            0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // size u64 = 5
+            0x00, 0x00, 0x00, 0x00, // empty ext
+            0x00, 0x00, 0x00, 0x00, // num_attrs = 0
+                                    // ...and nothing after: no trailing u32.
+        ];
+        assert_eq!(inflated, expected, "no trailing field after the folder list");
+
+        // And it still round-trips through decode unchanged.
+        assert_eq!(decode_frame(&frame), PeerMessage::FolderContents(response));
     }
 
     #[test]

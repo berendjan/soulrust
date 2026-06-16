@@ -336,6 +336,31 @@ mod tests {
     }
 
     #[test]
+    fn login_request_body_matches_nicotine_reference_vector() {
+        // Reproduces Nicotine+'s own LoginMessageTest::test_make_network_message
+        // (pynicotine/tests/unit/protocol/test_slskmessages.py): the message
+        // Login(username="test", passwd="s33cr3t", version=157, minorversion=19)
+        // packs to exactly these body bytes. The embedded 32-char string is
+        // md5("tests33cr3t").hexdigest() == "dbc93f24d8f3f109deed23c3e2f8b74c"
+        // (Login.make_network_message hashes username+passwd as UTF-8). Pinning
+        // the reference's literal vector proves our digest computation and field
+        // order (username, passwd, version, md5, minorversion) are byte-for-byte
+        // identical to Nicotine+, independent of our own helper encoders.
+        let mut body = Vec::new();
+        LoginRequest {
+            username: "test".into(),
+            password: "s33cr3t".into(),
+            major_version: 157,
+            minor_version: 19,
+        }
+        .encode_body(&mut body);
+        assert_eq!(
+            body,
+            b"\x04\x00\x00\x00test\x07\x00\x00\x00s33cr3t\x9d\x00\x00\x00\x20\x00\x00\x00dbc93f24d8f3f109deed23c3e2f8b74c\x13\x00\x00\x00"
+        );
+    }
+
+    #[test]
     fn set_wait_port_frame_is_byte_exact() {
         // SoulseekQt form: port + obfuscation_type + obfuscated_port (three
         // u32s). Body is 12 bytes, frame length = code(4) + body(12) = 16.
