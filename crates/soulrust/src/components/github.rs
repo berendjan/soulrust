@@ -118,6 +118,18 @@ mod tests {
     }
 
     #[test]
+    fn version_comparison_orders_prereleases_below_their_release() {
+        // Semver: a pre-release is LOWER than the same release, so we must not
+        // "update" from a stable build to its own pre-release.
+        assert!(!is_newer("v0.1.0-beta", "0.1.0").unwrap(), "prerelease is not newer than release");
+        assert!(is_newer("v0.1.0", "0.1.0-beta").unwrap(), "release is newer than its prerelease");
+        // Ordering among pre-releases, and a newer pre-release vs an older release.
+        assert!(is_newer("v0.2.0-beta", "0.2.0-alpha").unwrap());
+        assert!(is_newer("v0.2.0-alpha", "0.1.0").unwrap(), "newer prerelease beats older release");
+        assert!(!is_newer("v0.1.0-alpha", "0.1.0-beta").unwrap());
+    }
+
+    #[test]
     fn picks_only_the_exact_platform_asset() {
         let release = Release {
             tag: "v0.2.0".into(),

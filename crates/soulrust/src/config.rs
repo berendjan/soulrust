@@ -148,10 +148,17 @@ pub fn load_config(path: &Path) -> Config {
 }
 
 /// Writes atomically: serialize to `<path>.tmp`, then rename over the target.
+/// Before overwriting, the previous config is copied to `<path>.old` (best
+/// effort) so a bad write can be recovered, as Nicotine+ keeps a config backup.
 pub fn save_config(path: &Path, config: &Config) -> Result<(), String> {
     let yaml = serde_yaml::to_string(config).map_err(|e| e.to_string())?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    // Keep a backup of the existing config before replacing it.
+    if path.exists() {
+        let backup = path.with_extension("yaml.old");
+        let _ = std::fs::copy(path, backup);
     }
     let tmp = path.with_extension("yaml.tmp");
     std::fs::write(&tmp, yaml).map_err(|e| e.to_string())?;
@@ -271,6 +278,27 @@ mod tests {
 
         save_config(&path, &config).unwrap();
         assert_eq!(load_config(&path), config);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_keeps_an_old_backup_of_the_previous_config() {
+        let dir = temp_path("backup");
+        let path = dir.join("soulrust.yaml");
+        let old = path.with_extension("yaml.old");
+
+        let mut first = Config::default();
+        first.server.username = "first".into();
+        save_config(&path, &first).unwrap();
+        assert!(!old.exists(), "no backup is written on the first save");
+
+        let mut second = Config::default();
+        second.server.username = "second".into();
+        save_config(&path, &second).unwrap();
+
+        assert!(old.exists(), "the previous config is backed up to .old");
+        assert_eq!(load_config(&path), second, "the live config is the latest write");
+        assert_eq!(load_config(&old), first, "the .old backup holds the prior config");
         std::fs::remove_dir_all(&dir).ok();
     }
 

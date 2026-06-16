@@ -250,6 +250,30 @@ mod tests {
         assert_eq!(t.partial, vec!["ello"]);
     }
 
+    #[test]
+    fn sanitize_handles_edge_cases() {
+        // Empty / whitespace-only -> nothing in any bucket.
+        let empty = sanitize_search_term("   \t  ");
+        assert!(empty.included.is_empty() && empty.excluded.is_empty() && empty.partial.is_empty());
+
+        // A bare prefix with no word is dropped (no empty-string entries).
+        let bare = sanitize_search_term("- * foo");
+        assert_eq!(bare.included, vec!["foo"]);
+        assert!(bare.excluded.is_empty(), "bare '-' adds nothing");
+        assert!(bare.partial.is_empty(), "bare '*' adds nothing");
+        // '--foo' strips only the leading '-', leaving '-foo' as an excluded word.
+        assert_eq!(sanitize_search_term("--foo").excluded, vec!["-foo"]);
+
+        // Repeated whitespace collapses; case is normalized.
+        let spaced = sanitize_search_term("  AAA   -BBB  ");
+        assert_eq!(spaced.included, vec!["aaa"]);
+        assert_eq!(spaced.excluded, vec!["bbb"]);
+
+        // Only the leading char classifies: a '-' or '*' mid-word stays included.
+        let mid = sanitize_search_term("a-b c*d");
+        assert_eq!(mid.included, vec!["a-b", "c*d"]);
+    }
+
     fn index_with(paths: &[(&str, u64)]) -> ShareIndex {
         // Use the real indexer (add_virtual) rather than hand-rolling indexing,
         // so the test matches the index shape a real scan produces (same word
