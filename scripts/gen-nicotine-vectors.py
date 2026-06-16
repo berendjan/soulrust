@@ -31,6 +31,7 @@ sys.path.insert(0, NICOTINE_DIR)
 
 try:
     from pynicotine.slskmessages import (
+        ConnectToPeer,
         FileListMessage,
         FileSearch,
         FileSearchResponse,
@@ -124,6 +125,9 @@ VECTORS = [
          search_username="peer", token=0x2222,
          shares=[("Music\\hit.mp3", 4096, None, None)],
          freeulslots=True, ulspeed=5000, inqueue=0, private_shares=[]).make_network_message())),
+    ("CONNECT_TO_PEER_REQUEST_BODY",
+     'ConnectToPeer(token=0x01020304, user="alice", conn_type="P") — uncompressed body',
+     ConnectToPeer(token=0x01020304, user="alice", conn_type="P").make_network_message()),
 ]
 
 

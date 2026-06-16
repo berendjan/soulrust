@@ -8,14 +8,21 @@
 use std::net::Ipv4Addr;
 
 use crate::frame::frame_u32;
+use crate::peer::ConnectionType;
 use crate::wire::{put_string, put_u32, DecodeError, Reader};
 
 pub mod code {
     pub const LOGIN: u32 = 1;
     pub const SET_WAIT_PORT: u32 = 2;
     pub const GET_PEER_ADDRESS: u32 = 3;
+    pub const CONNECT_TO_PEER: u32 = 18;
     pub const FILE_SEARCH: u32 = 26;
+    pub const EXCLUDED_SEARCH_PHRASES: u32 = 160;
 }
+
+/// Cap on a server-supplied list length, so a forged count can't make us
+/// preallocate an arbitrary vector.
+const MAX_LIST_PREALLOC: usize = 4096;
 
 /// A message the client sends to the server.
 pub trait ServerRequest {
@@ -191,13 +198,82 @@ impl FileSearchBroadcast {
     }
 }
 
+/// Server code 18 — ConnectToPeer request: ask the server to relay an indirect
+/// connection request to `username` (used when we can't reach a peer directly).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectToPeerRequest {
+    pub token: u32,
+    pub username: String,
+    pub connection_type: ConnectionType,
+}
+
+impl ServerRequest for ConnectToPeerRequest {
+    const CODE: u32 = code::CONNECT_TO_PEER;
+
+    fn encode_body(&self, buf: &mut Vec<u8>) {
+        put_u32(buf, self.token);
+        put_string(buf, &self.username);
+        put_string(buf, self.connection_type.as_str());
+    }
+}
+
+/// Server code 18 — ConnectToPeer as received: another peer wants to connect to
+/// us and the server is relaying their request. We respond by connecting to
+/// `ip:port` and sending a PierceFirewall carrying `token`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectToPeer {
+    pub username: String,
+    pub connection_type: ConnectionType,
+    pub ip: Ipv4Addr,
+    pub port: u32,
+    pub token: u32,
+    pub privileged: bool,
+    pub obfuscation_type: u32,
+    pub obfuscated_port: u32,
+}
+
+impl ConnectToPeer {
+    pub fn decode(r: &mut Reader) -> Result<Self, DecodeError> {
+        Ok(ConnectToPeer {
+            username: r.string()?,
+            connection_type: ConnectionType::from_str(&r.string()?)?,
+            ip: r.ipv4()?,
+            port: r.u32()?,
+            token: r.u32()?,
+            privileged: r.bool()?,
+            obfuscation_type: r.u32()?,
+            obfuscated_port: r.u32()?,
+        })
+    }
+}
+
+/// Server code 160 — ExcludedSearchPhrases: phrases the server forbids in search
+/// results; we drop any shared file whose path contains one.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExcludedSearchPhrases {
+    pub phrases: Vec<String>,
+}
+
+impl ExcludedSearchPhrases {
+    pub fn decode(r: &mut Reader) -> Result<Self, DecodeError> {
+        let count = r.u32()? as usize;
+        let mut phrases = Vec::with_capacity(count.min(MAX_LIST_PREALLOC));
+        for _ in 0..count {
+            phrases.push(r.string()?);
+        }
+        Ok(ExcludedSearchPhrases { phrases })
+    }
+}
+
 /// A decoded server→client message. Unrecognized codes are surfaced rather
 /// than dropped so callers can log or count them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerMessage {
     Login(LoginResponse),
     GetPeerAddress(GetPeerAddressResponse),
+    ConnectToPeer(ConnectToPeer),
     FileSearch(FileSearchBroadcast),
+    ExcludedSearchPhrases(ExcludedSearchPhrases),
     Unknown { code: u32, body: Vec<u8> },
 }
 
@@ -212,7 +288,11 @@ impl ServerMessage {
             code::GET_PEER_ADDRESS => {
                 ServerMessage::GetPeerAddress(GetPeerAddressResponse::decode(&mut r)?)
             }
+            code::CONNECT_TO_PEER => ServerMessage::ConnectToPeer(ConnectToPeer::decode(&mut r)?),
             code::FILE_SEARCH => ServerMessage::FileSearch(FileSearchBroadcast::decode(&mut r)?),
+            code::EXCLUDED_SEARCH_PHRASES => {
+                ServerMessage::ExcludedSearchPhrases(ExcludedSearchPhrases::decode(&mut r)?)
+            }
             _ => {
                 let mut body = Vec::with_capacity(r.remaining());
                 while !r.is_empty() {
@@ -287,6 +367,67 @@ mod tests {
         let mut body = Vec::new();
         GetPeerAddressRequest { username: "user1".into() }.encode_body(&mut body);
         assert_eq!(body, b"\x05\x00\x00\x00user1");
+    }
+
+    #[test]
+    fn connect_to_peer_request_body_is_byte_exact() {
+        let mut body = Vec::new();
+        ConnectToPeerRequest {
+            token: 0x0102_0304,
+            username: "alice".into(),
+            connection_type: ConnectionType::Peer,
+        }
+        .encode_body(&mut body);
+
+        let mut expected = Vec::new();
+        put_u32(&mut expected, 0x0102_0304);
+        put_string(&mut expected, "alice");
+        put_string(&mut expected, "P");
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn connect_to_peer_response_decodes() {
+        let mut body = Vec::new();
+        put_u32(&mut body, code::CONNECT_TO_PEER);
+        put_string(&mut body, "bob");
+        put_string(&mut body, "F");
+        put_ipv4(&mut body, Ipv4Addr::new(1, 2, 3, 4));
+        put_u32(&mut body, 2234);
+        put_u32(&mut body, 99);
+        put_bool(&mut body, true);
+        put_u32(&mut body, 0);
+        put_u32(&mut body, 0);
+
+        assert_eq!(
+            ServerMessage::decode(&body).unwrap(),
+            ServerMessage::ConnectToPeer(ConnectToPeer {
+                username: "bob".into(),
+                connection_type: ConnectionType::File,
+                ip: Ipv4Addr::new(1, 2, 3, 4),
+                port: 2234,
+                token: 99,
+                privileged: true,
+                obfuscation_type: 0,
+                obfuscated_port: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn excluded_search_phrases_decodes() {
+        let mut body = Vec::new();
+        put_u32(&mut body, code::EXCLUDED_SEARCH_PHRASES);
+        put_u32(&mut body, 2);
+        put_string(&mut body, "linux distro");
+        put_string(&mut body, "netbsd");
+
+        assert_eq!(
+            ServerMessage::decode(&body).unwrap(),
+            ServerMessage::ExcludedSearchPhrases(ExcludedSearchPhrases {
+                phrases: vec!["linux distro".into(), "netbsd".into()],
+            })
+        );
     }
 
     #[test]

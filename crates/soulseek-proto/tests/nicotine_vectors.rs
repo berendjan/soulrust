@@ -12,7 +12,8 @@ use soulseek_proto::peer_message::{
     FolderContentsRequest, GetSharedFileList, PeerMessage, UserInfoResponse,
 };
 use soulseek_proto::server::{
-    FileSearchRequest, GetPeerAddressRequest, LoginRequest, ServerRequest, SetWaitPort,
+    ConnectToPeerRequest, FileSearchRequest, GetPeerAddressRequest, LoginRequest, ServerRequest,
+    SetWaitPort,
 };
 
 mod vectors {
@@ -123,6 +124,17 @@ fn user_info_response_body_matches_nicotine() {
     }
     .to_frame();
     assert_eq!(&frame[8..], vectors::USER_INFO_RESPONSE_BODY);
+}
+
+#[test]
+fn connect_to_peer_request_body_matches_nicotine() {
+    let frame = ConnectToPeerRequest {
+        token: 0x0102_0304,
+        username: "alice".into(),
+        connection_type: ConnectionType::Peer,
+    }
+    .to_frame();
+    assert_eq!(&frame[8..], vectors::CONNECT_TO_PEER_REQUEST_BODY);
 }
 
 #[test]

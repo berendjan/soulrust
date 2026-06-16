@@ -170,6 +170,30 @@ impl traits::core::Handle<NetRx> for Session {
                     );
                 }
             }
+            ServerMessage::ConnectToPeer(request) => {
+                // Stage 2c will hand this to the peer reactor (indirect connect
+                // + PierceFirewall); for now just surface it.
+                Self::emit(
+                    SessionEventKind::ProtocolNote {
+                        note: format!(
+                            "connect-to-peer request from {} ({})",
+                            request.username, request.connection_type
+                        ),
+                    },
+                    writer,
+                );
+            }
+            ServerMessage::ExcludedSearchPhrases(excluded) => {
+                Self::emit(
+                    SessionEventKind::ProtocolNote {
+                        note: format!(
+                            "server sent {} excluded search phrase(s)",
+                            excluded.phrases.len()
+                        ),
+                    },
+                    writer,
+                );
+            }
             ServerMessage::Unknown { code, body } => {
                 Self::emit(
                     SessionEventKind::ProtocolNote {
