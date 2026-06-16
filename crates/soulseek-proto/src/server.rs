@@ -481,6 +481,29 @@ mod tests {
     }
 
     #[test]
+    fn login_failure_empty_detail_decodes_as_some_empty_string() {
+        // Nicotine+'s Login.parse_network_message reads rejection_detail iff
+        // `has_remaining_content()` is true — i.e. it keys off whether any bytes
+        // remain, NOT off the string's content. A zero-length detail string
+        // (its 4-byte length prefix of 0 is still "remaining content") is read
+        // as "" rather than skipped, so it must decode to Some("") not None.
+        // This is the boundary between an absent field and a present-but-empty
+        // one; the existing failure test pins None (no bytes) and Some(non-empty).
+        let mut body = Vec::new();
+        put_u32(&mut body, code::LOGIN);
+        put_bool(&mut body, false);
+        put_string(&mut body, "INVALIDUSERNAME");
+        put_string(&mut body, ""); // zero-length detail: 4 bytes of length prefix
+        assert_eq!(
+            ServerMessage::decode(&body).unwrap(),
+            ServerMessage::Login(LoginResponse::Failure {
+                reason: "INVALIDUSERNAME".into(),
+                detail: Some(String::new()),
+            })
+        );
+    }
+
+    #[test]
     fn get_peer_address_response_round_trips_through_frame() {
         let mut body = Vec::new();
         put_u32(&mut body, code::GET_PEER_ADDRESS);
@@ -586,6 +609,23 @@ mod tests {
         assert_eq!(
             ServerMessage::decode(&body).unwrap(),
             ServerMessage::Unknown { code: 9999, body: vec![1, 2, 3] }
+        );
+    }
+
+    #[test]
+    fn unknown_code_with_empty_body_is_preserved() {
+        // A server message with a code we don't implement but no payload (the
+        // cursor sits exactly at the end after reading the code) must surface as
+        // Unknown with an empty body — the `while !r.is_empty()` collector simply
+        // gathers nothing. Nicotine+ likewise treats an unrecognized code as a
+        // pass-through rather than an error; the zero-length boundary must not be
+        // mistaken for a truncation (UnexpectedEof). The existing unknown-code
+        // test pins a non-empty body; this pins the empty boundary.
+        let mut body = Vec::new();
+        put_u32(&mut body, 12345);
+        assert_eq!(
+            ServerMessage::decode(&body).unwrap(),
+            ServerMessage::Unknown { code: 12345, body: Vec::new() }
         );
     }
 

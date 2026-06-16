@@ -165,7 +165,11 @@ fn read_directories(r: &mut Reader) -> Result<Vec<SharedDirectory>, DecodeError>
     let count = r.u32()? as usize;
     let mut dirs = Vec::with_capacity(count.min(MAX_PREALLOC));
     for _ in 0..count {
-        let path = r.string()?;
+        // Nicotine+ normalizes the separator when decoding every directory path
+        // (`_parse_result_list`: `self.unpack_string().replace("/", "\\")`,
+        // slskmessages.py:3371), so the backslash form is canonical for any
+        // follow-up request (e.g. FolderContentsRequest) that must path-match.
+        let path = r.string()?.replace('/', "\\");
         let files = read_file_list(r)?;
         dirs.push(SharedDirectory { path, files });
     }
@@ -569,6 +573,86 @@ mod tests {
         assert_eq!(resp.private_directories[0].path, "Buddies Only");
         assert_eq!(resp.private_directories[0].files[0].name, "secret.mp3");
         assert_eq!(resp.private_directories[0].files[0].size, 4096);
+    }
+
+    #[test]
+    fn directory_paths_normalize_forward_slashes_to_backslashes() {
+        // Nicotine+'s `SharedFileListResponse._parse_result_list`
+        // (slskmessages.py:3371) decodes every directory path as
+        // `self.unpack_string().replace("/", "\\")`. A peer that sends a
+        // forward-slash path must therefore decode to the canonical backslash
+        // form so a later FolderContentsRequest path-matches. The `unknown`=0
+        // field follows the public section, but no private section is sent.
+        let mut raw = Vec::new();
+        put_u32(&mut raw, 1);
+        put_string(&mut raw, "Music/Album/Live"); // forward slashes on the wire
+        put_u32(&mut raw, 0); // no files
+        put_u32(&mut raw, 0); // unknown field
+
+        let frame = frame_u32(code::SHARED_FILE_LIST, &zlib_compress(&raw));
+        let (payload, _) = split_frame(&frame).unwrap().unwrap();
+        let PeerMessage::SharedFileList(resp) = PeerMessage::decode(payload).unwrap() else {
+            panic!("expected a shared file list");
+        };
+        assert_eq!(resp.directories[0].path, "Music\\Album\\Live");
+    }
+
+    #[test]
+    fn obsolete_extension_field_is_consumed_not_misaligned() {
+        // Nicotine+ reads the per-file extension as `ext_len = unpack_uint32()`
+        // then `self._offset += ext_len` (slskmessages.py:3380-3381) — the field
+        // is obsolete but its bytes must be consumed exactly, or every following
+        // field misaligns. We read it as a length-prefixed string, which spans
+        // the identical bytes. Pin that a NON-empty extension still leaves the
+        // trailing attribute list correctly aligned.
+        let mut raw = Vec::new();
+        put_u32(&mut raw, 1);
+        put_string(&mut raw, "Music");
+        put_u32(&mut raw, 1); // one file
+        put_u8(&mut raw, 1);
+        put_string(&mut raw, "track.mp3");
+        put_u64(&mut raw, 4096);
+        put_string(&mut raw, "mp3"); // non-empty obsolete ext (len 3)
+        put_u32(&mut raw, 2); // two attributes follow
+        put_u32(&mut raw, 0); // bitrate
+        put_u32(&mut raw, 320);
+        put_u32(&mut raw, 1); // length
+        put_u32(&mut raw, 184);
+        put_u32(&mut raw, 0); // unknown field
+
+        let frame = frame_u32(code::SHARED_FILE_LIST, &zlib_compress(&raw));
+        let (payload, _) = split_frame(&frame).unwrap().unwrap();
+        let PeerMessage::SharedFileList(resp) = PeerMessage::decode(payload).unwrap() else {
+            panic!("expected a shared file list");
+        };
+        let file = &resp.directories[0].files[0];
+        assert_eq!(file.name, "track.mp3");
+        assert_eq!(file.size, 4096);
+        assert_eq!(file.extension, "mp3");
+        assert_eq!(file.attributes, vec![(0, 320), (1, 184)]);
+    }
+
+    #[test]
+    fn trailing_private_section_present_but_empty_decodes_cleanly() {
+        // Nicotine+ reads the private list whenever any bytes remain after the
+        // `unknown` field (`if self.has_remaining_content(): self.privatelist =
+        // self._parse_result_list()`, slskmessages.py:3402-3403). A private
+        // section that is present but carries a folder count of 0 must decode to
+        // an empty list, not an error.
+        let mut raw = Vec::new();
+        put_u32(&mut raw, 1);
+        put_string(&mut raw, "Public");
+        put_u32(&mut raw, 0); // no files
+        put_u32(&mut raw, 0); // unknown field
+        put_u32(&mut raw, 0); // private section present, but zero folders
+
+        let frame = frame_u32(code::SHARED_FILE_LIST, &zlib_compress(&raw));
+        let (payload, _) = split_frame(&frame).unwrap().unwrap();
+        let PeerMessage::SharedFileList(resp) = PeerMessage::decode(payload).unwrap() else {
+            panic!("expected a shared file list");
+        };
+        assert_eq!(resp.directories.len(), 1);
+        assert!(resp.private_directories.is_empty());
     }
 
     #[test]
