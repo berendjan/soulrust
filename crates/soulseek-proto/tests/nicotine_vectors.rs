@@ -139,6 +139,29 @@ fn user_info_response_body_matches_nicotine() {
 }
 
 #[test]
+fn user_info_response_with_picture_matches_nicotine() {
+    // The pic-present path: our encoder must match Nicotine+'s has_pic=True body
+    // (bool true, then the length-prefixed picture bytes), and our decoder must
+    // read the picture back — neither direction is covered by the pic=None case.
+    let response = UserInfoResponse {
+        description: "soulrust user".into(),
+        picture: Some(b"PNG!".to_vec()),
+        total_uploads: 42,
+        queue_size: 3,
+        slots_available: true,
+        upload_allowed: 1,
+    };
+    let frame = response.to_frame();
+    assert_eq!(&frame[8..], vectors::USER_INFO_RESPONSE_WITH_PIC_BODY);
+
+    let PeerMessage::UserInfoResponse(decoded) = PeerMessage::decode(&frame[4..]).unwrap() else {
+        panic!("expected a user info response");
+    };
+    assert_eq!(decoded, response);
+    assert_eq!(decoded.picture.as_deref(), Some(b"PNG!".as_slice()));
+}
+
+#[test]
 fn connect_to_peer_request_body_matches_nicotine() {
     let frame = ConnectToPeerRequest {
         token: 0x0102_0304,
@@ -173,6 +196,27 @@ fn our_decoder_accepts_nicotines_file_search_response() {
     assert_eq!(resp.files[0].name, "Music\\hit.mp3");
     assert_eq!(resp.files[0].size, 4096);
     assert!(resp.private_files.is_empty());
+}
+
+#[test]
+fn our_decoder_accepts_nicotines_file_search_response_with_private_results() {
+    // Nicotine+'s real compressed FileSearchResponse carrying BOTH a public and a
+    // privately-shared file. Decoding it exercises the trailing private-results
+    // branch (the unknown=0 field, then the private file list) — the same class
+    // of conditional tail that once dropped private shares in SharedFileList.
+    let (payload, rest) = split_frame(vectors::FILE_SEARCH_RESPONSE_PRIVATE_FRAME).unwrap().unwrap();
+    assert!(rest.is_empty());
+
+    let PeerMessage::FileSearchResponse(resp) = PeerMessage::decode(payload).unwrap() else {
+        panic!("expected a file search response");
+    };
+    assert_eq!(resp.username, "peer");
+    assert_eq!(resp.token, 0x2222);
+    assert_eq!(resp.files.len(), 1);
+    assert_eq!(resp.files[0].name, "Music\\hit.mp3");
+    assert_eq!(resp.private_files.len(), 1, "private results must be decoded");
+    assert_eq!(resp.private_files[0].name, "Buddies\\secret.flac");
+    assert_eq!(resp.private_files[0].size, 999);
 }
 
 #[test]

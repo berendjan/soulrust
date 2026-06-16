@@ -20,7 +20,7 @@ use crate::messages::{
     BrowseAccepted, BrowseFailed, BrowseUser, DownloadFailed, HandlerId, IncomingSearch, NetConn,
     NetConnEvent, NetRx, NetTx, PeerBrowseConnect, PeerDistribConnect, PeerDownloadConnect,
     PeerPierce, PeerUploadConnect, ResolveUploadPeer, SessionEvent, SessionEventKind,
-    StartDownload, StartSearch, StartSearchResult, StartedSearch,
+    SetExcludedPhrases, StartDownload, StartSearch, StartSearchResult, StartedSearch,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,6 +336,10 @@ impl traits::core::Handle<NetRx> for Session {
                     },
                     writer,
                 );
+                // Hand the phrases to peer_net so it suppresses matching files in
+                // the responses it serves (the matcher is already there; without
+                // this it ran against an empty list and never filtered).
+                Self::send(&SetExcludedPhrases { phrases: excluded.phrases }, writer);
             }
             ServerMessage::Unknown { code, body } => {
                 Self::emit(
@@ -548,6 +552,10 @@ mod tests {
             self.decode(MessageId::IncomingSearch, IncomingSearch::deserialize_from)
         }
 
+        fn excluded_phrases(&self) -> Vec<SetExcludedPhrases> {
+            self.decode(MessageId::SetExcludedPhrases, SetExcludedPhrases::deserialize_from)
+        }
+
         fn pierces(&self) -> Vec<PeerPierce> {
             self.decode(MessageId::PeerPierce, PeerPierce::deserialize_from)
         }
@@ -727,6 +735,31 @@ mod tests {
             .events()
             .iter()
             .any(|e| matches!(e, SessionEventKind::SearchStarted { token: 1, query } if query == "A One")));
+    }
+
+    #[test]
+    fn excluded_search_phrases_are_forwarded_to_peer_net() {
+        // The server's ExcludedSearchPhrases (code 160) must reach peer_net so it
+        // can drop matching files from responses; previously it only produced a
+        // log note and the phrases were lost, so the filter never ran.
+        use soulseek_proto::wire::{put_string, put_u32};
+        let writer = CapturingWriter::default();
+        let mut session = test_session();
+
+        let mut body = Vec::new();
+        put_u32(&mut body, 160); // ExcludedSearchPhrases code
+        put_u32(&mut body, 2); // phrase count
+        put_string(&mut body, "forbidden");
+        put_string(&mut body, "blocked phrase");
+        session.handle(&NetRx { payload: body }, &writer);
+
+        let forwarded = writer.excluded_phrases();
+        assert_eq!(forwarded.len(), 1, "exactly one SetExcludedPhrases is emitted");
+        assert_eq!(forwarded[0].phrases, vec!["forbidden", "blocked phrase"]);
+        // Still surfaced to the UI as a protocol note.
+        assert!(writer.events().iter().any(
+            |e| matches!(e, SessionEventKind::ProtocolNote { note } if note.contains("2 excluded"))
+        ));
     }
 
     #[test]

@@ -22,7 +22,7 @@ use crate::messages::{
     ExtractRequest, ExtractResult, GetConfigReq, HttpHtml, HttpRender, IncomingSearch, NetConn,
     NetRx, NetTx, PeerActivity, PeerBrowseConnect, PeerDownloadConnect, PeerPierce,
     PeerDistribConnect, PeerUploadConnect, ResolveUploadPeer, SetConfigReq, SetConfigResult,
-    SessionEvent, StartDownload, StartSearch, StartSearchResult, UpdateDownloaded,
+    SetExcludedPhrases, SessionEvent, StartDownload, StartSearch, StartSearchResult, UpdateDownloaded,
     UpdaterStatusChanged, UploadComplete, UploadFailed,
 };
 
@@ -70,6 +70,7 @@ rust_messenger::Messenger! {
             Browse, BrowseHtml: [ web_bridge ],
             // serving: incoming searches matched + delivered; firewall pierces
             Session, IncomingSearch: [ peer_net ],
+            Session, SetExcludedPhrases: [ peer_net ],
             Session, PeerPierce: [ peer_net ],
             // downloads: bridge -> session resolves address -> peer_net -> ui log
             WebBridge, StartDownload: [ session ],

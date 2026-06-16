@@ -326,6 +326,12 @@ VECTORS = [
      "slotsavail=True, uploadallowed=1) — uncompressed body",
      UserInfoResponse(descr="soulrust user", pic=None, totalupl=42, queuesize=3,
                       slotsavail=True, uploadallowed=1).make_network_message()),
+    ("USER_INFO_RESPONSE_WITH_PIC_BODY",
+     'UserInfoResponse(descr="soulrust user", pic=b"PNG!", totalupl=42, queuesize=3, '
+     "slotsavail=True, uploadallowed=1) — has_pic=True branch: bool then the "
+     "length-prefixed picture bytes",
+     UserInfoResponse(descr="soulrust user", pic=b"PNG!", totalupl=42, queuesize=3,
+                      slotsavail=True, uploadallowed=1).make_network_message()),
     ("FOLDER_CONTENTS_REQUEST_BODY",
      'FolderContentsRequest(directory="Music\\\\Album", token=1234) — uncompressed body',
      FolderContentsRequest(directory="Music\\Album", token=1234).make_network_message()),
@@ -342,6 +348,15 @@ VECTORS = [
          search_username="peer", token=0x2222,
          shares=[("Music\\hit.mp3", 4096, None, None)],
          freeulslots=True, ulspeed=5000, inqueue=0, private_shares=[]).make_network_message())),
+    ("FILE_SEARCH_RESPONSE_PRIVATE_FRAME",
+     "FileSearchResponse (peer code 9), full compressed frame; one public file AND "
+     "one privately-shared file — exercises the trailing private-results branch "
+     "(the unknown=0 field, then the private file list)",
+     frame_u32(9, FileSearchResponse(
+         search_username="peer", token=0x2222,
+         shares=[("Music\\hit.mp3", 4096, None, None)],
+         freeulslots=True, ulspeed=5000, inqueue=0,
+         private_shares=[("Buddies\\secret.flac", 999, None, None)]).make_network_message())),
     ("CONNECT_TO_PEER_REQUEST_BODY",
      'ConnectToPeer(token=0x01020304, user="alice", conn_type="P") — uncompressed body',
      ConnectToPeer(token=0x01020304, user="alice", conn_type="P").make_network_message()),

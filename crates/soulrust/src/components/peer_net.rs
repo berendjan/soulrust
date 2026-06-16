@@ -42,8 +42,8 @@ use crate::config::AppContext;
 use crate::messages::{
     BrowseDir, BrowseFailed, BrowseFile, BrowseListing, DownloadComplete, DownloadFailed,
     HandlerId, IncomingSearch, NetTx, PeerActivity, PeerBrowseConnect, PeerDistribConnect,
-    PeerDownloadConnect, PeerPierce, PeerUploadConnect, ResolveUploadPeer, UploadComplete,
-    UploadFailed,
+    PeerDownloadConnect, PeerPierce, PeerUploadConnect, ResolveUploadPeer, SetExcludedPhrases,
+    UploadComplete, UploadFailed,
 };
 use crate::search_response;
 use crate::shares::ShareIndex;
@@ -124,6 +124,8 @@ enum PeerCommand {
     UploadConnect { username: String, ip: String, port: u16 },
     /// Adopt a distributed parent: open a `D` connection and relay its searches.
     DistribConnect { username: String, ip: String, port: u16 },
+    /// Replace the server-supplied excluded-phrase list used to filter responses.
+    SetExcludedPhrases { phrases: Vec<String> },
 }
 
 /// Downloads in flight, shared across connections (the negotiation and the file
@@ -176,9 +178,14 @@ struct ConnCtx {
     cmd_tx: UnboundedSender<PeerCommand>,
     /// Monotonic source of transfer tokens for uploads we initiate.
     next_token: AtomicU32,
+    /// Server-supplied phrases that must not appear in any file we return for a
+    /// search. Updated when the server sends ExcludedSearchPhrases; read on every
+    /// search response.
+    excluded_phrases: Mutex<Vec<String>>,
 }
 
 /// What a finished connection produced, for the accept loop to report on the bus.
+#[derive(Debug)]
 enum ConnOutcome {
     /// Served requests / negotiated only — nothing to report.
     Done,
@@ -284,6 +291,14 @@ impl traits::core::Handle<IncomingSearch> for PeerNet {
     }
 }
 
+impl traits::core::Handle<SetExcludedPhrases> for PeerNet {
+    fn handle<W: traits::core::Writer>(&mut self, message: &SetExcludedPhrases, _writer: &W) {
+        let _ = self
+            .cmd_tx
+            .send(PeerCommand::SetExcludedPhrases { phrases: message.phrases.clone() });
+    }
+}
+
 impl traits::core::Handle<PeerDownloadConnect> for PeerNet {
     fn handle<W: traits::core::Writer>(&mut self, message: &PeerDownloadConnect, _writer: &W) {
         let _ = self.cmd_tx.send(PeerCommand::Download {
@@ -352,6 +367,7 @@ fn run_reactor<W: traits::core::Writer>(
             incomplete_dir: config.incomplete_dir,
             cmd_tx,
             next_token: AtomicU32::new(1),
+            excluded_phrases: Mutex::new(Vec::new()),
         });
 
         let listener = match TcpListener::bind(("0.0.0.0", port)).await {
@@ -496,12 +512,21 @@ async fn command_loop<W: traits::core::Writer>(
                 let writer = writer.clone();
                 let our_username = ctx.our_username.clone();
                 let max = max_results;
+                // Snapshot the server's excluded phrases so the matcher drops any
+                // file the server told us to suppress (search_response::respond
+                // filters on this list).
+                let excluded = ctx.excluded_phrases.lock().unwrap().clone();
+                // Advertise our real upload queue depth / slot availability rather
+                // than a hardcoded "always free", so requesters' speed/queue
+                // filters see honest values.
+                let (free_slots, in_queue) =
+                    slot_advertisement(ctx.uploads.lock().unwrap().by_token.len());
                 // Matching is CPU-bound (word-index intersection); run it off the
                 // single reactor thread so a burst of network searches can't
                 // head-of-line-block accept / serve / connect dispatch.
                 tokio::spawn(async move {
                     let files = tokio::task::spawn_blocking(move || {
-                        search_response::respond(&query, max, &[], &shares)
+                        search_response::respond(&query, max, &excluded, &shares)
                     })
                     .await
                     .unwrap_or_default();
@@ -512,9 +537,11 @@ async fn command_loop<W: traits::core::Writer>(
                         username: our_username,
                         token,
                         files,
-                        free_slots: true,
+                        free_slots,
+                        // We do not yet measure upload throughput; advertise 0
+                        // until a real speed sampler exists.
                         upload_speed: 0,
-                        in_queue: 0,
+                        in_queue,
                         private_files: Vec::new(),
                     };
                     // Queue under the relay token, then ask the server to relay a
@@ -529,8 +556,20 @@ async fn command_loop<W: traits::core::Writer>(
                     PeerNet::send(&NetTx { frame: request.to_frame() }, &writer);
                 });
             }
+            PeerCommand::SetExcludedPhrases { phrases } => {
+                *ctx.excluded_phrases.lock().unwrap() = phrases;
+            }
         }
     }
+}
+
+/// Honest `(free_slots, in_queue)` for a search response, derived from the
+/// uploads we are currently tracking (offered + approved). We have no separate
+/// slot manager yet, so this is a conservative floor — but far better than the
+/// old hardcoded "always free, zero queue", which made other clients' queue
+/// filters treat us as an always-available peer.
+fn slot_advertisement(pending_uploads: usize) -> (bool, u32) {
+    (pending_uploads == 0, pending_uploads as u32)
 }
 
 async fn connect(ip: &str, port: u16) -> std::io::Result<tokio::net::TcpStream> {
@@ -976,6 +1015,49 @@ where
                     let _ = ctx.cmd_tx.send(PeerCommand::StartUpload { username: peer.clone() });
                 }
             }
+            PeerMessage::UploadDenied(denied) => {
+                // We are the downloader: a peer we queued a file from refuses it.
+                // A reason of "Queued" means remotely queued, not a rejection —
+                // keep waiting for the eventual TransferRequest. (Soulseek.NET
+                // trims a trailing '.' and compares case-insensitively; we match
+                // that so a "Queued." reply isn't mistaken for a hard reject.)
+                // Any other reason is terminal: fail fast instead of hanging.
+                if denied.reason.trim_end_matches('.').eq_ignore_ascii_case("queued") {
+                    on_activity(format!("{peer} queued {} remotely", denied.file));
+                } else if ctx
+                    .downloads
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .remove(&(peer.clone(), denied.file.clone()))
+                    .is_some()
+                {
+                    on_activity(format!("{peer} denied {}: {}", denied.file, denied.reason));
+                    return Ok(ConnOutcome::DownloadFailed {
+                        username: peer,
+                        filename: denied.file,
+                        reason: denied.reason,
+                    });
+                }
+            }
+            PeerMessage::UploadFailed(failed) => {
+                // The uploader reports the transfer of a file we queued failed.
+                let was_ours = ctx
+                    .downloads
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .remove(&(peer.clone(), failed.file.clone()))
+                    .is_some();
+                if was_ours {
+                    on_activity(format!("{peer} reported upload of {} failed", failed.file));
+                    return Ok(ConnOutcome::DownloadFailed {
+                        username: peer,
+                        filename: failed.file,
+                        reason: "upload failed".into(),
+                    });
+                }
+            }
             _ => {} // not-yet-handled messages
         }
     }
@@ -1243,6 +1325,7 @@ mod tests {
             incomplete_dir: std::env::temp_dir(),
             cmd_tx,
             next_token: AtomicU32::new(1),
+            excluded_phrases: Mutex::new(Vec::new()),
         })
     }
 
@@ -1455,6 +1538,7 @@ mod tests {
                 incomplete_dir: dir.clone(),
                 cmd_tx,
                 next_token: AtomicU32::new(1),
+                excluded_phrases: Mutex::new(Vec::new()),
             });
             ctx.downloads.lock().unwrap().by_token.insert(
                 42,
@@ -1584,6 +1668,7 @@ mod tests {
                 incomplete_dir: dir.clone(),
                 cmd_tx,
                 next_token: AtomicU32::new(1),
+                excluded_phrases: Mutex::new(Vec::new()),
             });
             ctx.downloads.lock().unwrap().by_token.insert(
                 42,
@@ -1648,6 +1733,101 @@ mod tests {
     }
 
     #[test]
+    fn upload_denied_fails_the_queued_download() {
+        // We queued a download; the uploader refuses with a hard reason. We must
+        // fail fast (emit DownloadFailed) and clear the pending entry instead of
+        // hanging forever waiting for a TransferRequest that never comes.
+        runtime().block_on(async {
+            use soulseek_proto::transfer::UploadDenied;
+            let (mut client, server) = tokio::io::duplex(64 * 1024);
+            let ctx = test_ctx();
+            ctx.downloads.lock().unwrap().pending.insert(("bob".into(), "f.mp3".into()), 5);
+            let ctx_serve = ctx.clone();
+            let serve = tokio::spawn(async move {
+                serve_connection(server, &ctx_serve, Some("bob".into()), |_| {}).await
+            });
+            client
+                .write_all(
+                    &UploadDenied { file: "f.mp3".into(), reason: "File not shared".into() }
+                        .to_frame(),
+                )
+                .await
+                .unwrap();
+            drop(client);
+            let outcome = serve.await.unwrap().unwrap();
+            let ConnOutcome::DownloadFailed { username, filename, reason } = outcome else {
+                panic!("expected DownloadFailed, got {outcome:?}");
+            };
+            assert_eq!((username.as_str(), filename.as_str()), ("bob", "f.mp3"));
+            assert_eq!(reason, "File not shared");
+            assert!(ctx.downloads.lock().unwrap().pending.is_empty(), "pending entry cleared");
+        });
+    }
+
+    #[test]
+    fn upload_denied_queued_reason_keeps_waiting() {
+        // A reason of "Queued" (optionally with a trailing '.') means remotely
+        // queued, not a rejection: the download stays pending for the eventual
+        // TransferRequest rather than being failed.
+        runtime().block_on(async {
+            use soulseek_proto::transfer::UploadDenied;
+            let (mut client, server) = tokio::io::duplex(64 * 1024);
+            let ctx = test_ctx();
+            ctx.downloads.lock().unwrap().pending.insert(("bob".into(), "f.mp3".into()), 5);
+            let ctx_serve = ctx.clone();
+            let serve = tokio::spawn(async move {
+                serve_connection(server, &ctx_serve, Some("bob".into()), |_| {}).await
+            });
+            client
+                .write_all(&UploadDenied { file: "f.mp3".into(), reason: "Queued.".into() }.to_frame())
+                .await
+                .unwrap();
+            drop(client);
+            let outcome = serve.await.unwrap().unwrap();
+            assert!(matches!(outcome, ConnOutcome::Done), "queued is not a failure");
+            assert!(
+                ctx.downloads
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .contains_key(&("bob".to_string(), "f.mp3".to_string())),
+                "download stays pending while remotely queued"
+            );
+        });
+    }
+
+    #[test]
+    fn upload_failed_fails_the_queued_download() {
+        // The uploader reports a file we queued failed mid-transfer: surface it.
+        runtime().block_on(async {
+            use soulseek_proto::transfer::UploadFailed;
+            let (mut client, server) = tokio::io::duplex(64 * 1024);
+            let ctx = test_ctx();
+            ctx.downloads.lock().unwrap().pending.insert(("bob".into(), "f.mp3".into()), 5);
+            let ctx_serve = ctx.clone();
+            let serve = tokio::spawn(async move {
+                serve_connection(server, &ctx_serve, Some("bob".into()), |_| {}).await
+            });
+            client.write_all(&UploadFailed { file: "f.mp3".into() }.to_frame()).await.unwrap();
+            drop(client);
+            let outcome = serve.await.unwrap().unwrap();
+            let ConnOutcome::DownloadFailed { filename, .. } = outcome else {
+                panic!("expected DownloadFailed, got {outcome:?}");
+            };
+            assert_eq!(filename, "f.mp3");
+            assert!(ctx.downloads.lock().unwrap().pending.is_empty());
+        });
+    }
+
+    #[test]
+    fn slot_advertisement_reflects_pending_uploads() {
+        // No pending uploads -> a free slot and empty queue; with work queued we
+        // report it instead of the old hardcoded "always free, zero queue".
+        assert_eq!(slot_advertisement(0), (true, 0));
+        assert_eq!(slot_advertisement(3), (false, 3));
+    }
+
+    #[test]
     fn serve_distrib_responds_to_a_distributed_search() {
         // A DistribSearch on a D connection is fed into the responder path via a
         // PeerCommand::IncomingSearch (same as a server search).
@@ -1665,6 +1845,7 @@ mod tests {
                 incomplete_dir: std::env::temp_dir(),
                 cmd_tx,
                 next_token: AtomicU32::new(1),
+                excluded_phrases: Mutex::new(Vec::new()),
             });
             let serve = tokio::spawn(async move {
                 serve_distrib(&mut server, &ctx, "parent", &mut |_| {}).await
@@ -1709,6 +1890,7 @@ mod tests {
                 incomplete_dir: std::env::temp_dir(),
                 cmd_tx,
                 next_token: AtomicU32::new(1),
+                excluded_phrases: Mutex::new(Vec::new()),
             });
             ctx.uploads.lock().unwrap().by_token.insert(
                 5,

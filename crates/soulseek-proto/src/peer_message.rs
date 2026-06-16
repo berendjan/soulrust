@@ -967,4 +967,46 @@ mod tests {
             Err(DecodeError::InvalidValue(msg)) if msg.contains("inflates past")
         ));
     }
+
+    #[test]
+    fn shared_file_list_decodes_soulseek_net_style_trailing_locked_count() {
+        // We (and Nicotine+) omit the locked-directory section when empty, ending
+        // the body after the unknown=0 field. Soulseek.NET instead ALWAYS writes
+        // the locked-directory count (0) after it. Both interoperate only if we
+        // decode the always-present form, so pin that here.
+        let mut raw = Vec::new();
+        put_u32(&mut raw, 1); // 1 public directory
+        put_string(&mut raw, "Music\\A");
+        put_u32(&mut raw, 0); // 0 files in it
+        put_u32(&mut raw, 0); // unknown = 0
+        put_u32(&mut raw, 0); // locked-directory count = 0 (Soulseek.NET always sends this)
+
+        let decoded = SharedFileListResponse::decode_inflated(&raw).unwrap();
+        assert_eq!(decoded.directories.len(), 1);
+        assert_eq!(decoded.directories[0].path, "Music\\A");
+        assert!(decoded.private_directories.is_empty(), "trailing 0 locked count -> no locked dirs");
+    }
+
+    #[test]
+    fn file_search_response_decodes_soulseek_net_style_trailing_locked_count() {
+        // Same divergence on the search path: Soulseek.NET always appends the
+        // locked-file count (0); we must decode it without choking.
+        let mut raw = Vec::new();
+        put_string(&mut raw, "alice"); // username
+        put_u32(&mut raw, 7); // token
+        put_u32(&mut raw, 0); // 0 files
+        put_bool(&mut raw, true); // free_slots
+        put_u32(&mut raw, 100); // upload_speed
+        put_u32(&mut raw, 0); // in_queue
+        put_u32(&mut raw, 0); // unknown = 0
+        put_u32(&mut raw, 0); // locked-file count = 0 (Soulseek.NET always sends this)
+
+        let decoded = FileSearchResponse::decode_inflated(&raw).unwrap();
+        assert_eq!(decoded.username, "alice");
+        assert_eq!(decoded.token, 7);
+        assert!(decoded.files.is_empty());
+        assert!(decoded.free_slots);
+        assert_eq!(decoded.upload_speed, 100);
+        assert!(decoded.private_files.is_empty(), "trailing 0 locked count -> no locked files");
+    }
 }

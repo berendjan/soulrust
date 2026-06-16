@@ -68,6 +68,7 @@ rust_messenger::messenger_id_enum!(
         UploadComplete = 36,
         UploadFailed = 37,
         PeerDistribConnect = 38,
+        SetExcludedPhrases = 39,
     }
 );
 
@@ -351,6 +352,15 @@ pub struct IncomingSearch {
     pub query: String,
 }
 
+/// session → peer_net: the server's list of phrases that must not appear in any
+/// file we return for a search (ExcludedSearchPhrasesNotification, code 160).
+/// peer_net stores the latest list and drops matching files from every
+/// FileSearchResponse it builds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetExcludedPhrases {
+    pub phrases: Vec<String>,
+}
+
 /// session → peer_net: a server ConnectToPeer — a (likely firewalled) peer
 /// wants to reach us. We connect to `ip:port` and send PierceFirewall(token).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -521,6 +531,7 @@ impl_bus_message!(
     UploadComplete => MessageId::UploadComplete,
     UploadFailed => MessageId::UploadFailed,
     PeerDistribConnect => MessageId::PeerDistribConnect,
+    SetExcludedPhrases => MessageId::SetExcludedPhrases,
 );
 
 #[cfg(test)]
