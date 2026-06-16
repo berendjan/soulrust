@@ -20,9 +20,10 @@ use crate::messages::{
     ApplyUpdateReq, ApplyUpdateResult, BrowseAccepted, BrowseFailed, BrowseHtml, BrowseListing,
     BrowseRenderReq, BrowseUser, ConfigChanged, ConfigSnapshot, DownloadComplete, DownloadFailed,
     ExtractRequest, ExtractResult, GetConfigReq, HttpHtml, HttpRender, IncomingSearch, NetConn,
-    NetRx, NetTx, PeerActivity, PeerBrowseConnect, PeerDownloadConnect, PeerPierce, SetConfigReq,
-    SetConfigResult, SessionEvent, StartDownload, StartSearch, StartSearchResult, UpdateDownloaded,
-    UpdaterStatusChanged,
+    NetRx, NetTx, PeerActivity, PeerBrowseConnect, PeerDownloadConnect, PeerPierce,
+    PeerUploadConnect, ResolveUploadPeer, SetConfigReq, SetConfigResult, SessionEvent,
+    StartDownload, StartSearch, StartSearchResult, UpdateDownloaded, UpdaterStatusChanged,
+    UploadComplete, UploadFailed,
 };
 
 rust_messenger::Messenger! {
@@ -76,6 +77,12 @@ rust_messenger::Messenger! {
             Session, DownloadFailed: [ ui ],
             PeerNet, DownloadComplete: [ ui ],
             PeerNet, DownloadFailed: [ ui ],
+            // uploads: peer_net asks session to resolve the downloader's address,
+            // then opens the file connection and streams.
+            PeerNet, ResolveUploadPeer: [ session ],
+            Session, PeerUploadConnect: [ peer_net ],
+            PeerNet, UploadComplete: [ ui ],
+            PeerNet, UploadFailed: [ ui ],
             // peer network edge: serving activity -> ui log
             PeerNet, PeerActivity: [ ui ],
             // broadcasts

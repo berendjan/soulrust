@@ -12,6 +12,7 @@ use crate::config::AppContext;
 use crate::messages::{
     ConfigChanged, DownloadComplete, DownloadFailed, HandlerId, HttpHtml, HttpRender, Page,
     PeerActivity, SessionEvent, SessionEventKind, UpdaterStatus, UpdaterStatusChanged,
+    UploadComplete, UploadFailed,
 };
 
 const MAX_LOG_LINES: usize = 100;
@@ -266,6 +267,18 @@ impl traits::core::Handle<DownloadComplete> for Ui {
 impl traits::core::Handle<DownloadFailed> for Ui {
     fn handle<W: traits::core::Writer>(&mut self, message: &DownloadFailed, _writer: &W) {
         self.log(format!("download of {} from {} failed: {}", message.filename, message.username, message.reason));
+    }
+}
+
+impl traits::core::Handle<UploadComplete> for Ui {
+    fn handle<W: traits::core::Writer>(&mut self, message: &UploadComplete, _writer: &W) {
+        self.log(format!("uploaded {} to {}", message.filename, message.username));
+    }
+}
+
+impl traits::core::Handle<UploadFailed> for Ui {
+    fn handle<W: traits::core::Writer>(&mut self, message: &UploadFailed, _writer: &W) {
+        self.log(format!("upload of {} to {} failed: {}", message.filename, message.username, message.reason));
     }
 }
 

@@ -16,8 +16,9 @@ use soulseek_proto::server::{
 use crate::config::AppContext;
 use crate::messages::{
     BrowseAccepted, BrowseFailed, BrowseUser, DownloadFailed, HandlerId, IncomingSearch, NetConn,
-    NetConnEvent, NetRx, NetTx, PeerBrowseConnect, PeerDownloadConnect, PeerPierce, SessionEvent,
-    SessionEventKind, StartDownload, StartSearch, StartSearchResult, StartedSearch,
+    NetConnEvent, NetRx, NetTx, PeerBrowseConnect, PeerDownloadConnect, PeerPierce,
+    PeerUploadConnect, ResolveUploadPeer, SessionEvent, SessionEventKind, StartDownload,
+    StartSearch, StartSearchResult, StartedSearch,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +41,9 @@ pub struct Session {
     /// Downloads waiting on a peer address, keyed by username. A GetPeerAddress
     /// response drains these into PeerDownloadConnect messages.
     pending_downloads: HashMap<String, Vec<PendingDownload>>,
+    /// Usernames whose address we're resolving so peer_net can open an upload
+    /// connection. A GetPeerAddress response emits PeerUploadConnect for these.
+    pending_upload_resolves: HashSet<String>,
 }
 
 /// A download queued before we knew the peer's address.
@@ -62,6 +66,7 @@ impl Session {
             next_token: 1,
             pending_browses: HashSet::new(),
             pending_downloads: HashMap::new(),
+            pending_upload_resolves: HashSet::new(),
         }
     }
 
@@ -167,7 +172,8 @@ impl traits::core::Handle<NetRx> for Session {
                 let was_browse = self.pending_browses.remove(&response.username);
                 let downloads =
                     self.pending_downloads.remove(&response.username).unwrap_or_default();
-                let handled = was_browse || !downloads.is_empty();
+                let was_upload = self.pending_upload_resolves.remove(&response.username);
+                let handled = was_browse || !downloads.is_empty() || was_upload;
 
                 if was_browse {
                     if offline {
@@ -212,6 +218,15 @@ impl traits::core::Handle<NetRx> for Session {
                             writer,
                         );
                     }
+                }
+
+                if was_upload {
+                    // peer_net checks the offline sentinel (0.0.0.0:0) and fails
+                    // the queued uploads itself (it holds their filenames).
+                    Self::send(
+                        &PeerUploadConnect { username: response.username.clone(), ip: ip.clone(), port },
+                        writer,
+                    );
                 }
 
                 if !handled {
@@ -380,6 +395,18 @@ impl traits::core::Handle<StartDownload> for Session {
             filename: message.filename.clone(),
             size: message.size,
         });
+    }
+}
+
+impl traits::core::Handle<ResolveUploadPeer> for Session {
+    fn handle<W: traits::core::Writer>(&mut self, message: &ResolveUploadPeer, writer: &W) {
+        if self.state != SessionState::LoggedIn {
+            return;
+        }
+        // Resolve the address; the GetPeerAddress response emits PeerUploadConnect.
+        let request = GetPeerAddressRequest { username: message.username.clone() };
+        Self::send(&NetTx { frame: request.to_frame() }, writer);
+        self.pending_upload_resolves.insert(message.username.clone());
     }
 }
 

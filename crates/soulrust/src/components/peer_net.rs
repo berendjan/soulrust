@@ -15,6 +15,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,7 +28,8 @@ use soulseek_proto::peer_message::{
 };
 use soulseek_proto::server::{ConnectToPeerRequest, ServerRequest};
 use soulseek_proto::transfer::{
-    FileTransferInit, QueueUpload, TransferDirection, TransferResponse,
+    FileTransferInit, QueueUpload, TransferDirection, TransferRequest, TransferResponse,
+    UploadDenied,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -38,7 +40,7 @@ use crate::config::AppContext;
 use crate::messages::{
     BrowseDir, BrowseFailed, BrowseFile, BrowseListing, DownloadComplete, DownloadFailed,
     HandlerId, IncomingSearch, NetTx, PeerActivity, PeerBrowseConnect, PeerDownloadConnect,
-    PeerPierce,
+    PeerPierce, PeerUploadConnect, ResolveUploadPeer, UploadComplete, UploadFailed,
 };
 use crate::search_response;
 use crate::shares::ShareIndex;
@@ -102,6 +104,11 @@ enum PeerCommand {
     Pierce { username: String, ip: String, port: u16, token: u32 },
     IncomingSearch { username: String, token: u32, query: String },
     Download { username: String, ip: String, port: u16, filename: String, size: u64 },
+    /// A downloader approved an upload we offered; ask session to resolve their
+    /// address (emitted by a connection task via the cloned sender in ConnCtx).
+    StartUpload { username: String },
+    /// session resolved the address; open the file connection(s) and stream.
+    UploadConnect { username: String, ip: String, port: u16 },
 }
 
 /// Downloads in flight, shared across connections (the negotiation and the file
@@ -124,14 +131,36 @@ struct ActiveDownload {
     size: u64,
 }
 
+/// Uploads we have offered, keyed by the transfer token we minted. Marked
+/// `approved` once the downloader's `TransferResponse(allowed)` arrives; the
+/// file connection is then opened once we resolve the peer's address.
+#[derive(Default)]
+struct Uploads {
+    by_token: HashMap<u32, PendingUpload>,
+}
+
+struct PendingUpload {
+    username: String,
+    filename: String,
+    real_path: PathBuf,
+    size: u64,
+    approved: bool,
+}
+
 /// Shared per-reactor state handed to every connection task.
 struct ConnCtx {
     shares: Arc<ShareIndex>,
     queue: Arc<DeliveryQueue>,
     downloads: Mutex<Downloads>,
+    uploads: Mutex<Uploads>,
     our_username: String,
     download_dir: PathBuf,
     incomplete_dir: PathBuf,
+    /// Lets connection tasks signal the reactor's command loop (e.g. an approved
+    /// upload needs an address resolved and a file connection opened).
+    cmd_tx: UnboundedSender<PeerCommand>,
+    /// Monotonic source of transfer tokens for uploads we initiate.
+    next_token: AtomicU32,
 }
 
 /// What a finished connection produced, for the accept loop to report on the bus.
@@ -190,10 +219,11 @@ impl traits::core::Handler for PeerNet {
             incomplete_dir: std::mem::take(&mut self.incomplete_dir),
         };
         let cmd_rx = self.cmd_rx.take().expect("on_start called once");
+        let cmd_tx = self.cmd_tx.clone();
         let writer = writer.clone();
         std::thread::Builder::new()
             .name("soulrust-peer-net".into())
-            .spawn(move || run_reactor(config, cmd_rx, writer))
+            .spawn(move || run_reactor(config, cmd_rx, cmd_tx, writer))
             .expect("spawning peer-net reactor thread");
     }
 }
@@ -251,6 +281,16 @@ impl traits::core::Handle<PeerDownloadConnect> for PeerNet {
     }
 }
 
+impl traits::core::Handle<PeerUploadConnect> for PeerNet {
+    fn handle<W: traits::core::Writer>(&mut self, message: &PeerUploadConnect, _writer: &W) {
+        let _ = self.cmd_tx.send(PeerCommand::UploadConnect {
+            username: message.username.clone(),
+            ip: message.ip.clone(),
+            port: message.port,
+        });
+    }
+}
+
 /// One-time/low-frequency status onto the bus (listener bound, fatal errors).
 /// Per-connection activity goes to stderr — it is peer-driven and must never
 /// outrun the bounded bus reader.
@@ -261,6 +301,7 @@ fn status<W: traits::core::Writer>(writer: &W, note: String) {
 fn run_reactor<W: traits::core::Writer>(
     config: ReactorConfig,
     cmd_rx: UnboundedReceiver<PeerCommand>,
+    cmd_tx: UnboundedSender<PeerCommand>,
     writer: W,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
@@ -280,9 +321,12 @@ fn run_reactor<W: traits::core::Writer>(
             shares,
             queue: Arc::new(Mutex::new(PendingDeliveries::default())),
             downloads: Mutex::new(Downloads::default()),
+            uploads: Mutex::new(Uploads::default()),
             our_username: config.username,
             download_dir: config.download_dir,
             incomplete_dir: config.incomplete_dir,
+            cmd_tx,
+            next_token: AtomicU32::new(1),
         });
 
         let listener = match TcpListener::bind(("0.0.0.0", port)).await {
@@ -369,6 +413,51 @@ async fn command_loop<W: traits::core::Writer>(
                 let ctx = ctx.clone();
                 let writer = writer.clone();
                 tokio::spawn(download_init_task(ip, port, peer, filename, size, ctx, writer));
+            }
+            PeerCommand::StartUpload { username: peer } => {
+                // A downloader approved an upload; ask session to resolve their
+                // address so we can open the file connection.
+                PeerNet::send(&ResolveUploadPeer { username: peer }, &writer);
+            }
+            PeerCommand::UploadConnect { username: peer, ip, port } => {
+                // Collect the approved uploads for this peer.
+                let ready: Vec<(u32, String, PathBuf, u64)> = {
+                    let uploads = ctx.uploads.lock().unwrap();
+                    uploads
+                        .by_token
+                        .iter()
+                        .filter(|(_, u)| u.username == peer && u.approved)
+                        .map(|(&token, u)| (token, u.filename.clone(), u.real_path.clone(), u.size))
+                        .collect()
+                };
+                let offline = ip == "0.0.0.0" || port == 0;
+                for (token, filename, real_path, size) in ready {
+                    ctx.uploads.lock().unwrap().by_token.remove(&token);
+                    if offline {
+                        PeerNet::send(
+                            &UploadFailed {
+                                username: peer.clone(),
+                                filename,
+                                reason: "peer is offline or not reachable".into(),
+                            },
+                            &writer,
+                        );
+                        continue;
+                    }
+                    let our_username = ctx.our_username.clone();
+                    let writer = writer.clone();
+                    tokio::spawn(upload_task(
+                        ip.clone(),
+                        port,
+                        token,
+                        peer.clone(),
+                        filename,
+                        real_path,
+                        size,
+                        our_username,
+                        writer,
+                    ));
+                }
             }
             PeerCommand::IncomingSearch { username: searcher, token, query } => {
                 let our_token = connect_token;
@@ -571,6 +660,45 @@ async fn download_init_task<W: traits::core::Writer>(
     report_outcome(&writer, fake_addr(), result);
 }
 
+/// Outbound upload: open a file connection to the downloader, send the peer-init
+/// and `FileTransferInit`, then stream the file from disk. We are the uploader.
+#[allow(clippy::too_many_arguments)]
+async fn upload_task<W: traits::core::Writer>(
+    ip: String,
+    port: u16,
+    token: u32,
+    peer: String,
+    filename: String,
+    real_path: PathBuf,
+    size: u64,
+    our_username: String,
+    writer: W,
+) {
+    let result = async {
+        let mut stream =
+            connect(&ip, port).await.map_err(|e| format!("connect {ip}:{port}: {e}"))?;
+        let init = PeerInit {
+            username: our_username,
+            connection_type: ConnectionType::File,
+            token: 0,
+        };
+        stream.write_all(&init.to_frame()).await.map_err(|e| format!("send peer init: {e}"))?;
+        let file = tokio::fs::File::open(&real_path)
+            .await
+            .map_err(|e| format!("open {}: {e}", real_path.display()))?;
+        transfer_io::upload(&mut stream, token, file, size)
+            .await
+            .map_err(|e| format!("streaming: {e}"))?;
+        Ok::<(), String>(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => PeerNet::send(&UploadComplete { username: peer, filename }, &writer),
+        Err(reason) => PeerNet::send(&UploadFailed { username: peer, filename, reason }, &writer),
+    }
+}
+
 /// Reads one length-prefixed frame, returning the payload (code + contents), or
 /// `None` on a clean end of stream. Rejects a declared length beyond `max_len`.
 async fn read_frame<R: AsyncRead + Unpin>(
@@ -743,7 +871,61 @@ where
                     on_activity(format!("accepted transfer of {} from {peer}", request.file));
                 }
             }
-            _ => {} // responses / not-yet-handled messages
+            PeerMessage::QueueUpload(queue) => {
+                // A peer wants to download one of our files. Offer it (with a
+                // size) if we share it; otherwise decline.
+                match ctx.shares.resolve(&queue.file) {
+                    Some((path, size)) => {
+                        let token = ctx.next_token.fetch_add(1, Ordering::Relaxed);
+                        ctx.uploads.lock().unwrap().by_token.insert(
+                            token,
+                            PendingUpload {
+                                username: peer.clone(),
+                                filename: queue.file.clone(),
+                                real_path: path.to_owned(),
+                                size,
+                                approved: false,
+                            },
+                        );
+                        let request = TransferRequest {
+                            direction: TransferDirection::Upload,
+                            token,
+                            file: queue.file.clone(),
+                            filesize: Some(size),
+                        };
+                        stream.write_all(&request.to_frame()).await?;
+                        on_activity(format!("offered {} to {peer}", queue.file));
+                    }
+                    None => {
+                        let denied =
+                            UploadDenied { file: queue.file, reason: "File not shared".into() };
+                        stream.write_all(&denied.to_frame()).await?;
+                    }
+                }
+            }
+            PeerMessage::TransferResponse(response) => {
+                // A downloader's verdict on a file we offered. On approval, mark
+                // it and ask the reactor to resolve the address + open the file
+                // connection.
+                let approved = {
+                    let mut uploads = ctx.uploads.lock().unwrap();
+                    match uploads.by_token.get_mut(&response.token) {
+                        Some(pending) if response.allowed => {
+                            pending.approved = true;
+                            true
+                        }
+                        Some(_) => {
+                            uploads.by_token.remove(&response.token);
+                            false
+                        }
+                        None => false,
+                    }
+                };
+                if approved {
+                    let _ = ctx.cmd_tx.send(PeerCommand::StartUpload { username: peer.clone() });
+                }
+            }
+            _ => {} // not-yet-handled messages
         }
     }
     Ok(ConnOutcome::Done)
@@ -866,13 +1048,20 @@ mod tests {
     }
 
     fn test_ctx() -> Arc<ConnCtx> {
+        let (cmd_tx, cmd_rx) = unbounded_channel();
+        // Keep the channel open for the test's lifetime without a live consumer;
+        // sends from the connection task just go nowhere.
+        std::mem::forget(cmd_rx);
         Arc::new(ConnCtx {
             shares: Arc::new(test_index()),
             queue: Arc::new(Mutex::new(PendingDeliveries::default())),
             downloads: Mutex::new(Downloads::default()),
+            uploads: Mutex::new(Uploads::default()),
             our_username: "me".into(),
             download_dir: std::env::temp_dir(),
             incomplete_dir: std::env::temp_dir(),
+            cmd_tx,
+            next_token: AtomicU32::new(1),
         })
     }
 
@@ -1073,13 +1262,18 @@ mod tests {
         runtime().block_on(async {
             let dir = std::env::temp_dir().join(format!("soulrust-dl-{}", std::process::id()));
             let _ = std::fs::create_dir_all(&dir);
+            let (cmd_tx, cmd_rx) = unbounded_channel();
+            std::mem::forget(cmd_rx);
             let ctx = Arc::new(ConnCtx {
                 shares: Arc::new(test_index()),
                 queue: Arc::new(Mutex::new(PendingDeliveries::default())),
                 downloads: Mutex::new(Downloads::default()),
+                uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
                 download_dir: dir.clone(),
                 incomplete_dir: dir.clone(),
+                cmd_tx,
+                next_token: AtomicU32::new(1),
             });
             ctx.downloads.lock().unwrap().by_token.insert(
                 42,
@@ -1107,6 +1301,104 @@ mod tests {
             assert_eq!(filename, "Music\\got.mp3");
             assert_eq!(std::fs::read(&path).unwrap(), b"hello world");
             let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn offers_a_shared_file_in_response_to_queue_upload() {
+        // A peer asks to download one of our files; we reply with a
+        // TransferRequest carrying the size, and record the pending upload.
+        runtime().block_on(async {
+            let (mut client, server) = tokio::io::duplex(64 * 1024);
+            let ctx = test_ctx();
+            let ctx_serve = ctx.clone();
+            let serve = tokio::spawn(async move {
+                serve_connection(server, &ctx_serve, Some("bob".into()), |_| {}).await
+            });
+
+            client
+                .write_all(&QueueUpload { file: "Music\\Album\\song.mp3".into() }.to_frame())
+                .await
+                .unwrap();
+
+            let reply = PeerMessage::decode(&read_one_frame(&mut client).await).unwrap();
+            let PeerMessage::TransferRequest(req) = reply else { panic!("expected transfer request") };
+            assert_eq!(req.direction, TransferDirection::Upload);
+            assert_eq!(req.file, "Music\\Album\\song.mp3");
+            assert_eq!(req.filesize, Some(4096));
+
+            drop(client);
+            serve.await.unwrap().unwrap();
+            assert_eq!(ctx.uploads.lock().unwrap().by_token.len(), 1, "upload recorded by token");
+        });
+    }
+
+    #[test]
+    fn declines_queue_upload_for_an_unshared_file() {
+        runtime().block_on(async {
+            let (mut client, server) = tokio::io::duplex(64 * 1024);
+            let ctx = test_ctx();
+            let serve = tokio::spawn(async move {
+                serve_connection(server, &ctx, Some("bob".into()), |_| {}).await
+            });
+            client.write_all(&QueueUpload { file: "Nope\\missing.mp3".into() }.to_frame()).await.unwrap();
+
+            let reply = PeerMessage::decode(&read_one_frame(&mut client).await).unwrap();
+            let PeerMessage::UploadDenied(denied) = reply else { panic!("expected upload denied") };
+            assert_eq!(denied.file, "Nope\\missing.mp3");
+
+            drop(client);
+            serve.await.unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn approved_upload_triggers_a_start_upload_command() {
+        // When the downloader approves an offer, we mark it and ask the reactor
+        // to resolve the address and open the file connection.
+        use soulseek_proto::transfer::TransferResponse;
+        runtime().block_on(async {
+            let (mut client, server) = tokio::io::duplex(64 * 1024);
+            let (cmd_tx, mut cmd_rx) = unbounded_channel();
+            let ctx = Arc::new(ConnCtx {
+                shares: Arc::new(test_index()),
+                queue: Arc::new(Mutex::new(PendingDeliveries::default())),
+                downloads: Mutex::new(Downloads::default()),
+                uploads: Mutex::new(Uploads::default()),
+                our_username: "me".into(),
+                download_dir: std::env::temp_dir(),
+                incomplete_dir: std::env::temp_dir(),
+                cmd_tx,
+                next_token: AtomicU32::new(1),
+            });
+            ctx.uploads.lock().unwrap().by_token.insert(
+                5,
+                PendingUpload {
+                    username: "bob".into(),
+                    filename: "Music\\Album\\song.mp3".into(),
+                    real_path: "/tmp/song.mp3".into(),
+                    size: 4096,
+                    approved: false,
+                },
+            );
+
+            let serve = tokio::spawn(async move {
+                serve_connection(server, &ctx, Some("bob".into()), |_| {}).await
+            });
+            client
+                .write_all(
+                    &TransferResponse { token: 5, allowed: true, filesize: None, reason: None }
+                        .to_frame(),
+                )
+                .await
+                .unwrap();
+            drop(client);
+            serve.await.unwrap().unwrap();
+
+            match cmd_rx.try_recv() {
+                Ok(PeerCommand::StartUpload { username }) => assert_eq!(username, "bob"),
+                other => panic!("expected StartUpload, got {:?}", other.is_ok()),
+            }
         });
     }
 }

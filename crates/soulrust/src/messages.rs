@@ -63,6 +63,10 @@ rust_messenger::messenger_id_enum!(
         PeerDownloadConnect = 31,
         DownloadComplete = 32,
         DownloadFailed = 33,
+        ResolveUploadPeer = 34,
+        PeerUploadConnect = 35,
+        UploadComplete = 36,
+        UploadFailed = 37,
     }
 );
 
@@ -397,6 +401,40 @@ pub struct DownloadFailed {
 }
 
 // ---------------------------------------------------------------------------
+// uploads (serve a file to a peer)
+
+/// peer_net → session: a downloader approved a transfer; resolve their address
+/// so we can open the file connection to send the bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveUploadPeer {
+    pub username: String,
+}
+
+/// session → peer_net: the resolved address to open an upload (`F`) connection
+/// to. A location, not data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerUploadConnect {
+    pub username: String,
+    pub ip: String,
+    pub port: u16,
+}
+
+/// peer_net → ui: a file was fully uploaded to a peer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadComplete {
+    pub username: String,
+    pub filename: String,
+}
+
+/// peer_net / session → ui: an upload could not be completed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadFailed {
+    pub username: String,
+    pub filename: String,
+    pub reason: String,
+}
+
+// ---------------------------------------------------------------------------
 // bus plumbing: Message + ExtendedMessage + deserialize_from for every type
 
 macro_rules! impl_bus_message {
@@ -465,6 +503,10 @@ impl_bus_message!(
     PeerDownloadConnect => MessageId::PeerDownloadConnect,
     DownloadComplete => MessageId::DownloadComplete,
     DownloadFailed => MessageId::DownloadFailed,
+    ResolveUploadPeer => MessageId::ResolveUploadPeer,
+    PeerUploadConnect => MessageId::PeerUploadConnect,
+    UploadComplete => MessageId::UploadComplete,
+    UploadFailed => MessageId::UploadFailed,
 );
 
 #[cfg(test)]
