@@ -226,3 +226,136 @@ Most of the differences collapse onto one question.
 (borrow panics, deadlocks, blocked executor). Choose the failure mode you'd
 rather debug — and note that adopting the call graph is really a decision to go
 async first.
+
+---
+
+## Performance: the two designs tax *different* things
+
+A common assumption is that the "lock-free bus" must be the fast one. It isn't
+free — it just moves the cost from state access to message transport. Ballpark
+per-operation costs (uncontended, modern x86-64; order-of-magnitude, not
+measured on this codebase):
+
+| Operation | Cost |
+|---|---|
+| `&mut self` field write (bus state, no sync) | ~0–2 ns |
+| Atomic CAS (the ring's lock-free reserve) | ~5–15 ns |
+| `RefCell` borrow check | ~1–2 ns |
+| `std::sync::Mutex` / `parking_lot` lock+unlock, uncontended | ~10–25 ns |
+| `tokio::sync::Mutex` lock+unlock, uncontended | ~50–150 ns |
+| bincode encode+decode, small struct | ~50–300 ns |
+| **thread context switch** (bus crossing handlers) | **~1–5 µs** |
+| bincode + copy of a 512 KB `BrowseListing` | ~100–400 µs (memcpy-bound) |
+
+- **Bus:** ~0 ns on state access (`&mut self`, single writer, no lock), but pays
+  **bincode encode + ring copy + a cross-thread handoff on every hop** — ~1–5 µs
+  for a small message, *hundreds of µs* for the 512 KB browse listing.
+- **Call graph:** ~0 transport (by reference, no serialization, no copy, no
+  handoff), but pays a **lock/borrow per state touch** — single-digit to ~100 ns.
+
+Transport (µs) dominates a lock (ns) by ~100×, so the in-process call graph is
+usually the *faster* one in absolute terms; the mutex tax only becomes the
+bottleneck under real contention (many runtime threads hammering one lock). **For
+this app the delta is in the noise** — hundreds of messages/sec means microseconds
+of CPU per second either way — and the 512 KB browse path is the one place the
+bus is genuinely slower. Conclusion: speed does not decide this; the failure
+modes do. Use `std::sync::Mutex`/`parking_lot` (not `tokio::sync::Mutex`) for
+state not held across `.await`.
+
+A note on tokio's own locking: a *busy* worker's hot path is lock-free (per-worker
+run queue is an atomic ring; work-stealing is CAS-based). Locks live on cold
+paths — the I/O driver (one thread drives `epoll` at a time), the global inject
+queue (cross-thread spawns/wakeups), the timer wheel, the `spawn_blocking` pool.
+A **single-threaded** runtime (`current_thread`/`LocalSet`) has one worker, no
+work-stealing, no inject contention, and an always-uncontended driver lock — so
+it has *less* synchronization than the multi-threaded bus, not more.
+
+## Preventing re-entrancy at compile time
+
+Footgun #1 (re-entrancy → borrow panic / deadlock) is the call graph's worst
+edge. In the *general* case it can't be ruled out at compile time — whether a
+cycle occurs can depend on runtime values, so it's undecidable. Every static
+defense works by **constraining the graph to a DAG**:
+
+1. **Rank the components** (cleanest fit). Give each a compile-time rank; permit a
+   send only to a *strictly higher* rank. Every path then strictly increases →
+   acyclic → a handler is never re-entered while it holds a borrow. Enforceable on
+   stable with a per-route `const _: () = assert!(SRC::RANK < RECV::RANK);` (a
+   self-send fails too). Fits this topology: `web → session → net/peer edges`,
+   `ui` as a sink. Request/response needs no back-edge — a reply is a return
+   value, not a send.
+2. **Declare out-edges + static cycle detection** (proc-macro). Have each handler
+   declare the messages it may send (the `sends`/`handles` style `messenger-macro`
+   already uses), build the directed graph at expansion time, reject cycles. More
+   expressive than ranks, but conservative (a conditionally-taken edge still
+   counts).
+3. **Return commands instead of sending inline** (structural). `handle` *returns*
+   the messages to send; the dispatcher performs them after the borrow drops, so
+   sending-while-borrowed has no API. But this is recursion-turned-iteration
+   through a dispatcher loop — i.e. **you've rebuilt the bus.** That is precisely
+   *why* the bus makes this class of bug impossible.
+
+Cheap non-static fallback: `try_borrow_mut()` (a `Result`, not a panic) or a
+per-handler re-entrancy guard — recoverable error instead of a crash, but no
+compile-time guarantee. Takeaway: every real compile-time prevention forces a
+DAG, and the one with no graph constraint reintroduces the bus.
+
+## The implemented spike: `crates/direct_messenger`
+
+The call-graph design now exists as a crate with **two route flavours**, so the
+sync/async choice is per-route, not per-app:
+
+- **`routes:` — synchronous.** Generates `SyncSender`/`SyncMessengerRoute`;
+  `handle` is `fn … -> Response`. No executor, no `Send` bound, so blocking I/O is
+  fine and state may be `RefCell`. Maps 1:1 onto the `web_bridge::round_trip`
+  flows — the typed return value deletes the corr-id/pending-map/timeout subsystem.
+- **`async_routes:` — asynchronous.** The original behaviour: `Sender`/
+  `MessengerRoute`, `async fn handle`, `Send` future.
+
+The crate's tests pin the load-bearing constraint: a messenger that is *entirely*
+`routes:` may use `RefCell` state, but **adding one `async_routes:` entry forces
+every handler (including sync-only ones) onto `Sync` state** — because the async
+`route` future captures `&DirectMessenger`, which must then be `Sync`. That is
+footgun #7, now compiler-enforced rather than documented.
+
+## If you go async: the real fork (and the corner to avoid)
+
+Two axes are easy to fuse but are independent:
+
+- **Execution model:** threads+blocking (today) · single-threaded async ·
+  multi-threaded async.
+- **Wiring model:** a *queue* (enqueue-and-return, decoupled) vs a *direct call
+  graph* (inline, synchronous tree).
+
+The bus is `{threads, queue}`; `direct_messenger` is `{either, call-graph}`. The
+tempting "obvious" endpoint — **`{N-thread async, shared call-graph router,
+Mutex state}` — is the worst corner**: re-entrancy stops being a loud single-
+threaded `RefCell` panic and becomes a **silent deadlock** (lock → send → routes
+back → re-lock, no 15 s timeout), *plus* lock contention on state that was free
+under the bus. Multi-threading is what *kills* the shared call graph, not what
+rescues it.
+
+Following the constraints honestly, multi-threaded async converges instead on
+**actors over channels** — the async-native form of today's bus:
+
+- each component is a task that **owns its state (`&mut self`, no lock)** and reads
+  a typed `mpsc` inbox;
+- a `send` enqueues and returns → **no re-entrancy** (recipient runs on its own
+  turn), same property that makes the bus safe;
+- bounded channels give **backpressure**; task isolation replaces thread
+  isolation; blocking goes to `spawn_blocking`;
+- a `oneshot` reply channel **is** the correlation → typed request/response with
+  **no pending-map, no timeout, no `BridgeReply`** — the entire `web_bridge`
+  subsystem deleted, which was the prize the typed `Response` was chasing.
+
+So the destination is **not** `{N-thread, call-graph, Mutex}`. It is one of:
+
+- `{current_thread async, call-graph, RefCell}` — keep compile-checked routing and
+  the typed `Response`, accept disciplined non-re-entrancy; the *only* variant
+  where `RefCell` stays legal, and enough for this I/O-bound, hundreds-of-msgs/sec
+  workload (you reach for `N = num_cores` only to parallelize CPU-bound work, and
+  Spotify extraction wants `spawn_blocking` regardless); or
+- `{multi-thread async, actors-over-channels}` — the bus reborn async-native, with
+  `oneshot` replacing the corr-id machinery.
+
+Both are coherent; the `{N-thread, call-graph, Mutex}` corner is the one to avoid.
