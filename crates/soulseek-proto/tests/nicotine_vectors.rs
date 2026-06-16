@@ -21,6 +21,7 @@ use soulseek_proto::transfer::{
     FileOffset, FileTransferInit, PlaceInQueueRequest, PlaceInQueueResponse, QueueUpload,
     TransferDirection, TransferRequest, TransferResponse, UploadDenied, UploadFailed,
 };
+use soulseek_proto::Reader;
 
 mod vectors {
     include!("fixtures/nicotine_vectors.rs");
@@ -347,4 +348,130 @@ fn f_connection_messages_match_nicotine() {
     // Raw bytes: no length prefix, no code — compare directly.
     assert_eq!(FileTransferInit { token: 0xABCD }.to_bytes(), vectors::FILE_TRANSFER_INIT_BYTES);
     assert_eq!(FileOffset { offset: 1_048_576 }.to_bytes(), vectors::FILE_OFFSET_BYTES);
+}
+
+// --- file transfers: decode direction -----------------------------------------
+// The fixtures above come from Nicotine+'s real make_network_message(); here we
+// feed those exact bytes BACK through our decoders, mirroring the
+// `our_decoder_accepts_nicotines_*` tests for server/peer messages. PeerMessage
+// transfer frames are [u32 code][body] once the length prefix is stripped, so
+// prepend the peer code to each oracle body (codes from slskmessages.py).
+
+fn peer_payload(code: u32, body: &[u8]) -> Vec<u8> {
+    let mut payload = code.to_le_bytes().to_vec();
+    payload.extend_from_slice(body);
+    payload
+}
+
+#[test]
+fn our_decoder_accepts_nicotines_transfer_request() {
+    // Peer code 40. UPLOAD=1 carries the trailing u64 filesize; DOWNLOAD=0 does
+    // not (slskmessages.py TransferRequest.parse_network_message reads filesize
+    // only `if self.direction == TransferDirection.UPLOAD`).
+    let PeerMessage::TransferRequest(upload) =
+        PeerMessage::decode(&peer_payload(40, vectors::TRANSFER_REQUEST_UPLOAD_BODY)).unwrap()
+    else {
+        panic!("expected a transfer request");
+    };
+    assert_eq!(upload.direction, TransferDirection::Upload);
+    assert_eq!(upload.token, 0xABCD);
+    assert_eq!(upload.file, "Music\\song.mp3");
+    assert_eq!(upload.filesize, Some(5_242_880));
+
+    let PeerMessage::TransferRequest(download) =
+        PeerMessage::decode(&peer_payload(40, vectors::TRANSFER_REQUEST_DOWNLOAD_BODY)).unwrap()
+    else {
+        panic!("expected a transfer request");
+    };
+    assert_eq!(download.direction, TransferDirection::Download);
+    assert_eq!(download.token, 7);
+    assert_eq!(download.file, "x");
+    assert_eq!(download.filesize, None, "DOWNLOAD requests carry no filesize on the wire");
+}
+
+#[test]
+fn our_decoder_accepts_nicotines_transfer_response() {
+    // Peer code 41. Allowed => trailing u64 filesize; rejected => a reason string
+    // (slskmessages.py TransferResponse.parse_network_message branches on
+    // `allowed` after an early return when no content remains).
+    let PeerMessage::TransferResponse(allowed) =
+        PeerMessage::decode(&peer_payload(41, vectors::TRANSFER_RESPONSE_ALLOWED_BODY)).unwrap()
+    else {
+        panic!("expected a transfer response");
+    };
+    assert_eq!(allowed.token, 9);
+    assert!(allowed.allowed);
+    assert_eq!(allowed.filesize, Some(4096));
+    assert_eq!(allowed.reason, None);
+
+    let PeerMessage::TransferResponse(rejected) =
+        PeerMessage::decode(&peer_payload(41, vectors::TRANSFER_RESPONSE_REJECTED_BODY)).unwrap()
+    else {
+        panic!("expected a transfer response");
+    };
+    assert_eq!(rejected.token, 9);
+    assert!(!rejected.allowed);
+    assert_eq!(rejected.filesize, None);
+    assert_eq!(rejected.reason.as_deref(), Some("Queued"));
+
+    // The real accept shape Nicotine+ actually sends (downloads.py builds
+    // TransferResponse(allowed=True, token=...) with filesize unset): just
+    // token + bool, so parse_network_message early-returns with no filesize.
+    // Decoded straight from the body — there is no trailing content.
+    let bare = TransferResponse::decode(&mut Reader::new(vectors::TRANSFER_RESPONSE_ACCEPTED_BARE_BODY))
+        .unwrap();
+    assert_eq!(bare, TransferResponse { token: 9, allowed: true, filesize: None, reason: None });
+}
+
+#[test]
+fn our_decoder_accepts_nicotines_queue_and_place_in_queue() {
+    // Peer codes 43 / 51 / 44.
+    let PeerMessage::QueueUpload(queue) =
+        PeerMessage::decode(&peer_payload(43, vectors::QUEUE_UPLOAD_BODY)).unwrap()
+    else {
+        panic!("expected a queue upload");
+    };
+    assert_eq!(queue.file, "Music\\song.mp3");
+
+    let PeerMessage::PlaceInQueueRequest(request) =
+        PeerMessage::decode(&peer_payload(51, vectors::PLACE_IN_QUEUE_REQUEST_BODY)).unwrap()
+    else {
+        panic!("expected a place-in-queue request");
+    };
+    assert_eq!(request.file, "a\\b.mp3");
+
+    let PeerMessage::PlaceInQueueResponse(response) =
+        PeerMessage::decode(&peer_payload(44, vectors::PLACE_IN_QUEUE_RESPONSE_BODY)).unwrap()
+    else {
+        panic!("expected a place-in-queue response");
+    };
+    assert_eq!(response.filename, "a\\b.mp3");
+    assert_eq!(response.place, 3);
+}
+
+#[test]
+fn our_decoder_accepts_nicotines_upload_denied_and_failed() {
+    // Peer codes 50 / 46.
+    let PeerMessage::UploadDenied(denied) =
+        PeerMessage::decode(&peer_payload(50, vectors::UPLOAD_DENIED_BODY)).unwrap()
+    else {
+        panic!("expected an upload denied");
+    };
+    assert_eq!(denied.file, "a.mp3");
+    assert_eq!(denied.reason, "Not shared");
+
+    let PeerMessage::UploadFailed(failed) =
+        PeerMessage::decode(&peer_payload(46, vectors::UPLOAD_FAILED_BODY)).unwrap()
+    else {
+        panic!("expected an upload failed");
+    };
+    assert_eq!(failed.file, "a.mp3");
+}
+
+#[test]
+fn our_decoder_accepts_nicotines_f_connection_messages() {
+    // Bare little-endian scalars, no frame: decode Nicotine+'s real
+    // FileTransferInit (u32 token) and FileOffset (u64 offset) bytes directly.
+    assert_eq!(FileTransferInit::decode(vectors::FILE_TRANSFER_INIT_BYTES).unwrap().token, 0xABCD);
+    assert_eq!(FileOffset::decode(vectors::FILE_OFFSET_BYTES).unwrap().offset, 1_048_576);
 }

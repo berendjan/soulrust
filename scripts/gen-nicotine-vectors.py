@@ -290,6 +290,10 @@ VECTORS = [
     ("TRANSFER_RESPONSE_REJECTED_BODY",
      'TransferResponse(allowed=False, token=9, reason="Queued") — token, bool, reason',
      TransferResponse(allowed=False, token=9, reason="Queued").make_network_message()),
+    ("TRANSFER_RESPONSE_ACCEPTED_BARE_BODY",
+     "TransferResponse(allowed=True, token=9) — the real accept shape Nicotine+ "
+     "sends (downloads.py): token + bool only, no trailing filesize",
+     TransferResponse(allowed=True, token=9).make_network_message()),
     ("QUEUE_UPLOAD_BODY",
      'QueueUpload(file="Music\\\\song.mp3")',
      QueueUpload(file="Music\\song.mp3").make_network_message()),

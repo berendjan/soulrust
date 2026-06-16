@@ -353,6 +353,24 @@ mod tests {
     }
 
     #[test]
+    fn transfer_response_bare_rejected_decodes_with_no_reason() {
+        // token + allowed=false and nothing else. Nicotine+'s
+        // TransferResponse.parse_network_message returns early at
+        // `if not self.has_remaining_content(): return` BEFORE the
+        // `else: self.reason = self.unpack_string()` branch, so a rejected
+        // response with no trailing reason leaves reason unset — the symmetric
+        // case to the bare-allowed early return above.
+        let mut body = Vec::new();
+        put_u32(&mut body, 5);
+        put_bool(&mut body, false);
+        let decoded = TransferResponse::decode(&mut Reader::new(&body)).unwrap();
+        assert_eq!(
+            decoded,
+            TransferResponse { token: 5, allowed: false, filesize: None, reason: None }
+        );
+    }
+
+    #[test]
     fn queue_upload_round_trips() {
         let msg = QueueUpload { file: "Music\\song.mp3".into() };
         let (code, body) = decode_peer(&msg.to_frame());

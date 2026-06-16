@@ -36,6 +36,8 @@ pub struct ShareIndex {
     pub word_index: HashMap<String, Vec<u32>>,
     /// Virtual folder path → the ids of files directly in it.
     pub folders: BTreeMap<String, Vec<u32>>,
+    /// Virtual file path → its file id, for O(1) upload resolution.
+    by_virtual: HashMap<String, u32>,
     /// The compressed browse frame, built once on first use and reused (the
     /// share list is constant between scans). Mirrors Nicotine+ caching
     /// `SharedFileListResponse.built` so we don't rebuild + re-zlib the whole
@@ -93,6 +95,7 @@ impl ShareIndex {
             .unwrap_or_default();
         self.folders.entry(folder).or_default().push(id);
 
+        self.by_virtual.insert(virtual_path.clone(), id);
         self.files.push(SharedFileEntry { real_path, virtual_path, size });
     }
 
@@ -103,10 +106,8 @@ impl ShareIndex {
     /// Resolve a peer-requested virtual path to the real file on disk and its
     /// size, for serving an upload. `None` if we do not share that path.
     pub fn resolve(&self, virtual_path: &str) -> Option<(&Path, u64)> {
-        self.files
-            .iter()
-            .find(|entry| entry.virtual_path == virtual_path)
-            .map(|entry| (entry.real_path.as_path(), entry.size))
+        let entry = &self.files[*self.by_virtual.get(virtual_path)? as usize];
+        Some((entry.real_path.as_path(), entry.size))
     }
 
     /// The wire `SharedFile` for a file id as carried in a *search* response:

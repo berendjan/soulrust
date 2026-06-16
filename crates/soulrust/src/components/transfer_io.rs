@@ -20,11 +20,37 @@ use soulseek_proto::transfer::{FileOffset, FileTransferInit};
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
+/// Copy exactly `len` bytes from `src` to `dst` in 64 KiB chunks, erroring if
+/// `src` ends before `len` bytes have been read. The fixed buffer bounds memory
+/// regardless of transfer size.
+async fn copy_exact<R, W>(src: &mut R, dst: &mut W, len: u64) -> io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut remaining = len;
+    let mut buf = vec![0u8; 64 * 1024];
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let read = src.read(&mut buf[..want]).await?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "source ended before the expected number of bytes",
+            ));
+        }
+        dst.write_all(&buf[..read]).await?;
+        remaining -= read as u64;
+    }
+    Ok(len)
+}
+
 /// Stream a file to a peer over an `F` connection (we are the uploader).
 ///
 /// Sends `FileTransferInit(token)`, reads the peer's `FileOffset`, seeks there,
 /// and writes the remaining `size - offset` bytes. Returns the number of bytes
-/// sent. The 64 KiB chunking bounds memory regardless of file size.
+/// sent. A file shorter than the advertised `size` errors rather than silently
+/// short-transferring (the peer would otherwise wait for bytes that never come).
 pub async fn upload<S>(stream: &mut S, token: u32, mut file: File, size: u64) -> io::Result<u64>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -44,21 +70,7 @@ where
     }
 
     file.seek(SeekFrom::Start(offset)).await?;
-    let mut remaining = size - offset;
-    let mut sent = 0u64;
-    let mut buf = vec![0u8; 64 * 1024];
-    while remaining > 0 {
-        let want = remaining.min(buf.len() as u64) as usize;
-        let read = file.read(&mut buf[..want]).await?;
-        if read == 0 {
-            // File is shorter than the size we advertised — stop cleanly rather
-            // than spin; the peer sees a short transfer.
-            break;
-        }
-        stream.write_all(&buf[..read]).await?;
-        sent += read as u64;
-        remaining -= read as u64;
-    }
+    let sent = copy_exact(&mut file, stream, size - offset).await?;
     stream.flush().await?;
     Ok(sent)
 }
@@ -85,23 +97,7 @@ where
         ));
     }
     stream.write_all(&FileOffset { offset }.to_bytes()).await?;
-
-    let mut remaining = expected_size - offset;
-    let mut received = 0u64;
-    let mut buf = vec![0u8; 64 * 1024];
-    while remaining > 0 {
-        let want = remaining.min(buf.len() as u64) as usize;
-        let read = stream.read(&mut buf[..want]).await?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "peer closed before sending the whole file",
-            ));
-        }
-        sink.write_all(&buf[..read]).await?;
-        received += read as u64;
-        remaining -= read as u64;
-    }
+    let received = copy_exact(stream, &mut sink, expected_size - offset).await?;
     sink.flush().await?;
     Ok(received)
 }
@@ -202,6 +198,74 @@ mod tests {
 
             let result = dl.await.unwrap();
             assert!(result.is_err(), "short transfer must error");
+        });
+    }
+
+    #[test]
+    fn upload_of_a_fully_resumed_file_sends_zero_bytes() {
+        runtime().block_on(async {
+            let src = TempPath::new("done");
+            tokio::fs::write(&src.0, b"abcdefghij").await.unwrap(); // 10 bytes
+            let file = File::open(&src.0).await.unwrap();
+            let (mut client, mut server) = tokio::io::duplex(1024);
+
+            let up = tokio::spawn(async move { upload(&mut server, 1, file, 10).await });
+            let mut init = [0u8; FileTransferInit::LEN];
+            client.read_exact(&mut init).await.unwrap();
+            client.write_all(&FileOffset { offset: 10 }.to_bytes()).await.unwrap(); // resume at EOF
+
+            let mut got = Vec::new();
+            client.read_to_end(&mut got).await.unwrap();
+            assert_eq!(up.await.unwrap().unwrap(), 0);
+            assert!(got.is_empty());
+        });
+    }
+
+    #[test]
+    fn upload_rejects_an_offset_past_the_size() {
+        runtime().block_on(async {
+            let src = TempPath::new("small");
+            tokio::fs::write(&src.0, b"abc").await.unwrap();
+            let file = File::open(&src.0).await.unwrap();
+            let (mut client, mut server) = tokio::io::duplex(1024);
+
+            let up = tokio::spawn(async move { upload(&mut server, 1, file, 3).await });
+            let mut init = [0u8; FileTransferInit::LEN];
+            client.read_exact(&mut init).await.unwrap();
+            client.write_all(&FileOffset { offset: 9 }.to_bytes()).await.unwrap(); // past size
+
+            assert!(up.await.unwrap().is_err());
+        });
+    }
+
+    #[test]
+    fn upload_errors_when_the_file_is_shorter_than_advertised() {
+        runtime().block_on(async {
+            let src = TempPath::new("truncated");
+            tokio::fs::write(&src.0, b"only ten b").await.unwrap(); // 10 bytes on disk
+            let file = File::open(&src.0).await.unwrap();
+            let (mut client, mut server) = tokio::io::duplex(4096);
+
+            // Advertise 1000 bytes but the file holds 10.
+            let up = tokio::spawn(async move { upload(&mut server, 1, file, 1000).await });
+            let mut init = [0u8; FileTransferInit::LEN];
+            client.read_exact(&mut init).await.unwrap();
+            client.write_all(&FileOffset { offset: 0 }.to_bytes()).await.unwrap();
+            let mut drained = Vec::new();
+            let _ = client.read_to_end(&mut drained).await;
+
+            assert!(up.await.unwrap().is_err(), "short file must surface an error, not Ok");
+        });
+    }
+
+    #[test]
+    fn download_rejects_an_offset_past_the_expected_size() {
+        runtime().block_on(async {
+            let dest = TempPath::new("bad-offset");
+            let sink = File::create(&dest.0).await.unwrap();
+            let (_client, mut server) = tokio::io::duplex(1024);
+            let result = download(&mut server, 100, 50, sink).await;
+            assert!(result.is_err());
         });
     }
 }
