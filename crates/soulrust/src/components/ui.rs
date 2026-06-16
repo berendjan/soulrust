@@ -10,8 +10,8 @@ use rust_messenger::traits::extended::Sender;
 
 use crate::config::AppContext;
 use crate::messages::{
-    ConfigChanged, HandlerId, HttpHtml, HttpRender, Page, SessionEvent, SessionEventKind,
-    UpdaterStatus, UpdaterStatusChanged,
+    ConfigChanged, HandlerId, HttpHtml, HttpRender, Page, PeerActivity, SessionEvent,
+    SessionEventKind, UpdaterStatus, UpdaterStatusChanged,
 };
 
 const MAX_LOG_LINES: usize = 100;
@@ -248,6 +248,12 @@ impl traits::core::Handle<ConfigChanged> for Ui {
     fn handle<W: traits::core::Writer>(&mut self, message: &ConfigChanged, _writer: &W) {
         self.username = message.config.server.username.clone();
         self.log("configuration updated".into());
+    }
+}
+
+impl traits::core::Handle<PeerActivity> for Ui {
+    fn handle<W: traits::core::Writer>(&mut self, message: &PeerActivity, _writer: &W) {
+        self.log(message.note.clone());
     }
 }
 

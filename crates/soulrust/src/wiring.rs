@@ -10,6 +10,7 @@
 use crate::components::browse::Browse;
 use crate::components::net_edge::NetEdge;
 use crate::components::peer_edge::PeerEdge;
+use crate::components::peer_net::PeerNet;
 use crate::components::session::Session;
 use crate::components::ui::Ui;
 use crate::components::updater::Updater;
@@ -19,8 +20,8 @@ use crate::extract::ExtractorComponent;
 use crate::messages::{
     ApplyUpdateReq, ApplyUpdateResult, BrowseAccepted, BrowseFailed, BrowseHtml, BrowseListing,
     BrowseRenderReq, BrowseUser, ConfigChanged, ConfigSnapshot, ExtractRequest, ExtractResult,
-    GetConfigReq, HttpHtml, HttpRender, NetConn, NetRx, NetTx, PeerBrowseConnect, SetConfigReq,
-    SetConfigResult, SessionEvent, StartSearch, StartSearchResult, UpdateDownloaded,
+    GetConfigReq, HttpHtml, HttpRender, NetConn, NetRx, NetTx, PeerActivity, PeerBrowseConnect,
+    SetConfigReq, SetConfigResult, SessionEvent, StartSearch, StartSearchResult, UpdateDownloaded,
     UpdaterStatusChanged,
 };
 
@@ -34,6 +35,7 @@ rust_messenger::Messenger! {
             ui: Ui,
             net_edge: NetEdge,
             peer_edge: PeerEdge,
+            peer_net: PeerNet,
             browse: Browse,
             web_bridge: WebBridge,
         ]
@@ -64,6 +66,8 @@ rust_messenger::Messenger! {
             PeerEdge, BrowseFailed: [ browse ],
             WebBridge, BrowseRenderReq: [ browse ],
             Browse, BrowseHtml: [ web_bridge ],
+            // peer network edge: serving activity -> ui log
+            PeerNet, PeerActivity: [ ui ],
             // broadcasts
             Session, SessionEvent: [ ui ],
             ConfigStore, ConfigChanged: [ ui ],

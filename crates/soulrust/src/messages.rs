@@ -24,6 +24,7 @@ rust_messenger::messenger_id_enum!(
         Extractor = 7,
         PeerEdge = 8,
         Browse = 9,
+        PeerNet = 10,
     }
 );
 
@@ -55,6 +56,7 @@ rust_messenger::messenger_id_enum!(
         BrowseFailed = 24,
         BrowseRenderReq = 25,
         BrowseHtml = 26,
+        PeerActivity = 27,
     }
 );
 
@@ -319,6 +321,16 @@ pub struct BrowseHtml {
 }
 
 // ---------------------------------------------------------------------------
+// peer network edge → ui (serving activity, shown in the log)
+
+/// peer_net → ui: a notable serving event (a peer connected, we served a
+/// browse, the listener bound, …). Just a log line — no bulk data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerActivity {
+    pub note: String,
+}
+
+// ---------------------------------------------------------------------------
 // bus plumbing: Message + ExtendedMessage + deserialize_from for every type
 
 macro_rules! impl_bus_message {
@@ -380,6 +392,7 @@ impl_bus_message!(
     BrowseFailed => MessageId::BrowseFailed,
     BrowseRenderReq => MessageId::BrowseRenderReq,
     BrowseHtml => MessageId::BrowseHtml,
+    PeerActivity => MessageId::PeerActivity,
 );
 
 #[cfg(test)]

@@ -383,6 +383,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "direct_messenger"
+version = "0.1.0"
+
+[[package]]
 name = "displaydoc"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1803,6 +1807,7 @@ dependencies = [
  "serde_yaml",
  "soulseek-proto",
  "tiny_http",
+ "tokio",
  "ureq 2.12.1",
 ]
 
