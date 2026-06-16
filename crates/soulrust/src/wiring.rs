@@ -19,7 +19,8 @@ use crate::extract::ExtractorComponent;
 use crate::messages::{
     ApplyUpdateReq, ApplyUpdateResult, BrowseAccepted, BrowseFailed, BrowseHtml, BrowseListing,
     BrowseRenderReq, BrowseUser, ConfigChanged, ConfigSnapshot, DownloadComplete, DownloadFailed,
-    ExtractRequest, ExtractResult, GetConfigReq, HttpHtml, HttpRender, IncomingSearch, NetConn,
+    DownloadQueuePosition, ExtractRequest, ExtractResult, GetConfigReq, HttpHtml, HttpRender,
+    IncomingSearch, NetConn,
     NetRx, NetTx, PeerActivity, PeerBrowseConnect, PeerDownloadConnect, PeerPierce,
     PeerDistribConnect, PeerUploadConnect, ResolveUploadPeer, SetConfigReq, SetConfigResult,
     SetExcludedPhrases, SessionEvent, StartDownload, StartSearch, StartSearchResult, UpdateDownloaded,
@@ -78,6 +79,7 @@ rust_messenger::Messenger! {
             Session, DownloadFailed: [ ui ],
             PeerNet, DownloadComplete: [ ui ],
             PeerNet, DownloadFailed: [ ui ],
+            PeerNet, DownloadQueuePosition: [ ui ],
             // uploads: peer_net asks session to resolve the downloader's address,
             // then opens the file connection and streams.
             PeerNet, ResolveUploadPeer: [ session ],

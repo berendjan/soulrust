@@ -69,6 +69,7 @@ rust_messenger::messenger_id_enum!(
         UploadFailed = 37,
         PeerDistribConnect = 38,
         SetExcludedPhrases = 39,
+        DownloadQueuePosition = 40,
     }
 );
 
@@ -411,6 +412,16 @@ pub struct DownloadFailed {
     pub reason: String,
 }
 
+/// peer_net → ui: the uploader's reported position of our queued download
+/// (answer to a PlaceInQueueRequest). `place` is 1-based; 0 means the uploader
+/// no longer has it queued (about to send it, or it was dropped).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadQueuePosition {
+    pub username: String,
+    pub filename: String,
+    pub place: u32,
+}
+
 // ---------------------------------------------------------------------------
 // uploads (serve a file to a peer)
 
@@ -532,6 +543,7 @@ impl_bus_message!(
     UploadFailed => MessageId::UploadFailed,
     PeerDistribConnect => MessageId::PeerDistribConnect,
     SetExcludedPhrases => MessageId::SetExcludedPhrases,
+    DownloadQueuePosition => MessageId::DownloadQueuePosition,
 );
 
 #[cfg(test)]

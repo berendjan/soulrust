@@ -10,9 +10,9 @@ use rust_messenger::traits::extended::Sender;
 
 use crate::config::AppContext;
 use crate::messages::{
-    ConfigChanged, DownloadComplete, DownloadFailed, HandlerId, HttpHtml, HttpRender, Page,
-    PeerActivity, SessionEvent, SessionEventKind, UpdaterStatus, UpdaterStatusChanged,
-    UploadComplete, UploadFailed,
+    ConfigChanged, DownloadComplete, DownloadFailed, DownloadQueuePosition, HandlerId, HttpHtml,
+    HttpRender, Page, PeerActivity, SessionEvent, SessionEventKind, UpdaterStatus,
+    UpdaterStatusChanged, UploadComplete, UploadFailed,
 };
 
 const MAX_LOG_LINES: usize = 100;
@@ -253,6 +253,19 @@ impl traits::core::Handle<DownloadComplete> for Ui {
 impl traits::core::Handle<DownloadFailed> for Ui {
     fn handle<W: traits::core::Writer>(&mut self, message: &DownloadFailed, _writer: &W) {
         self.log(format!("download of {} from {} failed: {}", message.filename, message.username, message.reason));
+    }
+}
+
+impl traits::core::Handle<DownloadQueuePosition> for Ui {
+    fn handle<W: traits::core::Writer>(&mut self, message: &DownloadQueuePosition, _writer: &W) {
+        if message.place == 0 {
+            self.log(format!("{} is starting our download of {}", message.username, message.filename));
+        } else {
+            self.log(format!(
+                "download of {} from {} is at queue position {}",
+                message.filename, message.username, message.place
+            ));
+        }
     }
 }
 

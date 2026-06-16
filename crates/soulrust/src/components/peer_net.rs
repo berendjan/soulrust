@@ -30,8 +30,8 @@ use soulseek_proto::server::{ConnectToPeerRequest, ServerRequest};
 use soulseek_proto::distributed::{self, DistribSearch, DistributedMessage};
 use soulseek_proto::Reader;
 use soulseek_proto::transfer::{
-    FileTransferInit, QueueUpload, TransferDirection, TransferRequest, TransferResponse,
-    UploadDenied,
+    FileTransferInit, PlaceInQueueRequest, PlaceInQueueResponse, QueueUpload, TransferDirection,
+    TransferRequest, TransferResponse, UploadDenied,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -41,12 +41,13 @@ use crate::components::transfer_io;
 use crate::config::AppContext;
 use crate::messages::{
     BrowseDir, BrowseFailed, BrowseFile, BrowseListing, DownloadComplete, DownloadFailed,
-    HandlerId, IncomingSearch, NetTx, PeerActivity, PeerBrowseConnect, PeerDistribConnect,
-    PeerDownloadConnect, PeerPierce, PeerUploadConnect, ResolveUploadPeer, SetExcludedPhrases,
-    UploadComplete, UploadFailed,
+    DownloadQueuePosition, HandlerId, IncomingSearch, NetTx, PeerActivity, PeerBrowseConnect,
+    PeerDistribConnect, PeerDownloadConnect, PeerPierce, PeerUploadConnect, ResolveUploadPeer,
+    SetExcludedPhrases, UploadComplete, UploadFailed,
 };
 use crate::search_response;
 use crate::shares::ShareIndex;
+use crate::transfers::uploads::{TransferId, UploadQueue};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Drop a peer connection that sends nothing for this long, so idle/slow peers
@@ -126,6 +127,9 @@ enum PeerCommand {
     DistribConnect { username: String, ip: String, port: u16 },
     /// Replace the server-supplied excluded-phrase list used to filter responses.
     SetExcludedPhrases { phrases: Vec<String> },
+    /// A connection task received a PlaceInQueueResponse for one of our queued
+    /// downloads; forward the position to the UI (the task has no bus Writer).
+    QueuePosition { username: String, filename: String, place: u32 },
 }
 
 /// Downloads in flight, shared across connections (the negotiation and the file
@@ -162,6 +166,9 @@ struct PendingUpload {
     real_path: PathBuf,
     size: u64,
     approved: bool,
+    /// This upload's slot in the shared [`UploadQueue`], so we can report its
+    /// place-in-queue and remove it from the queue when it starts or is dropped.
+    transfer_id: TransferId,
 }
 
 /// Shared per-reactor state handed to every connection task.
@@ -182,6 +189,10 @@ struct ConnCtx {
     /// search. Updated when the server sends ExcludedSearchPhrases; read on every
     /// search response.
     excluded_phrases: Mutex<Vec<String>>,
+    /// Tracks every upload we have offered but not yet started, in FIFO order, so
+    /// we can answer a downloader's PlaceInQueueRequest and report an honest
+    /// queue depth in search responses.
+    upload_queue: Mutex<UploadQueue>,
 }
 
 /// What a finished connection produced, for the accept loop to report on the bus.
@@ -368,6 +379,7 @@ fn run_reactor<W: traits::core::Writer>(
             cmd_tx,
             next_token: AtomicU32::new(1),
             excluded_phrases: Mutex::new(Vec::new()),
+            upload_queue: Mutex::new(UploadQueue::new(false)),
         });
 
         let listener = match TcpListener::bind(("0.0.0.0", port)).await {
@@ -477,7 +489,11 @@ async fn command_loop<W: traits::core::Writer>(
                 };
                 let offline = ip == "0.0.0.0" || port == 0;
                 for (token, filename, real_path, size) in ready {
-                    ctx.uploads.lock().unwrap().by_token.remove(&token);
+                    // The upload is starting (or failing): take it out of the
+                    // pending registry and its queue slot.
+                    if let Some(starting) = ctx.uploads.lock().unwrap().by_token.remove(&token) {
+                        ctx.upload_queue.lock().unwrap().dequeue(starting.transfer_id);
+                    }
                     if offline {
                         PeerNet::send(
                             &UploadFailed {
@@ -520,7 +536,7 @@ async fn command_loop<W: traits::core::Writer>(
                 // than a hardcoded "always free", so requesters' speed/queue
                 // filters see honest values.
                 let (free_slots, in_queue) =
-                    slot_advertisement(ctx.uploads.lock().unwrap().by_token.len());
+                    slot_advertisement(ctx.upload_queue.lock().unwrap().len());
                 // Matching is CPU-bound (word-index intersection); run it off the
                 // single reactor thread so a burst of network searches can't
                 // head-of-line-block accept / serve / connect dispatch.
@@ -558,6 +574,9 @@ async fn command_loop<W: traits::core::Writer>(
             }
             PeerCommand::SetExcludedPhrases { phrases } => {
                 *ctx.excluded_phrases.lock().unwrap() = phrases;
+            }
+            PeerCommand::QueuePosition { username, filename, place } => {
+                PeerNet::send(&DownloadQueuePosition { username, filename, place }, &writer);
             }
         }
     }
@@ -706,7 +725,10 @@ async fn download_init_task<W: traits::core::Writer>(
     };
     let queued = async {
         stream.write_all(&init.to_frame()).await?;
-        stream.write_all(&QueueUpload { file: filename.clone() }.to_frame()).await
+        stream.write_all(&QueueUpload { file: filename.clone() }.to_frame()).await?;
+        // Ask where we sit in the uploader's queue; the answer (a
+        // PlaceInQueueResponse on this connection) is surfaced to the UI.
+        stream.write_all(&PlaceInQueueRequest { file: filename.clone() }.to_frame()).await
     }
     .await;
     if let Err(err) = queued {
@@ -954,6 +976,7 @@ where
                 match ctx.shares.resolve(&queue.file) {
                     Some((path, size)) => {
                         let token = ctx.next_token.fetch_add(1, Ordering::Relaxed);
+                        let transfer_id = ctx.upload_queue.lock().unwrap().enqueue(&peer);
                         {
                             let mut uploads = ctx.uploads.lock().unwrap();
                             uploads.by_token.insert(
@@ -964,14 +987,18 @@ where
                                     real_path: path.to_owned(),
                                     size,
                                     approved: false,
+                                    transfer_id,
                                 },
                             );
                             // Bound the registry: a peer that offers files and
                             // never approves can't grow it without limit (evict
-                            // the oldest, lowest-token pending upload).
+                            // the oldest, lowest-token pending upload — and drop
+                            // its queue slot so the two stay in lockstep).
                             while uploads.by_token.len() > MAX_PENDING_TRANSFERS {
                                 if let Some(&oldest) = uploads.by_token.keys().min() {
-                                    uploads.by_token.remove(&oldest);
+                                    if let Some(evicted) = uploads.by_token.remove(&oldest) {
+                                        ctx.upload_queue.lock().unwrap().dequeue(evicted.transfer_id);
+                                    }
                                 } else {
                                     break;
                                 }
@@ -1005,7 +1032,10 @@ where
                             true
                         }
                         Some(_) => {
-                            uploads.by_token.remove(&response.token);
+                            // Rejected: drop the offer and its queue slot together.
+                            if let Some(rejected) = uploads.by_token.remove(&response.token) {
+                                ctx.upload_queue.lock().unwrap().dequeue(rejected.transfer_id);
+                            }
                             false
                         }
                         None => false,
@@ -1057,6 +1087,34 @@ where
                         reason: "upload failed".into(),
                     });
                 }
+            }
+            PeerMessage::PlaceInQueueRequest(req) => {
+                // A downloader asks where its queued file sits. Report the FIFO
+                // position of the upload we offered this peer for that file, or 0
+                // if it is no longer queued (about to be sent / already dropped).
+                let place = {
+                    let uploads = ctx.uploads.lock().unwrap();
+                    let tid = uploads
+                        .by_token
+                        .values()
+                        .find(|u| u.username == peer && u.filename == req.file)
+                        .map(|u| u.transfer_id);
+                    tid.map(|id| ctx.upload_queue.lock().unwrap().place_in_queue(id) as u32)
+                        .unwrap_or(0)
+                };
+                stream
+                    .write_all(&PlaceInQueueResponse { filename: req.file.clone(), place }.to_frame())
+                    .await?;
+                on_activity(format!("told {peer} {} is at queue place {place}", req.file));
+            }
+            PeerMessage::PlaceInQueueResponse(resp) => {
+                // We are the downloader: surface where our queued download sits.
+                // The task has no bus Writer, so route it through the reactor.
+                let _ = ctx.cmd_tx.send(PeerCommand::QueuePosition {
+                    username: peer.clone(),
+                    filename: resp.filename,
+                    place: resp.place,
+                });
             }
             _ => {} // not-yet-handled messages
         }
@@ -1373,6 +1431,7 @@ mod tests {
             cmd_tx,
             next_token: AtomicU32::new(1),
             excluded_phrases: Mutex::new(Vec::new()),
+            upload_queue: Mutex::new(UploadQueue::new(false)),
         })
     }
 
@@ -1586,6 +1645,7 @@ mod tests {
                 cmd_tx,
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
+                upload_queue: Mutex::new(UploadQueue::new(false)),
             });
             ctx.downloads.lock().unwrap().by_token.insert(
                 42,
@@ -1717,6 +1777,7 @@ mod tests {
                 cmd_tx,
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
+                upload_queue: Mutex::new(UploadQueue::new(false)),
             });
             ctx.downloads.lock().unwrap().by_token.insert(
                 7,
@@ -1845,6 +1906,7 @@ mod tests {
                 cmd_tx,
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
+                upload_queue: Mutex::new(UploadQueue::new(false)),
             });
             ctx.downloads.lock().unwrap().by_token.insert(
                 42,
@@ -2022,6 +2084,7 @@ mod tests {
                 cmd_tx,
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
+                upload_queue: Mutex::new(UploadQueue::new(false)),
             });
             let serve = tokio::spawn(async move {
                 serve_distrib(&mut server, &ctx, "parent", &mut |_| {}).await
@@ -2067,7 +2130,9 @@ mod tests {
                 cmd_tx,
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
+                upload_queue: Mutex::new(UploadQueue::new(false)),
             });
+            let tid = ctx.upload_queue.lock().unwrap().enqueue("bob");
             ctx.uploads.lock().unwrap().by_token.insert(
                 5,
                 PendingUpload {
@@ -2076,6 +2141,7 @@ mod tests {
                     real_path: "/tmp/song.mp3".into(),
                     size: 4096,
                     approved: false,
+                    transfer_id: tid,
                 },
             );
 
@@ -2095,6 +2161,155 @@ mod tests {
             match cmd_rx.try_recv() {
                 Ok(PeerCommand::StartUpload { username }) => assert_eq!(username, "bob"),
                 other => panic!("expected StartUpload, got {:?}", other.is_ok()),
+            }
+        });
+    }
+
+    #[test]
+    fn answers_place_in_queue_with_the_real_position() {
+        // A PlaceInQueueRequest gets the FIFO position of the matching offered
+        // upload — here the second of two queued for this peer.
+        runtime().block_on(async {
+            let (mut client, server) = tokio::io::duplex(64 * 1024);
+            let ctx = test_ctx();
+            let _first = ctx.upload_queue.lock().unwrap().enqueue("bob");
+            let second = ctx.upload_queue.lock().unwrap().enqueue("bob");
+            ctx.uploads.lock().unwrap().by_token.insert(
+                2,
+                PendingUpload {
+                    username: "bob".into(),
+                    filename: "Music\\b.mp3".into(),
+                    real_path: "/tmp/b.mp3".into(),
+                    size: 10,
+                    approved: false,
+                    transfer_id: second,
+                },
+            );
+            let ctx_serve = ctx.clone();
+            let serve = tokio::spawn(async move {
+                serve_connection(server, &ctx_serve, Some("bob".into()), |_| {}).await
+            });
+
+            client
+                .write_all(&PlaceInQueueRequest { file: "Music\\b.mp3".into() }.to_frame())
+                .await
+                .unwrap();
+            let reply = PeerMessage::decode(&read_one_frame(&mut client).await).unwrap();
+            let PeerMessage::PlaceInQueueResponse(resp) = reply else {
+                panic!("expected a place-in-queue response");
+            };
+            assert_eq!(resp.filename, "Music\\b.mp3");
+            assert_eq!(resp.place, 2, "second in the queue");
+            drop(client);
+            serve.await.unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn place_in_queue_is_zero_for_an_unoffered_file() {
+        // No matching offered upload -> position 0 ("not queued").
+        runtime().block_on(async {
+            let (mut client, server) = tokio::io::duplex(64 * 1024);
+            let ctx = test_ctx();
+            let ctx_serve = ctx.clone();
+            let serve = tokio::spawn(async move {
+                serve_connection(server, &ctx_serve, Some("bob".into()), |_| {}).await
+            });
+
+            client
+                .write_all(&PlaceInQueueRequest { file: "Music\\never-offered.mp3".into() }.to_frame())
+                .await
+                .unwrap();
+            let reply = PeerMessage::decode(&read_one_frame(&mut client).await).unwrap();
+            let PeerMessage::PlaceInQueueResponse(resp) = reply else {
+                panic!("expected a place-in-queue response");
+            };
+            assert_eq!(resp.place, 0);
+            drop(client);
+            serve.await.unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn queue_upload_enqueues_and_rejection_dequeues() {
+        // QueueUpload for a shared file enqueues it (so place-in-queue is real);
+        // a downloader's rejection removes both the offer and its queue slot.
+        use soulseek_proto::transfer::TransferResponse;
+        runtime().block_on(async {
+            let (mut client, server) = tokio::io::duplex(64 * 1024);
+            let ctx = test_ctx();
+            let ctx_serve = ctx.clone();
+            let serve = tokio::spawn(async move {
+                serve_connection(server, &ctx_serve, Some("bob".into()), |_| {}).await
+            });
+
+            // Offer one of our shared files; the queue now holds it.
+            client
+                .write_all(&QueueUpload { file: "Music\\Album\\song.mp3".into() }.to_frame())
+                .await
+                .unwrap();
+            let reply = PeerMessage::decode(&read_one_frame(&mut client).await).unwrap();
+            let PeerMessage::TransferRequest(req) = reply else { panic!("expected transfer request") };
+            assert_eq!(ctx.upload_queue.lock().unwrap().len(), 1, "offer is queued");
+
+            // Reject it; the queue slot is released.
+            client
+                .write_all(
+                    &TransferResponse {
+                        token: req.token,
+                        allowed: false,
+                        filesize: None,
+                        reason: Some("not now".into()),
+                    }
+                    .to_frame(),
+                )
+                .await
+                .unwrap();
+            drop(client);
+            serve.await.unwrap().unwrap();
+            assert_eq!(ctx.upload_queue.lock().unwrap().len(), 0, "rejection dequeues");
+        });
+    }
+
+    #[test]
+    fn place_in_queue_response_is_forwarded_to_the_ui() {
+        // As the downloader, an inbound PlaceInQueueResponse is relayed to the
+        // reactor (which turns it into a DownloadQueuePosition for the UI).
+        runtime().block_on(async {
+            let (mut client, server) = tokio::io::duplex(64 * 1024);
+            let (cmd_tx, mut cmd_rx) = unbounded_channel();
+            let ctx = Arc::new(ConnCtx {
+                shares: Arc::new(test_index()),
+                queue: Arc::new(Mutex::new(PendingDeliveries::default())),
+                downloads: Mutex::new(Downloads::default()),
+                uploads: Mutex::new(Uploads::default()),
+                our_username: "me".into(),
+                download_dir: std::env::temp_dir(),
+                incomplete_dir: std::env::temp_dir(),
+                cmd_tx,
+                next_token: AtomicU32::new(1),
+                excluded_phrases: Mutex::new(Vec::new()),
+                upload_queue: Mutex::new(UploadQueue::new(false)),
+            });
+            let ctx_serve = ctx.clone();
+            let serve = tokio::spawn(async move {
+                serve_connection(server, &ctx_serve, Some("alice".into()), |_| {}).await
+            });
+
+            client
+                .write_all(
+                    &PlaceInQueueResponse { filename: "Music\\x.mp3".into(), place: 3 }.to_frame(),
+                )
+                .await
+                .unwrap();
+            drop(client);
+            serve.await.unwrap().unwrap();
+
+            match cmd_rx.try_recv() {
+                Ok(PeerCommand::QueuePosition { username, filename, place }) => {
+                    assert_eq!((username.as_str(), filename.as_str(), place), ("alice", "Music\\x.mp3", 3));
+                }
+                other => panic!("expected QueuePosition, got ok={}", other.is_ok()),
             }
         });
     }

@@ -97,8 +97,12 @@ where
         ));
     }
     stream.write_all(&FileOffset { offset }.to_bytes()).await?;
-    let received = copy_exact(stream, &mut sink, expected_size - offset).await?;
+    // Flush whatever we received even if the transfer ends early: tokio's File
+    // buffers writes, and a dropped buffer would lose the partial we need on disk
+    // to resume later. Persist first, then surface any short-transfer error.
+    let copied = copy_exact(stream, &mut sink, expected_size - offset).await;
     sink.flush().await?;
+    let received = copied?;
     Ok(received)
 }
 

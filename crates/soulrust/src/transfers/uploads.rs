@@ -73,6 +73,25 @@ impl UploadQueue {
         self.len() == 0
     }
 
+    /// The 1-based position of a still-queued transfer among all queued
+    /// transfers, in insertion (FIFO) order — the value a downloader's
+    /// `PlaceInQueueRequest` expects. Returns 0 if `id` is no longer queued
+    /// (already activated, finished, or never queued), which a downloader reads
+    /// as "not waiting".
+    pub fn place_in_queue(&self, id: TransferId) -> usize {
+        let still_queued = id < self.usernames.len()
+            && self
+                .queued_users
+                .get(&self.usernames[id])
+                .is_some_and(|ids| ids.contains(&id));
+        if !still_queued {
+            return 0;
+        }
+        // ids increase with insertion, so the FIFO rank is how many queued ids
+        // precede this one.
+        self.queued_users.values().flatten().filter(|&&other| other < id).count() + 1
+    }
+
     /// Enqueue a new upload for `username`. Mirrors `_enqueue_transfer` followed
     /// by `_update_transfer`.
     pub fn enqueue(&mut self, username: &str) -> TransferId {
@@ -384,5 +403,33 @@ mod tests {
             false,
             false,
         );
+    }
+
+    #[test]
+    fn place_in_queue_is_fifo_rank_among_queued() {
+        let mut q = UploadQueue::new(false);
+        let a = q.enqueue("alice"); // 1st queued
+        let b = q.enqueue("bob"); // 2nd
+        let c = q.enqueue("alice"); // 3rd
+
+        assert_eq!(q.place_in_queue(a), 1);
+        assert_eq!(q.place_in_queue(b), 2);
+        assert_eq!(q.place_in_queue(c), 3);
+
+        // Dequeueing the head shifts everyone behind it forward by one.
+        q.dequeue(a);
+        assert_eq!(q.place_in_queue(a), 0, "a is no longer queued");
+        assert_eq!(q.place_in_queue(b), 1);
+        assert_eq!(q.place_in_queue(c), 2);
+    }
+
+    #[test]
+    fn place_in_queue_is_zero_for_unknown_or_active() {
+        let mut q = UploadQueue::new(false);
+        assert_eq!(q.place_in_queue(999), 0, "never-seen id");
+        let a = q.enqueue("alice");
+        q.dequeue(a);
+        q.activate(a);
+        assert_eq!(q.place_in_queue(a), 0, "active transfer is not queued");
     }
 }
