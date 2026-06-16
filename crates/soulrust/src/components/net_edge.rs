@@ -6,9 +6,11 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::mpsc;
+use std::time::Duration;
 
 use rust_messenger::traits;
 use rust_messenger::traits::extended::Sender;
+use socket2::{SockRef, TcpKeepalive};
 use soulseek_proto::frame::split_frame;
 
 use crate::config::AppContext;
@@ -75,6 +77,13 @@ fn connect_and_read<W: traits::core::Writer>(
         }
     };
 
+    // Best-effort socket tuning (non-fatal): like Nicotine+'s server connection,
+    // disable Nagle for prompt control messages and enable TCP keepalive so a
+    // silently dropped server link surfaces instead of hanging.
+    if let Err(err) = configure_server_socket(&stream) {
+        eprintln!("[net-edge] socket tuning failed: {err}");
+    }
+
     match stream.try_clone() {
         Ok(write_half) => {
             // The handler picks this up on its first NetTx.
@@ -132,6 +141,35 @@ fn connect_and_read<W: traits::core::Writer>(
 /// Connection-event helper for the reader thread (which has no &self).
 fn send_conn<W: traits::core::Writer>(event: NetConnEvent, writer: &W) {
     NetEdge::send(&NetConn { event }, writer);
+}
+
+/// Apply the server-connection socket options (TCP_NODELAY + keepalive),
+/// mirroring the tuning Nicotine+ applies in its network thread.
+fn configure_server_socket(stream: &TcpStream) -> std::io::Result<()> {
+    stream.set_nodelay(true)?;
+    let sock = SockRef::from(stream);
+    sock.set_tcp_keepalive(&TcpKeepalive::new().with_time(Duration::from_secs(60)))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn configures_nodelay_and_keepalive_on_the_server_socket() {
+        // Port of Nicotine+'s test_server_conn socket-option assertions: connect
+        // to a local listener, apply the tuning, and confirm it took (nodelay is
+        // the readable one; keepalive must at least apply without error).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(addr).unwrap();
+
+        configure_server_socket(&stream).unwrap();
+
+        assert!(stream.nodelay().unwrap(), "Nagle must be disabled on the server socket");
+    }
 }
 
 impl traits::core::Handle<NetTx> for NetEdge {

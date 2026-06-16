@@ -17,6 +17,7 @@ rust_library(
         "@crates//:serde",
         "@crates//:serde_json",
         "@crates//:serde_yaml",
+        "@crates//:socket2",
         "@crates//:tiny_http",
         "@crates//:tokio",
         "@crates//:ureq",

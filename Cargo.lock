@@ -1812,6 +1812,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "socket2",
  "soulseek-proto",
  "tiny_http",
  "tokio",
