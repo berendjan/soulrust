@@ -7,18 +7,20 @@ use std::collections::{HashMap, HashSet};
 
 use rust_messenger::traits;
 use rust_messenger::traits::extended::Sender;
+use soulseek_proto::distributed::{self, DistribSearch};
 use soulseek_proto::peer::ConnectionType;
 use soulseek_proto::server::{
-    FileSearchRequest, GetPeerAddressRequest, LoginRequest, ServerMessage, ServerRequest,
-    SetWaitPort,
+    BranchLevel, BranchRoot, FileSearchRequest, GetPeerAddressRequest, LoginRequest, ServerMessage,
+    ServerRequest, SetWaitPort,
 };
+use soulseek_proto::Reader;
 
 use crate::config::AppContext;
 use crate::messages::{
     BrowseAccepted, BrowseFailed, BrowseUser, DownloadFailed, HandlerId, IncomingSearch, NetConn,
-    NetConnEvent, NetRx, NetTx, PeerBrowseConnect, PeerDownloadConnect, PeerPierce,
-    PeerUploadConnect, ResolveUploadPeer, SessionEvent, SessionEventKind, StartDownload,
-    StartSearch, StartSearchResult, StartedSearch,
+    NetConnEvent, NetRx, NetTx, PeerBrowseConnect, PeerDistribConnect, PeerDownloadConnect,
+    PeerPierce, PeerUploadConnect, ResolveUploadPeer, SessionEvent, SessionEventKind,
+    StartDownload, StartSearch, StartSearchResult, StartedSearch,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +130,13 @@ impl traits::core::Handle<NetRx> for Session {
                     obfuscated_port: 0,
                 };
                 Self::send(&NetTx { frame: wait_port.to_frame() }, writer);
+                // Declare our position in the distributed search tree: until we
+                // adopt a parent we are our own branch root at level 0.
+                Self::send(&NetTx { frame: BranchLevel { level: 0 }.to_frame() }, writer);
+                Self::send(
+                    &NetTx { frame: BranchRoot { root: self.username.clone() }.to_frame() },
+                    writer,
+                );
                 Self::emit(
                     SessionEventKind::LoggedIn { greeting, own_ip: own_ip.to_string() },
                     writer,
@@ -162,6 +171,41 @@ impl traits::core::Handle<NetRx> for Session {
                     },
                     writer,
                 );
+            }
+            ServerMessage::EmbeddedMessage(embedded) => {
+                // We're a branch root: the server injects distributed searches
+                // directly. Respond to them like any other search.
+                if embedded.distrib_code == distributed::code::SEARCH {
+                    if let Ok(search) =
+                        DistribSearch::decode(&mut Reader::new(&embedded.distrib_message))
+                    {
+                        Self::send(
+                            &IncomingSearch {
+                                username: search.username,
+                                token: search.token,
+                                query: search.query,
+                            },
+                            writer,
+                        );
+                    }
+                }
+            }
+            ServerMessage::PossibleParents(possible) => {
+                // Try to adopt the first candidate as our distributed parent;
+                // peer_net opens the D connection.
+                if let Some(parent) = possible.parents.into_iter().next() {
+                    Self::send(
+                        &PeerDistribConnect {
+                            username: parent.username,
+                            ip: parent.ip.to_string(),
+                            port: parent.port as u16,
+                        },
+                        writer,
+                    );
+                }
+            }
+            ServerMessage::ParentMinSpeed(_) | ServerMessage::ParentSpeedRatio(_) => {
+                // Eligibility/limits — informational for now.
             }
             ServerMessage::GetPeerAddress(response) => {
                 // 0.0.0.0:0 is the server's way of saying "unknown/offline".
@@ -501,6 +545,10 @@ mod tests {
             self.decode(MessageId::DownloadFailed, DownloadFailed::deserialize_from)
         }
 
+        fn distrib_connects(&self) -> Vec<PeerDistribConnect> {
+            self.decode(MessageId::PeerDistribConnect, PeerDistribConnect::deserialize_from)
+        }
+
         fn decode<T>(&self, id: MessageId, f: impl Fn(&[u8]) -> T) -> Vec<T> {
             self.records
                 .lock()
@@ -576,7 +624,7 @@ mod tests {
         session.handle(&NetRx { payload: login_success_payload() }, &writer);
 
         let frames = writer.frames();
-        assert_eq!(frames.len(), 2, "login + set wait port");
+        assert_eq!(frames.len(), 4, "login + set wait port + branch level + branch root");
         let expected_wait_port =
             SetWaitPort { port: 2234, obfuscation_type: 0, obfuscated_port: 0 }.to_frame();
         assert_eq!(frames[1], expected_wait_port);
@@ -651,10 +699,10 @@ mod tests {
         );
 
         let frames = writer.frames();
-        // login + wait port + 2 searches
-        assert_eq!(frames.len(), 4);
-        assert_eq!(frames[2], FileSearchRequest { token: 1, query: "A One".into() }.to_frame());
-        assert_eq!(frames[3], FileSearchRequest { token: 2, query: "B Two".into() }.to_frame());
+        // login + wait port + branch level + branch root + 2 searches
+        assert_eq!(frames.len(), 6);
+        assert_eq!(frames[4], FileSearchRequest { token: 1, query: "A One".into() }.to_frame());
+        assert_eq!(frames[5], FileSearchRequest { token: 2, query: "B Two".into() }.to_frame());
 
         let results = writer.search_results();
         assert_eq!(results[0].started.len(), 2);
@@ -772,6 +820,67 @@ mod tests {
             .events()
             .iter()
             .any(|e| matches!(e, SessionEventKind::ProtocolNote { note } if note.contains("stranger"))));
+    }
+
+    #[test]
+    fn login_declares_our_branch_position() {
+        // On login we tell the server we're our own branch root at level 0.
+        let writer = CapturingWriter::default();
+        let _session = logged_in_session(&writer);
+        let frames = writer.frames();
+        assert!(
+            frames.contains(&BranchLevel { level: 0 }.to_frame()),
+            "BranchLevel(0) sent on login"
+        );
+        assert!(
+            frames.contains(&BranchRoot { root: "testuser".into() }.to_frame()),
+            "BranchRoot(self) sent on login"
+        );
+    }
+
+    #[test]
+    fn embedded_distributed_search_is_forwarded_for_response() {
+        use soulseek_proto::wire::{put_string, put_u32, put_u8};
+        let writer = CapturingWriter::default();
+        let mut session = logged_in_session(&writer);
+
+        // Server EmbeddedMessage (code 93): u8 inner code 3 (DistribSearch) then
+        // its body (identifier=49, username, token, query).
+        let mut body = Vec::new();
+        put_u32(&mut body, 93); // EmbeddedMessage
+        put_u8(&mut body, 3); // inner DistribSearch
+        put_u32(&mut body, 49); // identifier (ASCII '1')
+        put_string(&mut body, "searcher");
+        put_u32(&mut body, 0x4242);
+        put_string(&mut body, "distributed query");
+        session.handle(&NetRx { payload: body }, &writer);
+
+        let searches = writer.incoming_searches();
+        assert_eq!(searches.len(), 1, "the embedded distributed search is responded to");
+        assert_eq!(searches[0].username, "searcher");
+        assert_eq!(searches[0].token, 0x4242);
+        assert_eq!(searches[0].query, "distributed query");
+    }
+
+    #[test]
+    fn possible_parents_triggers_a_distrib_connect() {
+        use soulseek_proto::wire::{put_ipv4, put_string, put_u32};
+        let writer = CapturingWriter::default();
+        let mut session = logged_in_session(&writer);
+
+        let mut body = Vec::new();
+        put_u32(&mut body, 102); // PossibleParents
+        put_u32(&mut body, 1); // one parent
+        put_string(&mut body, "parent1");
+        put_ipv4(&mut body, Ipv4Addr::new(10, 0, 0, 1));
+        put_u32(&mut body, 2234);
+        session.handle(&NetRx { payload: body }, &writer);
+
+        let connects = writer.distrib_connects();
+        assert_eq!(connects.len(), 1);
+        assert_eq!(connects[0].username, "parent1");
+        assert_eq!(connects[0].ip, "10.0.0.1");
+        assert_eq!(connects[0].port, 2234);
     }
 
     #[test]

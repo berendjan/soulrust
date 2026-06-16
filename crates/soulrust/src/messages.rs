@@ -67,6 +67,7 @@ rust_messenger::messenger_id_enum!(
         PeerUploadConnect = 35,
         UploadComplete = 36,
         UploadFailed = 37,
+        PeerDistribConnect = 38,
     }
 );
 
@@ -435,6 +436,18 @@ pub struct UploadFailed {
 }
 
 // ---------------------------------------------------------------------------
+// distributed search network
+
+/// session → peer_net: a candidate parent (from the server's PossibleParents) to
+/// open a distributed (`D`) connection to. A location, not data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerDistribConnect {
+    pub username: String,
+    pub ip: String,
+    pub port: u16,
+}
+
+// ---------------------------------------------------------------------------
 // bus plumbing: Message + ExtendedMessage + deserialize_from for every type
 
 macro_rules! impl_bus_message {
@@ -507,6 +520,7 @@ impl_bus_message!(
     PeerUploadConnect => MessageId::PeerUploadConnect,
     UploadComplete => MessageId::UploadComplete,
     UploadFailed => MessageId::UploadFailed,
+    PeerDistribConnect => MessageId::PeerDistribConnect,
 );
 
 #[cfg(test)]

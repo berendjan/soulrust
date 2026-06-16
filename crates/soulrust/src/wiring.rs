@@ -21,9 +21,9 @@ use crate::messages::{
     BrowseRenderReq, BrowseUser, ConfigChanged, ConfigSnapshot, DownloadComplete, DownloadFailed,
     ExtractRequest, ExtractResult, GetConfigReq, HttpHtml, HttpRender, IncomingSearch, NetConn,
     NetRx, NetTx, PeerActivity, PeerBrowseConnect, PeerDownloadConnect, PeerPierce,
-    PeerUploadConnect, ResolveUploadPeer, SetConfigReq, SetConfigResult, SessionEvent,
-    StartDownload, StartSearch, StartSearchResult, UpdateDownloaded, UpdaterStatusChanged,
-    UploadComplete, UploadFailed,
+    PeerDistribConnect, PeerUploadConnect, ResolveUploadPeer, SetConfigReq, SetConfigResult,
+    SessionEvent, StartDownload, StartSearch, StartSearchResult, UpdateDownloaded,
+    UpdaterStatusChanged, UploadComplete, UploadFailed,
 };
 
 rust_messenger::Messenger! {
@@ -83,6 +83,8 @@ rust_messenger::Messenger! {
             Session, PeerUploadConnect: [ peer_net ],
             PeerNet, UploadComplete: [ ui ],
             PeerNet, UploadFailed: [ ui ],
+            // distributed search tree: session adopts a parent -> peer_net D conn
+            Session, PeerDistribConnect: [ peer_net ],
             // peer network edge: serving activity -> ui log
             PeerNet, PeerActivity: [ ui ],
             // broadcasts

@@ -27,6 +27,8 @@ use soulseek_proto::peer_message::{
     FileSearchResponse, GetSharedFileList, PeerMessage, SharedFileListResponse, UserInfoResponse,
 };
 use soulseek_proto::server::{ConnectToPeerRequest, ServerRequest};
+use soulseek_proto::distributed::{self, DistribSearch, DistributedMessage};
+use soulseek_proto::Reader;
 use soulseek_proto::transfer::{
     FileTransferInit, QueueUpload, TransferDirection, TransferRequest, TransferResponse,
     UploadDenied,
@@ -39,8 +41,9 @@ use crate::components::transfer_io;
 use crate::config::AppContext;
 use crate::messages::{
     BrowseDir, BrowseFailed, BrowseFile, BrowseListing, DownloadComplete, DownloadFailed,
-    HandlerId, IncomingSearch, NetTx, PeerActivity, PeerBrowseConnect, PeerDownloadConnect,
-    PeerPierce, PeerUploadConnect, ResolveUploadPeer, UploadComplete, UploadFailed,
+    HandlerId, IncomingSearch, NetTx, PeerActivity, PeerBrowseConnect, PeerDistribConnect,
+    PeerDownloadConnect, PeerPierce, PeerUploadConnect, ResolveUploadPeer, UploadComplete,
+    UploadFailed,
 };
 use crate::search_response;
 use crate::shares::ShareIndex;
@@ -119,6 +122,8 @@ enum PeerCommand {
     StartUpload { username: String },
     /// session resolved the address; open the file connection(s) and stream.
     UploadConnect { username: String, ip: String, port: u16 },
+    /// Adopt a distributed parent: open a `D` connection and relay its searches.
+    DistribConnect { username: String, ip: String, port: u16 },
 }
 
 /// Downloads in flight, shared across connections (the negotiation and the file
@@ -301,6 +306,16 @@ impl traits::core::Handle<PeerUploadConnect> for PeerNet {
     }
 }
 
+impl traits::core::Handle<PeerDistribConnect> for PeerNet {
+    fn handle<W: traits::core::Writer>(&mut self, message: &PeerDistribConnect, _writer: &W) {
+        let _ = self.cmd_tx.send(PeerCommand::DistribConnect {
+            username: message.username.clone(),
+            ip: message.ip.clone(),
+            port: message.port,
+        });
+    }
+}
+
 /// One-time/low-frequency status onto the bus (listener bound, fatal errors).
 /// Per-connection activity goes to stderr — it is peer-driven and must never
 /// outrun the bounded bus reader.
@@ -423,6 +438,10 @@ async fn command_loop<W: traits::core::Writer>(
                 let ctx = ctx.clone();
                 let writer = writer.clone();
                 tokio::spawn(download_init_task(ip, port, peer, filename, size, ctx, writer));
+            }
+            PeerCommand::DistribConnect { username: peer, ip, port } => {
+                let ctx = ctx.clone();
+                tokio::spawn(distrib_task(ip, port, peer, ctx));
             }
             PeerCommand::StartUpload { username: peer } => {
                 // A downloader approved an upload; ask session to resolve their
@@ -794,6 +813,11 @@ where
                         // this peer-init username).
                         return recv_file(&mut stream, ctx, &init.username, &mut on_activity).await;
                     }
+                    if init.connection_type == ConnectionType::Distributed {
+                        // A distributed child connected to us; relay searches.
+                        serve_distrib(&mut stream, ctx, &init.username, &mut on_activity).await?;
+                        return Ok(ConnOutcome::Done);
+                    }
                     (init.username, Vec::new())
                 }
                 Ok(PeerInitMessage::PierceFirewall(pierce)) => {
@@ -1092,6 +1116,75 @@ where
         .await
         .map_err(|e| format!("move to final: {e}"))?;
     Ok(final_path.display().to_string())
+}
+
+/// Relays a distributed (`D`) connection's searches: reads distributed frames
+/// and, for each `DistribSearch` (or an embedded one), feeds it into the same
+/// responder path as a server search via the reactor command channel. Used for
+/// both a parent we adopt and a child that connects to us.
+async fn serve_distrib<S, F>(
+    stream: &mut S,
+    ctx: &ConnCtx,
+    peer: &str,
+    on_activity: &mut F,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: FnMut(String),
+{
+    on_activity(format!("distributed peer {peer} connected"));
+    while let Some(payload) =
+        read_frame_timeout(stream, MAX_PEER_MESSAGE_LEN, PEER_IDLE_TIMEOUT).await?
+    {
+        let search = match DistributedMessage::decode(&payload) {
+            Ok(DistributedMessage::Search(search)) => Some(search),
+            Ok(DistributedMessage::Embedded(embedded))
+                if embedded.inner_code == distributed::code::SEARCH =>
+            {
+                DistribSearch::decode(&mut Reader::new(&embedded.inner_message)).ok()
+            }
+            Ok(_) => None,  // ping / branch level / root — informational
+            Err(_) => break, // undecodable frame; drop the connection
+        };
+        if let Some(search) = search {
+            // Respond like a server search (and, once child forwarding lands,
+            // this is where we'd relay it onward).
+            let _ = ctx.cmd_tx.send(PeerCommand::IncomingSearch {
+                username: search.username,
+                token: search.token,
+                query: search.query,
+            });
+            on_activity(format!("relayed a distributed search from {peer}"));
+        }
+    }
+    Ok(())
+}
+
+/// Adopt a distributed parent: dial it, send our peer-init for a `D` connection,
+/// then relay the searches it sends down to us.
+async fn distrib_task(ip: String, port: u16, peer: String, ctx: Arc<ConnCtx>) {
+    let mut stream = match connect(&ip, port).await {
+        Ok(stream) => stream,
+        Err(err) => {
+            eprintln!("[peer-net] distrib connect {ip}:{port} failed: {err}");
+            return;
+        }
+    };
+    let init = PeerInit {
+        username: ctx.our_username.clone(),
+        connection_type: ConnectionType::Distributed,
+        token: 0,
+    };
+    if let Err(err) = stream.write_all(&init.to_frame()).await {
+        eprintln!("[peer-net] distrib init to {peer} failed: {err}");
+        return;
+    }
+    let result =
+        serve_distrib(&mut stream, &ctx, &peer, &mut |note| eprintln!("[peer-net distrib {peer}] {note}"))
+            .await;
+    if let Err(err) = result {
+        eprintln!("[peer-net distrib {peer}] ended: {err}");
+    }
 }
 
 /// Maps a decoded share list to the bus message, capping the forwarded listing
@@ -1551,6 +1644,50 @@ mod tests {
                 Some(5),
                 "our recorded size is used, not the uploader's filesize"
             );
+        });
+    }
+
+    #[test]
+    fn serve_distrib_responds_to_a_distributed_search() {
+        // A DistribSearch on a D connection is fed into the responder path via a
+        // PeerCommand::IncomingSearch (same as a server search).
+        use soulseek_proto::distributed::{DistribSearch, SEARCH_IDENTIFIER};
+        runtime().block_on(async {
+            let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+            let (cmd_tx, mut cmd_rx) = unbounded_channel();
+            let ctx = Arc::new(ConnCtx {
+                shares: Arc::new(test_index()),
+                queue: Arc::new(Mutex::new(PendingDeliveries::default())),
+                downloads: Mutex::new(Downloads::default()),
+                uploads: Mutex::new(Uploads::default()),
+                our_username: "me".into(),
+                download_dir: std::env::temp_dir(),
+                incomplete_dir: std::env::temp_dir(),
+                cmd_tx,
+                next_token: AtomicU32::new(1),
+            });
+            let serve = tokio::spawn(async move {
+                serve_distrib(&mut server, &ctx, "parent", &mut |_| {}).await
+            });
+
+            let search = DistribSearch {
+                identifier: SEARCH_IDENTIFIER,
+                username: "searcher".into(),
+                token: 7,
+                query: "jazz".into(),
+            };
+            client.write_all(&search.to_frame()).await.unwrap();
+            drop(client);
+            serve.await.unwrap().unwrap();
+
+            match cmd_rx.try_recv() {
+                Ok(PeerCommand::IncomingSearch { username, token, query }) => {
+                    assert_eq!(username, "searcher");
+                    assert_eq!(token, 7);
+                    assert_eq!(query, "jazz");
+                }
+                _ => panic!("expected an IncomingSearch from the distributed search"),
+            }
         });
     }
 
