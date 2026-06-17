@@ -18,11 +18,13 @@ use crate::config::ConfigStore;
 use crate::extract::ExtractorComponent;
 use crate::messages::{
     ApplyUpdateReq, ApplyUpdateResult, BrowseAccepted, BrowseFailed, BrowseHtml, BrowseListing,
-    BrowseRenderReq, BrowseUser, ConfigChanged, ConfigSnapshot, DownloadComplete, DownloadFailed,
+    BrowseRenderReq, BrowseUser, CancelDownload, ConfigChanged, ConfigSnapshot, DownloadComplete,
+    DownloadFailed,
     DownloadQueuePosition, ExtractRequest, ExtractResult, GetConfigReq, HttpHtml, HttpRender,
     IncomingSearch, NetConn,
-    NetRx, NetTx, PeerActivity, PeerBrowseConnect, PeerDownloadConnect, PeerPierce,
-    PeerDistribConnect, PeerUploadConnect, ResolveUploadPeer, SearchResultReceived, SetConfigReq,
+    NetRx, NetTx, PeerActivity, PeerBrowseConnect, PeerDownloadConnect, PeerPierce, PeerPierceDistrib,
+    PeerPierceFile, PeerDistribConnect, PeerUploadConnect, ResolveUploadPeer, SearchResultReceived,
+    SetConfigReq,
     SetConfigResult, SetExcludedPhrases, SessionEvent, StartDownload, StartSearch, StartSearchResult,
     UpdateDownloaded,
     UpdaterStatusChanged, UploadComplete, UploadFailed,
@@ -74,10 +76,13 @@ rust_messenger::Messenger! {
             Session, IncomingSearch: [ peer_net ],
             Session, SetExcludedPhrases: [ peer_net ],
             Session, PeerPierce: [ peer_net ],
+            Session, PeerPierceFile: [ peer_net ],
+            Session, PeerPierceDistrib: [ peer_net ],
             // requesting: filtered inbound search results -> ui
             PeerNet, SearchResultReceived: [ ui ],
             // downloads: bridge -> session resolves address -> peer_net -> ui log
-            WebBridge, StartDownload: [ session ],
+            WebBridge, StartDownload: [ session, ui ],
+            WebBridge, CancelDownload: [ ui, peer_net ],
             Session, PeerDownloadConnect: [ peer_net ],
             Session, DownloadFailed: [ ui ],
             PeerNet, DownloadComplete: [ ui ],

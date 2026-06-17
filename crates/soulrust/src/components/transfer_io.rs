@@ -51,12 +51,23 @@ where
 /// and writes the remaining `size - offset` bytes. Returns the number of bytes
 /// sent. A file shorter than the advertised `size` errors rather than silently
 /// short-transferring (the peer would otherwise wait for bytes that never come).
-pub async fn upload<S>(stream: &mut S, token: u32, mut file: File, size: u64) -> io::Result<u64>
+pub async fn upload<S>(stream: &mut S, token: u32, file: File, size: u64) -> io::Result<u64>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     stream.write_all(&FileTransferInit { token }.to_bytes()).await?;
+    stream_from_offset(stream, file, size).await
+}
 
+/// The second half of an upload, for when the `FileTransferInit` token has
+/// already been exchanged: read the peer's `FileOffset`, seek there, and stream
+/// the remaining `size - offset` bytes. This is the whole upload when *the
+/// downloader* opened the file connection (it sent the token, so we must not
+/// send it again) — the `TransferRequest{Download}` request path.
+pub async fn stream_from_offset<S>(stream: &mut S, mut file: File, size: u64) -> io::Result<u64>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut offset_buf = [0u8; FileOffset::LEN];
     stream.read_exact(&mut offset_buf).await?;
     let offset = FileOffset::decode(&offset_buf)
@@ -160,6 +171,32 @@ mod tests {
             let sent = up.await.unwrap().unwrap();
             assert_eq!(sent, size - 16);
             assert_eq!(got, &contents[16..]);
+        });
+    }
+
+    #[test]
+    fn stream_from_offset_streams_without_re_sending_the_token() {
+        // The downloader-opened upload path (`TransferRequest{Download}`): the
+        // token was already exchanged by the caller, so we send NO
+        // `FileTransferInit` — we read the offset and stream straight away.
+        runtime().block_on(async {
+            let contents = b"0123456789abcdef".repeat(8192); // 128 KiB, multi-chunk
+            let src = TempPath::new("src-offset");
+            tokio::fs::write(&src.0, &contents).await.unwrap();
+            let file = File::open(&src.0).await.unwrap();
+            let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+
+            let size = contents.len() as u64;
+            let up = tokio::spawn(async move { stream_from_offset(&mut server, file, size).await });
+
+            // No init token is read here (unlike `upload`): straight to the offset.
+            client.write_all(&FileOffset { offset: 32 }.to_bytes()).await.unwrap();
+            let mut got = Vec::new();
+            client.read_to_end(&mut got).await.unwrap();
+
+            let sent = up.await.unwrap().unwrap();
+            assert_eq!(sent, size - 32);
+            assert_eq!(got, &contents[32..]);
         });
     }
 

@@ -20,7 +20,8 @@ use crate::messages::{
     BrowseAccepted, BrowseFailed, BrowseUser, ConfigChanged, DownloadFailed, HandlerId,
     IncomingSearch, NetConn,
     NetConnEvent, NetRx, NetTx, PeerBrowseConnect, PeerDistribConnect, PeerDownloadConnect,
-    PeerPierce, PeerUploadConnect, ResolveUploadPeer, SessionEvent, SessionEventKind,
+    PeerPierce, PeerPierceDistrib, PeerPierceFile, PeerUploadConnect, ResolveUploadPeer, SessionEvent,
+    SessionEventKind,
     SetExcludedPhrases, StartDownload, StartSearch, StartSearchResult, StartedSearch,
 };
 
@@ -312,29 +313,27 @@ impl traits::core::Handle<NetRx> for Session {
                 }
             }
             ServerMessage::ConnectToPeer(request) => {
-                // A (likely firewalled) peer wants to reach us. For peer ('P')
-                // connections, hand it to peer_net to dial back + pierce. File
-                // and distributed connections are handled in later stages.
-                if request.connection_type == ConnectionType::Peer {
-                    Self::send(
-                        &PeerPierce {
-                            username: request.username,
-                            ip: request.ip.to_string(),
-                            port: request.port as u16,
-                            token: request.token,
-                        },
-                        writer,
-                    );
-                } else {
-                    Self::emit(
-                        SessionEventKind::ProtocolNote {
-                            note: format!(
-                                "connect-to-peer ({}) from {} not yet handled",
-                                request.connection_type, request.username
-                            ),
-                        },
-                        writer,
-                    );
+                // A (likely firewalled) peer wants to reach us. Hand it to
+                // peer_net to dial back + pierce. Peer ('P') connections carry
+                // browse / search / negotiation messages; file ('F') connections
+                // carry a transfer (a download we queued or an upload we
+                // offered); distributed ('D') connections join the search tree.
+                let (username, ip, port, token) = (
+                    request.username,
+                    request.ip.to_string(),
+                    request.port as u16,
+                    request.token,
+                );
+                match request.connection_type {
+                    ConnectionType::Peer => {
+                        Self::send(&PeerPierce { username, ip, port, token }, writer)
+                    }
+                    ConnectionType::File => {
+                        Self::send(&PeerPierceFile { username, ip, port, token }, writer)
+                    }
+                    ConnectionType::Distributed => {
+                        Self::send(&PeerPierceDistrib { username, ip, port, token }, writer)
+                    }
                 }
             }
             ServerMessage::ExcludedSearchPhrases(excluded) => {
@@ -569,6 +568,14 @@ mod tests {
 
         fn pierces(&self) -> Vec<PeerPierce> {
             self.decode(MessageId::PeerPierce, PeerPierce::deserialize_from)
+        }
+
+        fn file_pierces(&self) -> Vec<PeerPierceFile> {
+            self.decode(MessageId::PeerPierceFile, PeerPierceFile::deserialize_from)
+        }
+
+        fn distrib_pierces(&self) -> Vec<PeerPierceDistrib> {
+            self.decode(MessageId::PeerPierceDistrib, PeerPierceDistrib::deserialize_from)
         }
 
         fn download_connects(&self) -> Vec<PeerDownloadConnect> {
@@ -1091,6 +1098,58 @@ mod tests {
         assert_eq!(pierces[0].ip, "10.0.0.5");
         assert_eq!(pierces[0].port, 2234);
         assert_eq!(pierces[0].token, 555);
+        assert!(writer.file_pierces().is_empty(), "a P connect is not a file pierce");
+    }
+
+    fn connect_to_peer_payload(username: &str, conn_type: &str, token: u32) -> Vec<u8> {
+        use soulseek_proto::wire::{put_bool, put_ipv4, put_string, put_u32};
+        let mut body = Vec::new();
+        put_u32(&mut body, 18); // ConnectToPeer
+        put_string(&mut body, username);
+        put_string(&mut body, conn_type);
+        put_ipv4(&mut body, Ipv4Addr::new(10, 0, 0, 7));
+        put_u32(&mut body, 2300);
+        put_u32(&mut body, token);
+        put_bool(&mut body, false); // privileged
+        put_u32(&mut body, 0); // obfuscation type
+        put_u32(&mut body, 0); // obfuscated port
+        body
+    }
+
+    #[test]
+    fn connect_to_peer_for_a_file_connection_triggers_a_file_pierce() {
+        // Soulseek.NET / slskd open the transfer ('F') connection from the
+        // downloader side; when they can't reach us directly the server relays a
+        // ConnectToPeer(F). We must dial back + pierce (PeerPierceFile), not log
+        // "not yet handled" — otherwise every firewalled transfer stalls.
+        let writer = CapturingWriter::default();
+        let mut session = test_session();
+        session.handle(&NetRx { payload: connect_to_peer_payload("dave", "F", 909) }, &writer);
+
+        let file_pierces = writer.file_pierces();
+        assert_eq!(file_pierces.len(), 1, "an F connect-to-peer yields one file pierce");
+        assert_eq!(file_pierces[0].username, "dave");
+        assert_eq!(file_pierces[0].ip, "10.0.0.7");
+        assert_eq!(file_pierces[0].port, 2300);
+        assert_eq!(file_pierces[0].token, 909);
+        assert!(writer.pierces().is_empty(), "an F connect is not a peer pierce");
+    }
+
+    #[test]
+    fn connect_to_peer_for_a_distributed_connection_triggers_a_distrib_pierce() {
+        // 'D' (distributed search tree): a firewalled peer wants to join the
+        // tree with us, so we dial back + pierce, then relay its searches.
+        let writer = CapturingWriter::default();
+        let mut session = test_session();
+        session.handle(&NetRx { payload: connect_to_peer_payload("eve", "D", 7) }, &writer);
+
+        let distrib_pierces = writer.distrib_pierces();
+        assert_eq!(distrib_pierces.len(), 1, "a D connect-to-peer yields one distrib pierce");
+        assert_eq!(distrib_pierces[0].username, "eve");
+        assert_eq!(distrib_pierces[0].ip, "10.0.0.7");
+        assert_eq!(distrib_pierces[0].port, 2300);
+        assert_eq!(distrib_pierces[0].token, 7);
+        assert!(writer.pierces().is_empty() && writer.file_pierces().is_empty());
     }
 
     #[test]

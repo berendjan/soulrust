@@ -102,6 +102,39 @@ pub struct SharingConfig {
     pub max_peer_queue_length: u32,
 }
 
+impl SharingConfig {
+    /// Where finished downloads land. Falls back to a per-OS default under the
+    /// user's home (`~/Downloads/soulrust`) when unset, so downloads always have
+    /// a real home even on a fresh config.
+    pub fn download_path(&self) -> PathBuf {
+        if self.download_dir.trim().is_empty() {
+            home_dir().join("Downloads").join("soulrust")
+        } else {
+            PathBuf::from(&self.download_dir)
+        }
+    }
+
+    /// Where in-progress (`INCOMPLETE-…`) files live. Defaults to an `incomplete`
+    /// subfolder of the download folder when unset.
+    pub fn incomplete_path(&self) -> PathBuf {
+        if self.incomplete_dir.trim().is_empty() {
+            self.download_path().join("incomplete")
+        } else {
+            PathBuf::from(&self.incomplete_dir)
+        }
+    }
+}
+
+/// The user's home directory, cross-platform: `HOME` on Linux/macOS,
+/// `USERPROFILE` on Windows. Falls back to the current directory if neither is
+/// set (headless/sandboxed environments).
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 impl Default for SharingConfig {
     fn default() -> Self {
         SharingConfig {
@@ -269,6 +302,25 @@ mod tests {
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("soulrust-test-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn sharing_paths_fall_back_to_sane_defaults() {
+        // Unset → per-OS default under the home directory.
+        let cfg = SharingConfig::default();
+        let dl = cfg.download_path();
+        assert!(dl.ends_with("Downloads/soulrust"), "default download dir: {dl:?}");
+        // Incomplete defaults to a subfolder of the download dir.
+        assert_eq!(cfg.incomplete_path(), dl.join("incomplete"));
+
+        // Explicit values are honored verbatim.
+        let cfg = SharingConfig {
+            download_dir: "/music/dl".into(),
+            incomplete_dir: "/music/part".into(),
+            ..SharingConfig::default()
+        };
+        assert_eq!(cfg.download_path(), PathBuf::from("/music/dl"));
+        assert_eq!(cfg.incomplete_path(), PathBuf::from("/music/part"));
     }
 
     #[test]

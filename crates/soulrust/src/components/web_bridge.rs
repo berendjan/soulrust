@@ -19,9 +19,9 @@ use crate::config::{AppContext, Config, Control};
 use crate::extract::Job;
 use crate::messages::{
     ApplyUpdateReq, ApplyUpdateResult, BrowseAccepted, BrowseHtml, BrowseRenderReq, BrowseUser,
-    ConfigSnapshot, ExtractRequest, ExtractResult, GetConfigReq, HandlerId, HttpHtml, HttpRender,
-    Page, SetConfigReq, SetConfigResult, StartDownload, StartSearch, StartSearchResult,
-    StartedSearch,
+    CancelDownload, ConfigSnapshot, ExtractRequest, ExtractResult, GetConfigReq, HandlerId,
+    HttpHtml, HttpRender, Page, SetConfigReq, SetConfigResult, StartDownload, StartSearch,
+    StartSearchResult, StartedSearch,
 };
 
 const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -213,11 +213,16 @@ impl<W: traits::core::Writer> SharedBridge<W> {
                     self.html_page(self.render(Page::AccountStatus))
                 }
                 ("GET", "/account") => self.html_page(self.account_page(None)),
+                ("GET", "/downloads") => self.html_page(self.render(Page::Downloads)),
+                ("GET", "/fragments/downloads") => {
+                    self.html_page(self.render(Page::DownloadsFragment))
+                }
                 ("GET", "/bulk") => self.html_page(self.bulk_page()),
                 ("GET", "/spotify") => self.html_page(self.spotify_page(None)),
                 ("GET", "/config") => self.html_page(self.config_page()),
                 ("POST", "/account") => self.html_page(self.save_account(&body)),
                 ("POST", "/download") => self.html_page(self.submit_download(&body)),
+                ("POST", "/download/cancel") => self.html_page(self.cancel_download(&body)),
                 ("POST", "/search") => self.html_page(self.submit_search(&body)),
                 ("POST", "/filter") => self.html_page(self.filter_bitrate(&body)),
                 ("GET", p) if p.starts_with("/sort/") => {
@@ -334,7 +339,30 @@ impl<W: traits::core::Writer> SharedBridge<W> {
             return Ok(r#"<span class="pill warn">bad request</span>"#.into());
         }
         WebBridge::send(&StartDownload { username, filename, size }, &self.writer);
-        Ok(r#"<span class="pill ok">● queued</span>"#.into())
+        // Matches how the polled row renders a queued download, so it doesn't
+        // visibly change when the next 2s refresh lands.
+        Ok(r#"<span class="pill">queued</span>"#.into())
+    }
+
+    /// POST /download/cancel: drop a queued/active download. We tell the UI and
+    /// peer_net to forget it, then return a fresh Get button — the search row
+    /// swaps its action cell back to it, while the Downloads page removes the row
+    /// (it uses hx-swap="delete" and ignores this body).
+    fn cancel_download(&self, body: &str) -> Result<String, String> {
+        let form = parse_form(body);
+        let username = form.get("username").cloned().unwrap_or_default();
+        let filename = form.get("filename").cloned().unwrap_or_default();
+        let size = form.get("size").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        WebBridge::send(
+            &CancelDownload { username: username.clone(), filename: filename.clone() },
+            &self.writer,
+        );
+        Ok(format!(
+            r##"<form hx-post="/download" hx-target="this" hx-swap="outerHTML" style="margin:0"><input type="hidden" name="username" value="{user}"><input type="hidden" name="filename" value="{path}"><input type="hidden" name="size" value="{size}"><button class="btn xs" type="submit">Get</button></form>"##,
+            user = escape(&username),
+            path = escape(&filename),
+            size = size,
+        ))
     }
 
     /// GET /fragments/browse: render the current browse state (owned by the
@@ -718,8 +746,8 @@ fn render_config_page(config: &Config, banner: Option<String>) -> String {
 </div>
 <div class="card"><h2 style="margin-top:0">Downloads &amp; sharing</h2>
 <p class="muted" style="margin-top:0">Where finished downloads land, and which of your folders you share with the network. Applies after a restart.</p>
-<label>download folder <input type="text" name="download_dir" value="{download_dir}" placeholder="/home/you/Music/soulrust"></label>
-<label>incomplete folder (optional) <input type="text" name="incomplete_dir" value="{incomplete_dir}" placeholder="leave empty to use the download folder"></label>
+<label>download folder <input type="text" name="download_dir" value="{download_dir}" placeholder="{download_default}"></label>
+<label>incomplete folder (optional) <input type="text" name="incomplete_dir" value="{incomplete_dir}" placeholder="{incomplete_default}"></label>
 <label>shared folders — one path per line <textarea name="folders" rows="3" placeholder="/home/you/Music">{folders}</textarea></label>
 <label>upload slots <input type="text" name="upload_slots" value="{upload_slots}"></label>
 <label><input type="checkbox" name="respond_to_searches" {respond}> let other users find and download my shared files</label>
@@ -758,6 +786,8 @@ fn render_config_page(config: &Config, banner: Option<String>) -> String {
         ),
         download_dir = escape(&config.sharing.download_dir),
         incomplete_dir = escape(&config.sharing.incomplete_dir),
+        download_default = escape(&config.sharing.download_path().display().to_string()),
+        incomplete_default = escape(&config.sharing.incomplete_path().display().to_string()),
         folders = escape(&config.sharing.folders.join("\n")),
         upload_slots = config.sharing.upload_slots,
         respond = checked(config.sharing.respond_to_searches),

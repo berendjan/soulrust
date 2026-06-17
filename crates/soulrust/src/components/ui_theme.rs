@@ -162,6 +162,7 @@ const ICON_BULK: &str = r#"<svg viewBox="0 0 20 20" fill="none" stroke="currentC
 const ICON_SPOTIFY: &str = r#"<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="10" cy="10" r="8"/><path d="M5.8 8.2c3-1 6-.7 8.6.9"/><path d="M6.4 10.8c2.4-.7 4.8-.4 6.8 1"/><path d="M6.9 13.1c1.8-.5 3.5-.3 5 .8"/></svg>"#;
 const ICON_SETTINGS: &str = r#"<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M3 6h7"/><path d="M14 6h3"/><circle cx="12" cy="6" r="2"/><path d="M3 14h3"/><path d="M10 14h7"/><circle cx="8" cy="14" r="2"/></svg>"#;
 const ICON_USER: &str = r#"<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="10" cy="7" r="3.2"/><path d="M4.6 16.4c.9-2.9 2.9-4.3 5.4-4.3s4.5 1.4 5.4 4.3"/></svg>"#;
+const ICON_DOWNLOAD: &str = r#"<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3v9"/><path d="M6.5 9l3.5 3.5L13.5 9"/><path d="M4 16.5h12"/></svg>"#;
 
 fn escape_attr(text: &str) -> String {
     text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
@@ -225,6 +226,7 @@ pub fn shell(title: &str, active: &str, user: &str, body: &str) -> String {
   <nav class="nav">
     {search}
     {bulk}
+    {downloads}
     {spotify}
     {config}
   </nav>
@@ -245,6 +247,7 @@ pub fn shell(title: &str, active: &str, user: &str, body: &str) -> String {
         logo = ICON_LOGO,
         search = nav("search", "/", "Search", ICON_SEARCH),
         bulk = nav("bulk", "/bulk", "Bulk downloads", ICON_BULK),
+        downloads = nav("downloads", "/downloads", "Downloads", ICON_DOWNLOAD),
         spotify = nav("spotify", "/spotify", "Spotify", ICON_SPOTIFY),
         config = nav("config", "/config", "Settings", ICON_SETTINGS),
         user_icon = ICON_USER,

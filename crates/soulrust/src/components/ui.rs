@@ -10,15 +10,18 @@ use rust_messenger::traits::extended::Sender;
 
 use crate::config::AppContext;
 use crate::messages::{
-    ConfigChanged, DownloadComplete, DownloadFailed, DownloadQueuePosition, HandlerId, HttpHtml,
-    HttpRender, Page, PeerActivity, SearchResultReceived, SessionEvent, SessionEventKind,
-    UpdaterStatus, UpdaterStatusChanged, UploadComplete, UploadFailed,
+    CancelDownload, ConfigChanged, DownloadComplete, DownloadFailed, DownloadQueuePosition,
+    HandlerId, HttpHtml, HttpRender, Page, PeerActivity, SearchResultReceived, SessionEvent,
+    SessionEventKind, StartDownload, UpdaterStatus, UpdaterStatusChanged, UploadComplete,
+    UploadFailed,
 };
 
 const MAX_LOG_LINES: usize = 100;
 /// Cap on results kept per search, so a flood of responses can't grow the UI
 /// state without bound (filtering already drops the worst before they arrive).
 const MAX_RESULTS_PER_SEARCH: usize = 200;
+/// Cap on tracked downloads shown on the Downloads page.
+const MAX_DOWNLOADS: usize = 200;
 
 #[derive(Debug, Clone, PartialEq)]
 enum SessionStatus {
@@ -52,6 +55,39 @@ struct SearchRow {
     token: u32,
     query: String,
     results: Vec<SearchResultRow>,
+}
+
+/// A user-requested download and its latest known state, for the Downloads page.
+struct DownloadEntry {
+    username: String,
+    filename: String,
+    state: DownloadState,
+}
+
+#[derive(PartialEq)]
+enum DownloadState {
+    /// Requested; we're resolving the peer / waiting for it to offer the file.
+    Queued,
+    /// Sitting in the uploader's queue at this position.
+    Position(u32),
+    /// The uploader is about to send (queue position 0).
+    Starting,
+    /// Finished — holds the final on-disk path.
+    Completed(String),
+    /// Gave up — holds the reason.
+    Failed(String),
+    /// A partial file found on disk at startup (resumable by re-requesting).
+    Incomplete,
+}
+
+impl DownloadState {
+    /// In flight — belongs in the "Active" section and can be cancelled.
+    fn is_active(&self) -> bool {
+        matches!(
+            self,
+            DownloadState::Queued | DownloadState::Position(_) | DownloadState::Starting
+        )
+    }
 }
 
 /// A column the results table can be sorted by. Mirrors the visible columns.
@@ -95,6 +131,8 @@ pub struct Ui {
     sort: Option<(SortKey, bool)>,
     /// Minimum bitrate (kbps) a result must advertise to be shown; 0 = no filter.
     min_bitrate: u32,
+    /// User-requested downloads, newest last, for the Downloads page.
+    downloads: Vec<DownloadEntry>,
 }
 
 impl Ui {
@@ -107,6 +145,38 @@ impl Ui {
             username: ctx.config.server.username.clone(),
             sort: None,
             min_bitrate: 0,
+            // Seed the list from disk so finished and partial downloads from
+            // previous runs show up (the in-memory state itself isn't persisted).
+            downloads: scan_disk_downloads(
+                &ctx.config.sharing.download_path(),
+                &ctx.config.sharing.incomplete_path(),
+            ),
+        }
+    }
+
+    /// Record the latest state of a download (keyed by user + virtual path),
+    /// inserting it if new. Bounds memory by evicting the oldest finished entry.
+    fn set_download_state(&mut self, username: &str, filename: &str, state: DownloadState) {
+        if let Some(d) = self
+            .downloads
+            .iter_mut()
+            .find(|d| d.username == username && d.filename == filename)
+        {
+            d.state = state;
+            return;
+        }
+        self.downloads.push(DownloadEntry {
+            username: username.to_owned(),
+            filename: filename.to_owned(),
+            state,
+        });
+        if self.downloads.len() > MAX_DOWNLOADS {
+            let evict = self
+                .downloads
+                .iter()
+                .position(|d| !d.state.is_active())
+                .unwrap_or(0);
+            self.downloads.remove(evict);
         }
     }
 
@@ -133,6 +203,8 @@ impl Ui {
             Page::SearchesFragment => self.render_searches(),
             Page::ConfigForm => self.render_config_note(),
             Page::AccountStatus => self.render_account_status(),
+            Page::Downloads => self.render_downloads_page(),
+            Page::DownloadsFragment => self.render_downloads(),
             // The sort/filter mutation happens in the HttpRender handler (it has
             // &mut self); here we just render the updated table.
             Page::SortSearches { .. } | Page::FilterBitrate { .. } => self.render_searches(),
@@ -284,6 +356,46 @@ impl Ui {
         self.searches.iter().rev().map(|s| self.render_search(s)).collect()
     }
 
+    /// The action cell for a result row. If the file is already in the downloads
+    /// list, show its live status (so the 2s poll preserves it instead of
+    /// reverting to "Get"); otherwise a Get button that posts the download.
+    /// Failed downloads fall through to a Get button so they can be retried.
+    fn download_cell(&self, username: &str, filename: &str, size: u64) -> String {
+        let state = self
+            .downloads
+            .iter()
+            .find(|d| d.username == username && d.filename == filename)
+            .map(|d| &d.state);
+        // An in-flight download shows its status plus a cancel control; the
+        // cancel posts to /download/cancel and the cell swaps back to a Get
+        // button. Done/failed/never-requested fall through to a Get button.
+        let cancellable = |pill: &str| {
+            format!(
+                r##"<form hx-post="/download/cancel" hx-target="closest td" hx-swap="innerHTML" style="margin:0;display:inline-flex;gap:0.3rem;align-items:center"><input type="hidden" name="username" value="{user}"><input type="hidden" name="filename" value="{path}"><input type="hidden" name="size" value="{size}">{pill}<button class="btn xs secondary" type="submit" title="Cancel">✕</button></form>"##,
+                user = escape(username),
+                path = escape(filename),
+                size = size,
+                pill = pill,
+            )
+        };
+        match state {
+            Some(DownloadState::Queued) => cancellable(r#"<span class="pill">queued</span>"#),
+            Some(DownloadState::Position(n)) => {
+                cancellable(&format!(r#"<span class="pill">queue #{n}</span>"#))
+            }
+            Some(DownloadState::Starting) => {
+                cancellable(r#"<span class="pill ok">downloading…</span>"#)
+            }
+            Some(DownloadState::Completed(_)) => r#"<span class="pill ok">done</span>"#.into(),
+            _ => format!(
+                r##"<form hx-post="/download" hx-target="this" hx-swap="outerHTML" style="margin:0"><input type="hidden" name="username" value="{user}"><input type="hidden" name="filename" value="{path}"><input type="hidden" name="size" value="{size}"><button class="btn xs" type="submit">Get</button></form>"##,
+                user = escape(username),
+                path = escape(filename),
+                size = size,
+            ),
+        }
+    }
+
     /// A clickable, sort-aware column header cell. `id` is the sort key sent to
     /// `/sort/{id}`; the active column shows a ▲/▼ arrow. `hx-target` is the
     /// enclosing `.results` container so this works on both the search and bulk
@@ -343,10 +455,8 @@ impl Ui {
                     r#"<span class="pill warn">queued</span>"#
                 };
                 let length = f.length.map(length_str).unwrap_or_default();
-                // Form-encoded hidden inputs carry the exact path/size to
-                // POST /download; htmx swaps the button for "queued".
                 format!(
-                    r##"<tr><td class="col-user" title="{user}">{user}</td><td class="col-folder" title="{folder}">{folder}</td><td class="col-file" title="{path}">{file}</td><td class="col-size num">{human}</td><td class="col-bitrate num">{quality}</td><td class="col-length num">{length}</td><td class="col-slot">{slot}</td><td class="col-speed num">{speed}</td><td class="col-queue num">{queue}</td><td class="col-dl"><form hx-post="/download" hx-target="this" hx-swap="outerHTML" style="margin:0"><input type="hidden" name="username" value="{user}"><input type="hidden" name="filename" value="{path}"><input type="hidden" name="size" value="{size}"><button class="btn xs" type="submit">Get</button></form></td></tr>"##,
+                    r##"<tr><td class="col-user" title="{user}">{user}</td><td class="col-folder" title="{folder}">{folder}</td><td class="col-file" title="{path}">{file}</td><td class="col-size num">{human}</td><td class="col-bitrate num">{quality}</td><td class="col-length num">{length}</td><td class="col-slot">{slot}</td><td class="col-speed num">{speed}</td><td class="col-queue num">{queue}</td><td class="col-dl">{dl_cell}</td></tr>"##,
                     user = escape(&r.username),
                     folder = escape(dirname(&f.name)),
                     path = escape(&f.name),
@@ -357,7 +467,7 @@ impl Ui {
                     slot = slot,
                     speed = r.upload_speed,
                     queue = r.in_queue,
-                    size = f.size,
+                    dl_cell = self.download_cell(&r.username, &f.name, f.size),
                 )
             })
             .collect();
@@ -380,6 +490,90 @@ impl Ui {
             th_speed = self.sort_th("speed", "Speed B/s", true),
             th_queue = self.sort_th("queue", "Queue", true),
             body = body,
+        )
+    }
+
+    /// The full Downloads page: a shell around the live downloads fragment.
+    fn render_downloads_page(&self) -> String {
+        let body = r##"<h1>Downloads</h1>
+<p class="sub">Files you've queued with the <strong>Get</strong> button. Active transfers are up top; finished and failed ones below.</p>
+<div id="downloads" class="results" hx-get="/fragments/downloads" hx-trigger="load, every 2s"></div>"##;
+        crate::components::ui_theme::shell("soulrust — downloads", "downloads", &self.username, body)
+    }
+
+    /// One downloads table. `active` selects the in-flight rows (true) or the
+    /// at-rest ones — completed, failed, or partial-on-disk (false).
+    fn render_downloads_table(&self, active: bool) -> String {
+        let rows: String = self
+            .downloads
+            .iter()
+            .filter(|d| d.state.is_active() == active)
+            .rev()
+            .map(|d| {
+                let status = match &d.state {
+                    DownloadState::Queued => r#"<span class="pill">queued</span>"#.to_string(),
+                    DownloadState::Position(n) => {
+                        format!(r#"<span class="pill">queue #{n}</span>"#)
+                    }
+                    DownloadState::Starting => {
+                        r#"<span class="pill ok">downloading…</span>"#.to_string()
+                    }
+                    DownloadState::Completed(path) => format!(
+                        r#"<span class="pill ok">done</span> <span class="muted">{}</span>"#,
+                        escape(path)
+                    ),
+                    DownloadState::Failed(reason) => format!(
+                        r#"<span class="pill warn">failed</span> <span class="muted">{}</span>"#,
+                        escape(reason)
+                    ),
+                    DownloadState::Incomplete => {
+                        r#"<span class="pill warn">incomplete</span> <span class="muted">partial file on disk — search and Get again to resume</span>"#.to_string()
+                    }
+                };
+                // In-flight rows can be cancelled (removes the row); at-rest ones can't.
+                let action = if active {
+                    format!(
+                        r##" <form hx-post="/download/cancel" hx-target="closest tr" hx-swap="delete" style="margin:0;display:inline"><input type="hidden" name="username" value="{user}"><input type="hidden" name="filename" value="{path}"><button class="btn xs secondary" type="submit">cancel</button></form>"##,
+                        user = escape(&d.username),
+                        path = escape(&d.filename),
+                    )
+                } else {
+                    String::new()
+                };
+                let user = if d.username.is_empty() {
+                    r#"<span class="muted">—</span>"#.to_string()
+                } else {
+                    escape(&d.username)
+                };
+                format!(
+                    r##"<tr><td class="col-file" title="{path}">{file}</td><td class="col-user">{user}</td><td>{status}{action}</td></tr>"##,
+                    path = escape(&d.filename),
+                    file = escape(basename(&d.filename)),
+                    user = user,
+                    status = status,
+                    action = action,
+                )
+            })
+            .collect();
+        if rows.is_empty() {
+            let what = if active { "nothing downloading right now" } else { "no finished downloads yet" };
+            return format!(r#"<p class="muted">{what}</p>"#);
+        }
+        format!(
+            r##"<div class="results-scroll"><table class="results-table"><thead><tr><th class="col-file">File</th><th class="col-user">User</th><th>Status</th></tr></thead><tbody>{rows}</tbody></table></div>"##,
+        )
+    }
+
+    /// The live downloads fragment: an Active section then a Previous section.
+    fn render_downloads(&self) -> String {
+        let active = self.downloads.iter().filter(|d| d.state.is_active()).count();
+        let done = self.downloads.len() - active;
+        format!(
+            r##"<div class="card"><h3 style="margin-top:0">Active <span class="muted">— {active}</span></h3>{active_tbl}</div><div class="card"><h3 style="margin-top:0">Previous <span class="muted">— {done}</span></h3>{prev_tbl}</div>"##,
+            active = active,
+            done = done,
+            active_tbl = self.render_downloads_table(true),
+            prev_tbl = self.render_downloads_table(false),
         )
     }
 
@@ -463,15 +657,38 @@ impl traits::core::Handle<PeerActivity> for Ui {
     }
 }
 
+impl traits::core::Handle<StartDownload> for Ui {
+    fn handle<W: traits::core::Writer>(&mut self, message: &StartDownload, _writer: &W) {
+        self.set_download_state(&message.username, &message.filename, DownloadState::Queued);
+    }
+}
+
+impl traits::core::Handle<CancelDownload> for Ui {
+    fn handle<W: traits::core::Writer>(&mut self, message: &CancelDownload, _writer: &W) {
+        self.downloads
+            .retain(|d| !(d.username == message.username && d.filename == message.filename));
+    }
+}
+
 impl traits::core::Handle<DownloadComplete> for Ui {
     fn handle<W: traits::core::Writer>(&mut self, message: &DownloadComplete, _writer: &W) {
         self.log(format!("downloaded {} from {} → {}", message.filename, message.username, message.path));
+        self.set_download_state(
+            &message.username,
+            &message.filename,
+            DownloadState::Completed(message.path.clone()),
+        );
     }
 }
 
 impl traits::core::Handle<DownloadFailed> for Ui {
     fn handle<W: traits::core::Writer>(&mut self, message: &DownloadFailed, _writer: &W) {
         self.log(format!("download of {} from {} failed: {}", message.filename, message.username, message.reason));
+        self.set_download_state(
+            &message.username,
+            &message.filename,
+            DownloadState::Failed(message.reason.clone()),
+        );
     }
 }
 
@@ -517,6 +734,20 @@ impl traits::core::Handle<DownloadQueuePosition> for Ui {
                 message.filename, message.username, message.place
             ));
         }
+        // Don't resurrect a finished/at-rest entry from a late queue update.
+        let updatable = self
+            .downloads
+            .iter()
+            .find(|d| d.username == message.username && d.filename == message.filename)
+            .is_none_or(|d| d.state.is_active());
+        if updatable {
+            let state = if message.place == 0 {
+                DownloadState::Starting
+            } else {
+                DownloadState::Position(message.place)
+            };
+            self.set_download_state(&message.username, &message.filename, state);
+        }
     }
 }
 
@@ -544,6 +775,55 @@ fn escape(text: &str) -> String {
 /// row's `title` and the hidden download field.
 fn basename(path: &str) -> &str {
     path.rsplit(['\\', '/']).next().filter(|s| !s.is_empty()).unwrap_or(path)
+}
+
+/// Reconstruct the Downloads list from disk at startup: finished files in the
+/// download folder (shown as "done") and `INCOMPLETE-…` partials in the
+/// incomplete folder (shown as "incomplete", resumable). We can only recover the
+/// basename from disk — not the original peer or virtual path — so those are
+/// left blank. Bounded to [`MAX_DOWNLOADS`].
+fn scan_disk_downloads(download_dir: &std::path::Path, incomplete_dir: &std::path::Path) -> Vec<DownloadEntry> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(download_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Skip the incomplete subfolder and any stray partials.
+            if !entry.path().is_file() || name.starts_with("INCOMPLETE-") {
+                continue;
+            }
+            out.push(DownloadEntry {
+                username: String::new(),
+                filename: name,
+                state: DownloadState::Completed(entry.path().display().to_string()),
+            });
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(incomplete_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(basename) = parse_incomplete_name(&name) {
+                out.push(DownloadEntry {
+                    username: String::new(),
+                    filename: basename,
+                    state: DownloadState::Incomplete,
+                });
+            }
+        }
+    }
+    out.truncate(MAX_DOWNLOADS);
+    out
+}
+
+/// Recover the original basename from an `INCOMPLETE-<16hex>-<basename>` partial
+/// (see `peer_net::incomplete_name`). Returns `None` if the name isn't one.
+fn parse_incomplete_name(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("INCOMPLETE-")?;
+    // 16 hex digits of the stable key, then '-', then the basename.
+    if rest.len() > 17 && rest.as_bytes()[16] == b'-' && rest[..16].bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(rest[17..].to_string())
+    } else {
+        None
+    }
 }
 
 /// The folder portion of a Soulseek virtual path (everything before the last
@@ -890,6 +1170,159 @@ mod tests {
             }],
         };
         traits::core::Handle::<SearchResultReceived>::handle(ui, &msg, &W);
+    }
+
+    #[test]
+    fn downloads_page_tracks_active_then_moves_to_previous() {
+        struct W;
+        impl Clone for W {
+            fn clone(&self) -> Self {
+                W
+            }
+        }
+        impl traits::core::Writer for W {
+            fn write<M: traits::core::Message, H: traits::core::Handler, F: FnOnce(&mut [u8])>(
+                &self,
+                _size: usize,
+                _callback: F,
+            ) {
+            }
+        }
+        let mut ui = test_ui();
+        assert!(ui.render(&Page::DownloadsFragment).contains("nothing downloading"));
+
+        // Clicking Get → StartDownload → an active "queued" entry.
+        traits::core::Handle::<StartDownload>::handle(
+            &mut ui,
+            &StartDownload { username: "bob".into(), filename: "M\\song.mp3".into(), size: 9 },
+            &W,
+        );
+        let html = ui.render(&Page::DownloadsFragment);
+        assert!(html.contains("Active <span class=\"muted\">— 1"));
+        assert!(html.contains("song.mp3") && html.contains("queued"));
+
+        // Queue position update keeps it active.
+        traits::core::Handle::<DownloadQueuePosition>::handle(
+            &mut ui,
+            &DownloadQueuePosition { username: "bob".into(), filename: "M\\song.mp3".into(), place: 3 },
+            &W,
+        );
+        assert!(ui.render(&Page::DownloadsFragment).contains("queue #3"));
+
+        // Completion moves it to Previous with the final path.
+        traits::core::Handle::<DownloadComplete>::handle(
+            &mut ui,
+            &DownloadComplete {
+                username: "bob".into(),
+                filename: "M\\song.mp3".into(),
+                path: "/dl/song.mp3".into(),
+            },
+            &W,
+        );
+        let html = ui.render(&Page::DownloadsFragment);
+        assert!(html.contains("Active <span class=\"muted\">— 0"));
+        assert!(html.contains("Previous <span class=\"muted\">— 1"));
+        assert!(html.contains("done") && html.contains("/dl/song.mp3"));
+    }
+
+    #[test]
+    fn cancelling_a_download_removes_it() {
+        struct W;
+        impl Clone for W {
+            fn clone(&self) -> Self {
+                W
+            }
+        }
+        impl traits::core::Writer for W {
+            fn write<M: traits::core::Message, H: traits::core::Handler, F: FnOnce(&mut [u8])>(
+                &self,
+                _size: usize,
+                _callback: F,
+            ) {
+            }
+        }
+        let mut ui = test_ui();
+        traits::core::Handle::<StartDownload>::handle(
+            &mut ui,
+            &StartDownload { username: "bob".into(), filename: "a.mp3".into(), size: 1 },
+            &W,
+        );
+        assert!(ui.render(&Page::DownloadsFragment).contains("Active <span class=\"muted\">— 1"));
+        // An active row offers a cancel control.
+        assert!(ui.render(&Page::DownloadsFragment).contains(r#"hx-post="/download/cancel""#));
+
+        traits::core::Handle::<CancelDownload>::handle(
+            &mut ui,
+            &CancelDownload { username: "bob".into(), filename: "a.mp3".into() },
+            &W,
+        );
+        let html = ui.render(&Page::DownloadsFragment);
+        assert!(html.contains("Active <span class=\"muted\">— 0"), "cancelled download is gone");
+        assert!(html.contains("nothing downloading"));
+    }
+
+    #[test]
+    fn result_row_shows_queued_status_so_the_poll_keeps_it() {
+        struct W;
+        impl Clone for W {
+            fn clone(&self) -> Self {
+                W
+            }
+        }
+        impl traits::core::Writer for W {
+            fn write<M: traits::core::Message, H: traits::core::Handler, F: FnOnce(&mut [u8])>(
+                &self,
+                _size: usize,
+                _callback: F,
+            ) {
+            }
+        }
+        let mut ui = test_ui();
+        apply(&mut ui, SessionEventKind::SearchStarted { token: 8, query: "q".into() });
+        feed_result(&mut ui, 8, "carol", "Album\\tune.mp3", Some(256));
+        // Before requesting, the row offers a Get button.
+        assert!(ui.render(&Page::SearchesFragment).contains(r#"hx-post="/download""#));
+
+        // Requesting it (what clicking Get does) makes the row show the queued
+        // status, derived from server state — so the next 2s poll preserves it
+        // rather than reverting to a Get button.
+        traits::core::Handle::<StartDownload>::handle(
+            &mut ui,
+            &StartDownload { username: "carol".into(), filename: "Album\\tune.mp3".into(), size: 1 },
+            &W,
+        );
+        let html = ui.render(&Page::SearchesFragment);
+        assert!(html.contains(r#"<span class="pill">queued</span>"#), "row shows queued");
+    }
+
+    #[test]
+    fn parse_incomplete_name_recovers_the_basename() {
+        assert_eq!(
+            parse_incomplete_name("INCOMPLETE-00000000deadbeef-song.flac").as_deref(),
+            Some("song.flac")
+        );
+        assert_eq!(parse_incomplete_name("ordinary.mp3"), None);
+        // 16 chars but not all hex → not one of ours.
+        assert_eq!(parse_incomplete_name("INCOMPLETE-zzzzzzzzzzzzzzzz-x.mp3"), None);
+    }
+
+    #[test]
+    fn scan_disk_downloads_lists_completed_and_incomplete() {
+        let base = std::env::temp_dir().join(format!("soulrust-dlscan-{}", std::process::id()));
+        let dl = base.join("dl");
+        let inc = base.join("inc");
+        std::fs::create_dir_all(&dl).unwrap();
+        std::fs::create_dir_all(&inc).unwrap();
+        std::fs::write(dl.join("done.mp3"), b"x").unwrap();
+        std::fs::write(inc.join("INCOMPLETE-00000000deadbeef-half.flac"), b"x").unwrap();
+        let entries = scan_disk_downloads(&dl, &inc);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(entries.iter().any(|d| d.filename == "done.mp3"
+            && matches!(d.state, DownloadState::Completed(_))));
+        assert!(entries
+            .iter()
+            .any(|d| d.filename == "half.flac" && d.state == DownloadState::Incomplete));
     }
 
     #[test]

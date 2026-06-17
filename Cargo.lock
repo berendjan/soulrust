@@ -1878,6 +1878,7 @@ name = "soulrust-integration-tests"
 version = "0.1.0"
 dependencies = [
  "rust-messenger",
+ "serde_json",
  "soulrust",
  "soulseek-proto",
  "testcontainers",

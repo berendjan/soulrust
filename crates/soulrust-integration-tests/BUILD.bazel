@@ -6,6 +6,7 @@ rust_library(
     deps = [
         "//crates/soulrust",
         "//crates/soulseek-proto:soulseek_proto",
+        "@crates//:serde_json",
         "@crates//:testcontainers",
         "@crates//:ureq",
     ],
@@ -28,6 +29,7 @@ rust_library(
             "//crates/soulrust",
             "//crates/soulseek-proto:soulseek_proto",
             "@crates//:rust-messenger",
+            "@crates//:serde_json",
             "@crates//:testcontainers",
             "@crates//:ureq",
         ],
@@ -35,5 +37,6 @@ rust_library(
     for test_name in [
         "soulfind_protocol",
         "soulfind_app",
+        "slskd_transfer",
     ]
 ]

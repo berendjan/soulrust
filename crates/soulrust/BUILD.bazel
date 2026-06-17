@@ -6,11 +6,12 @@ rust_library(
         ["src/**/*.rs"],
         exclude = ["src/main.rs"],
     ),
-    compile_data = ["assets/htmx.min.js"],
+    compile_data = glob(["assets/*"]),
     visibility = ["//visibility:public"],
     deps = [
         "//crates/soulseek-proto:soulseek_proto",
         "@crates//:bincode",
+        "@crates//:lofty",
         "@crates//:rust-messenger",
         "@crates//:self-replace",
         "@crates//:semver",

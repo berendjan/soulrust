@@ -71,6 +71,9 @@ rust_messenger::messenger_id_enum!(
         SetExcludedPhrases = 39,
         DownloadQueuePosition = 40,
         SearchResultReceived = 41,
+        CancelDownload = 42,
+        PeerPierceFile = 43,
+        PeerPierceDistrib = 44,
     }
 );
 
@@ -86,6 +89,10 @@ pub enum Page {
     ConfigForm,
     /// The login/signup screen's live connection state (friendly, no log).
     AccountStatus,
+    /// The Downloads page (full shell) and its live fragment listing active +
+    /// finished transfers.
+    Downloads,
+    DownloadsFragment,
     /// Set the results-table sort column (toggles direction if already active),
     /// then render the searches fragment. `key` is a column id (user/folder/
     /// file/size/bitrate/length/slot/speed/queue).
@@ -410,6 +417,30 @@ pub struct PeerPierce {
     pub token: u32,
 }
 
+/// session → peer_net: a server ConnectToPeer for a **file** (`F`) connection —
+/// a (likely firewalled) peer can't open the transfer connection to us, so we
+/// dial `ip:port`, send PierceFirewall(token), and then run the transfer (a
+/// download we queued, or an upload we offered) over that connection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerPierceFile {
+    pub username: String,
+    pub ip: String,
+    pub port: u16,
+    pub token: u32,
+}
+
+/// session → peer_net: a server ConnectToPeer for a **distributed** (`D`)
+/// connection — a (likely firewalled) peer wants to join the distributed search
+/// tree with us. We dial `ip:port`, send PierceFirewall(token), and then relay
+/// its distributed searches (same as an inbound `D` connection).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerPierceDistrib {
+    pub username: String,
+    pub ip: String,
+    pub port: u16,
+    pub token: u32,
+}
+
 // ---------------------------------------------------------------------------
 // downloads (request a file from a peer)
 
@@ -421,6 +452,15 @@ pub struct StartDownload {
     pub username: String,
     pub filename: String,
     pub size: u64,
+}
+
+/// ui / web bridge → ui + peer_net: drop a queued/active download. The UI
+/// forgets it; peer_net removes the pending request and token so it won't be
+/// accepted or continued.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelDownload {
+    pub username: String,
+    pub filename: String,
 }
 
 /// session → peer_net: the resolved address to open a peer connection to and
@@ -583,6 +623,9 @@ impl_bus_message!(
     SetExcludedPhrases => MessageId::SetExcludedPhrases,
     DownloadQueuePosition => MessageId::DownloadQueuePosition,
     SearchResultReceived => MessageId::SearchResultReceived,
+    CancelDownload => MessageId::CancelDownload,
+    PeerPierceFile => MessageId::PeerPierceFile,
+    PeerPierceDistrib => MessageId::PeerPierceDistrib,
 );
 
 #[cfg(test)]
