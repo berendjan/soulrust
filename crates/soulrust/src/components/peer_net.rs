@@ -40,8 +40,8 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::components::transfer_io;
 use crate::config::AppContext;
 use crate::messages::{
-    BrowseDir, BrowseFailed, BrowseFile, BrowseListing, DownloadComplete, DownloadFailed,
-    DownloadQueuePosition, HandlerId, IncomingSearch, NetTx, PeerActivity, PeerBrowseConnect,
+    BrowseDir, BrowseFailed, BrowseFile, BrowseListing, ConfigChanged, DownloadComplete,
+    DownloadFailed, DownloadQueuePosition, HandlerId, IncomingSearch, NetTx, PeerActivity, PeerBrowseConnect,
     PeerDistribConnect, PeerDownloadConnect, PeerPierce, PeerUploadConnect, ResolveUploadPeer,
     SearchResultFile, SearchResultReceived, SetExcludedPhrases, UploadComplete, UploadFailed,
 };
@@ -127,6 +127,8 @@ enum PeerCommand {
     DistribConnect { username: String, ip: String, port: u16 },
     /// Replace the server-supplied excluded-phrase list used to filter responses.
     SetExcludedPhrases { phrases: Vec<String> },
+    /// Apply changed config live (no restart): search filter + result cap.
+    ApplyConfig { live: LiveConfig },
     /// A connection task received a PlaceInQueueResponse for one of our queued
     /// downloads; forward the position to the UI (the task has no bus Writer).
     QueuePosition { username: String, filename: String, place: u32 },
@@ -203,9 +205,20 @@ struct ConnCtx {
     /// we can answer a downloader's PlaceInQueueRequest and report an honest
     /// queue depth in search responses.
     upload_queue: Mutex<UploadQueue>,
-    /// Requester-side filter applied to inbound search results before they reach
-    /// the UI (min files / min peer speed / max queue length).
+    /// Settings the reactor re-reads on every use so a config change applies
+    /// live (no restart): the requester-side search filter and the cap on files
+    /// we return for an incoming search. Updated on `ConfigChanged`.
+    live: Mutex<LiveConfig>,
+}
+
+/// The subset of config the peer-net reactor honors at runtime without a
+/// restart. Refreshed wholesale when the config changes.
+#[derive(Debug, Clone, Copy)]
+struct LiveConfig {
+    /// Filter applied to inbound search results (min files / speed / queue).
     search_filter: SearchFilter,
+    /// Cap on files returned for a single incoming search.
+    max_results: usize,
 }
 
 /// What a finished connection produced, for the accept loop to report on the bus.
@@ -331,6 +344,24 @@ impl traits::core::Handle<SetExcludedPhrases> for PeerNet {
     }
 }
 
+impl traits::core::Handle<ConfigChanged> for PeerNet {
+    fn handle<W: traits::core::Writer>(&mut self, message: &ConfigChanged, _writer: &W) {
+        // Apply the search filter and result cap live; reconnect-bound settings
+        // (listen port, shared folders, server credentials) still need a restart.
+        let s = &message.config.sharing;
+        let _ = self.cmd_tx.send(PeerCommand::ApplyConfig {
+            live: LiveConfig {
+                search_filter: SearchFilter {
+                    min_files: s.min_result_files,
+                    min_upload_speed: s.min_peer_upload_speed,
+                    max_queue_length: s.max_peer_queue_length,
+                },
+                max_results: s.max_search_results as usize,
+            },
+        });
+    }
+}
+
 impl traits::core::Handle<PeerDownloadConnect> for PeerNet {
     fn handle<W: traits::core::Writer>(&mut self, message: &PeerDownloadConnect, _writer: &W) {
         let _ = self.cmd_tx.send(PeerCommand::Download {
@@ -384,7 +415,6 @@ fn run_reactor<W: traits::core::Writer>(
         }
     };
     let port = config.port;
-    let max_results = config.max_results;
     runtime.block_on(async move {
         // Scan here (off the startup path) and warm the cached browse frame.
         let shares = Arc::new(ShareIndex::scan(&config.folders));
@@ -401,7 +431,10 @@ fn run_reactor<W: traits::core::Writer>(
             next_token: AtomicU32::new(1),
             excluded_phrases: Mutex::new(Vec::new()),
             upload_queue: Mutex::new(UploadQueue::new(false)),
-            search_filter: config.search_filter,
+            live: Mutex::new(LiveConfig {
+                search_filter: config.search_filter,
+                max_results: config.max_results,
+            }),
         });
 
         let listener = match TcpListener::bind(("0.0.0.0", port)).await {
@@ -417,7 +450,7 @@ fn run_reactor<W: traits::core::Writer>(
         );
 
         // Commands run concurrently with the accept loop on this single thread.
-        let cmd = tokio::spawn(command_loop(cmd_rx, ctx.clone(), max_results, writer.clone()));
+        let cmd = tokio::spawn(command_loop(cmd_rx, ctx.clone(), writer.clone()));
         accept_loop(listener, ctx, writer).await;
         cmd.abort();
     });
@@ -468,7 +501,6 @@ fn report_outcome<W: traits::core::Writer>(
 async fn command_loop<W: traits::core::Writer>(
     mut cmd_rx: UnboundedReceiver<PeerCommand>,
     ctx: Arc<ConnCtx>,
-    max_results: usize,
     writer: W,
 ) {
     let mut connect_token: u32 = 1;
@@ -549,7 +581,9 @@ async fn command_loop<W: traits::core::Writer>(
                 let queue = ctx.queue.clone();
                 let writer = writer.clone();
                 let our_username = ctx.our_username.clone();
-                let max = max_results;
+                // Re-read the live result cap so a config change applies without
+                // a restart.
+                let max = ctx.live.lock().unwrap().max_results;
                 // Snapshot the server's excluded phrases so the matcher drops any
                 // file the server told us to suppress (search_response::respond
                 // filters on this list).
@@ -596,6 +630,9 @@ async fn command_loop<W: traits::core::Writer>(
             }
             PeerCommand::SetExcludedPhrases { phrases } => {
                 *ctx.excluded_phrases.lock().unwrap() = phrases;
+            }
+            PeerCommand::ApplyConfig { live } => {
+                *ctx.live.lock().unwrap() = live;
             }
             PeerCommand::QueuePosition { username, filename, place } => {
                 PeerNet::send(&DownloadQueuePosition { username, filename, place }, &writer);
@@ -1149,7 +1186,7 @@ where
                 // the requester-side filter (min files / speed / queue) and only
                 // forward survivors to the UI, where they're correlated to the
                 // originating search by token.
-                let accepted = ctx.search_filter.accepts(&resp);
+                let accepted = ctx.live.lock().unwrap().search_filter.accepts(&resp);
                 if accepted {
                     let files = resp
                         .files
@@ -1482,7 +1519,10 @@ mod tests {
             next_token: AtomicU32::new(1),
             excluded_phrases: Mutex::new(Vec::new()),
             upload_queue: Mutex::new(UploadQueue::new(false)),
-            search_filter: SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 },
+            live: Mutex::new(LiveConfig {
+                search_filter: SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 },
+                max_results: 100,
+            }),
         })
     }
 
@@ -1697,7 +1737,10 @@ mod tests {
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
                 upload_queue: Mutex::new(UploadQueue::new(false)),
-                search_filter: SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 },
+                live: Mutex::new(LiveConfig {
+                    search_filter: SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 },
+                    max_results: 100,
+                }),
             });
             ctx.downloads.lock().unwrap().by_token.insert(
                 42,
@@ -1830,7 +1873,10 @@ mod tests {
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
                 upload_queue: Mutex::new(UploadQueue::new(false)),
-                search_filter: SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 },
+                live: Mutex::new(LiveConfig {
+                    search_filter: SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 },
+                    max_results: 100,
+                }),
             });
             ctx.downloads.lock().unwrap().by_token.insert(
                 7,
@@ -1960,7 +2006,10 @@ mod tests {
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
                 upload_queue: Mutex::new(UploadQueue::new(false)),
-                search_filter: SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 },
+                live: Mutex::new(LiveConfig {
+                    search_filter: SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 },
+                    max_results: 100,
+                }),
             });
             ctx.downloads.lock().unwrap().by_token.insert(
                 42,
@@ -2139,7 +2188,10 @@ mod tests {
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
                 upload_queue: Mutex::new(UploadQueue::new(false)),
-                search_filter: SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 },
+                live: Mutex::new(LiveConfig {
+                    search_filter: SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 },
+                    max_results: 100,
+                }),
             });
             let serve = tokio::spawn(async move {
                 serve_distrib(&mut server, &ctx, "parent", &mut |_| {}).await
@@ -2186,7 +2238,10 @@ mod tests {
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
                 upload_queue: Mutex::new(UploadQueue::new(false)),
-                search_filter: SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 },
+                live: Mutex::new(LiveConfig {
+                    search_filter: SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 },
+                    max_results: 100,
+                }),
             });
             let tid = ctx.upload_queue.lock().unwrap().enqueue("bob");
             ctx.uploads.lock().unwrap().by_token.insert(
@@ -2346,7 +2401,10 @@ mod tests {
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
                 upload_queue: Mutex::new(UploadQueue::new(false)),
-                search_filter: SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 },
+                live: Mutex::new(LiveConfig {
+                    search_filter: SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 },
+                    max_results: 100,
+                }),
             });
             let ctx_serve = ctx.clone();
             let serve = tokio::spawn(async move {
@@ -2387,7 +2445,7 @@ mod tests {
             next_token: AtomicU32::new(1),
             excluded_phrases: Mutex::new(Vec::new()),
             upload_queue: Mutex::new(UploadQueue::new(false)),
-            search_filter: filter,
+            live: Mutex::new(LiveConfig { search_filter: filter, max_results: 100 }),
         });
         (ctx, cmd_rx)
     }
@@ -2434,6 +2492,33 @@ mod tests {
                 }
                 other => panic!("expected SearchResult, got ok={}", other.is_ok()),
             }
+        });
+    }
+
+    #[test]
+    fn search_filter_change_applies_live() {
+        // Start permissive, then tighten the filter at runtime exactly as a
+        // ConfigChanged does (ApplyConfig replaces ctx.live). The reactor reads
+        // ctx.live per response, so the new threshold takes effect without a
+        // restart and a now-too-slow result is dropped.
+        runtime().block_on(async {
+            let (mut client, server) = tokio::io::duplex(64 * 1024);
+            let (ctx, mut cmd_rx) =
+                ctx_with_filter(SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 });
+            // Live config update (what PeerCommand::ApplyConfig applies).
+            *ctx.live.lock().unwrap() = LiveConfig {
+                search_filter: SearchFilter { min_files: 1, min_upload_speed: 1_000, max_queue_length: 0 },
+                max_results: 100,
+            };
+            let ctx_serve = ctx.clone();
+            let serve = tokio::spawn(async move {
+                serve_connection(server, &ctx_serve, Some("peer".into()), |_| {}).await
+            });
+
+            client.write_all(&inbound_response(7, 1, 10, 0).to_frame()).await.unwrap(); // 10 < 1000
+            drop(client);
+            serve.await.unwrap().unwrap();
+            assert!(cmd_rx.try_recv().is_err(), "live-tightened filter drops the slow result");
         });
     }
 

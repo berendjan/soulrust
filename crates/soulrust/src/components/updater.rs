@@ -12,7 +12,7 @@ use crate::components::github::{
 };
 use crate::config::{AppContext, UpdateConfig};
 use crate::messages::{
-    ApplyUpdateReq, ApplyUpdateResult, HandlerId, UpdateDownloaded, UpdaterStatus,
+    ApplyUpdateReq, ApplyUpdateResult, ConfigChanged, HandlerId, UpdateDownloaded, UpdaterStatus,
     UpdaterStatusChanged,
 };
 use crate::version::VERSION;
@@ -157,6 +157,16 @@ fn writable_exe_dir() -> Result<PathBuf, String> {
             "executable directory {} is not writable (development run?)",
             dir.display()
         )),
+    }
+}
+
+impl traits::core::Handle<ConfigChanged> for Updater {
+    fn handle<W: traits::core::Writer>(&mut self, message: &ConfigChanged, _writer: &W) {
+        // Pick up update-setting changes live: a later auto_apply flip decides
+        // whether a found update applies on its own, and repo/enabled changes
+        // take effect on the next check — no restart needed.
+        self.auto_apply = message.config.update.auto_apply;
+        self.update_config = message.config.update.clone();
     }
 }
 
@@ -361,6 +371,22 @@ mod tests {
         ));
         assert!(updater.pending.is_some());
         std::fs::remove_file(&artifact).ok();
+    }
+
+    #[test]
+    fn config_change_updates_settings_live() {
+        // A ConfigChanged picks up auto_apply and repo without a restart.
+        let writer = CapturingWriter::default();
+        let mut updater = Updater::for_test(false);
+        assert!(!updater.auto_apply);
+
+        let mut config = crate::config::Config::default();
+        config.update.auto_apply = true;
+        config.update.repo = "owner/newrepo".into();
+        traits::core::Handle::<ConfigChanged>::handle(&mut updater, &ConfigChanged { config }, &writer);
+
+        assert!(updater.auto_apply, "auto_apply flipped live");
+        assert_eq!(updater.update_config.repo, "owner/newrepo", "repo updated live");
     }
 
     #[test]
