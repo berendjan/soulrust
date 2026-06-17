@@ -1105,7 +1105,13 @@ where
     on_activity(format!("receiving {} from {} (token {token})", active.filename, active.username));
 
     let basename = download_basename(&active.filename);
-    let incomplete = ctx.incomplete_dir.join(format!("INCOMPLETE-{token}-{basename}"));
+    // Name the partial by (username, virtual path), NOT the per-attempt transfer
+    // token: the token is fresh on every (re)negotiation, so a token-keyed name
+    // could never be found again to resume. A stable key lets a re-queued
+    // download pick up exactly where a previous attempt left off.
+    let incomplete = ctx
+        .incomplete_dir
+        .join(incomplete_name(&active.username, &active.filename, &basename));
 
     match receive_to_disk(stream, &incomplete, &ctx.download_dir, &basename, active.size).await {
         Ok(path) => Ok(ConnOutcome::Downloaded {
@@ -1114,7 +1120,9 @@ where
             path,
         }),
         Err(reason) => {
-            let _ = tokio::fs::remove_file(&incomplete).await;
+            // Keep the partial on failure so the next attempt resumes from it
+            // (the stable name above makes it findable). It is only removed once
+            // the bytes are complete and the file is moved into place.
             Ok(ConnOutcome::DownloadFailed {
                 username: active.username,
                 filename: active.filename,
@@ -1122,6 +1130,31 @@ where
             })
         }
     }
+}
+
+/// The incomplete-file name for a download, stable across transfer attempts:
+/// `INCOMPLETE-<key>-<basename>`, where `key` is a deterministic hash of the
+/// (username, virtual path) pair. Two different downloads (different user or
+/// path) never collide, and the *same* download always maps to the same partial
+/// regardless of the transfer token, so a retry resumes it.
+fn incomplete_name(username: &str, virtual_path: &str, basename: &str) -> String {
+    let key = stable_key(username, virtual_path);
+    format!("INCOMPLETE-{key:016x}-{basename}")
+}
+
+/// A deterministic 64-bit FNV-1a hash of `username` and `virtual_path` (with a
+/// separator that cannot appear in the inputs ambiguously). Deterministic across
+/// runs — unlike `DefaultHasher` — so an incomplete file is found after a
+/// restart, which is what makes cross-session resume work.
+fn stable_key(username: &str, virtual_path: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in username.bytes().chain(std::iter::once(0)).chain(virtual_path.bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 /// The on-disk basename for a downloaded virtual path: the last `\\`-separated
@@ -1171,9 +1204,10 @@ async fn unique_download_path(dir: &Path, basename: &str) -> PathBuf {
     unreachable!("counter exhausts u128 before paths")
 }
 
-/// Streams `size` bytes from the connection into `incomplete`, then moves it
-/// into `download_dir` under a non-colliding name derived from `basename`. Bytes
-/// go straight to disk — never the bus.
+/// Streams the remaining bytes of `size` from the connection into `incomplete`,
+/// resuming from whatever is already on disk, then moves the completed file into
+/// `download_dir` under a non-colliding name derived from `basename`. Bytes go
+/// straight to disk — never the bus.
 async fn receive_to_disk<S>(
     stream: &mut S,
     incomplete: &Path,
@@ -1187,11 +1221,24 @@ where
     for dir in [incomplete.parent(), Some(download_dir)].into_iter().flatten() {
         tokio::fs::create_dir_all(dir).await.map_err(|e| format!("create {}: {e}", dir.display()))?;
     }
-    let file = tokio::fs::File::create(incomplete)
+    // Resume point: bytes already on disk from a prior attempt. A partial that
+    // is somehow >= the declared size is treated as unusable and restarted from
+    // scratch (a truncated re-download is safer than trusting stale bytes).
+    let existing = tokio::fs::metadata(incomplete).await.map(|m| m.len()).unwrap_or(0);
+    let offset = if existing < size { existing } else { 0 };
+
+    // Append when resuming so we keep the partial; truncate for a fresh start.
+    let file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(offset > 0)
+        .truncate(offset == 0)
+        .open(incomplete)
         .await
-        .map_err(|e| format!("create {}: {e}", incomplete.display()))?;
-    // Fresh transfer from offset 0 (resume is a later refinement).
-    transfer_io::download(stream, 0, size, file).await.map_err(|e| format!("receiving: {e}"))?;
+        .map_err(|e| format!("open {}: {e}", incomplete.display()))?;
+    transfer_io::download(stream, offset, size, file)
+        .await
+        .map_err(|e| format!("receiving: {e}"))?;
     // Resolve the collision-free destination only now the bytes are on disk.
     let final_path = unique_download_path(download_dir, basename).await;
     tokio::fs::rename(incomplete, &final_path)
@@ -1566,6 +1613,135 @@ mod tests {
             assert_eq!(filename, "Music\\got.mp3");
             assert_eq!(std::fs::read(&path).unwrap(), b"hello world");
             let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    /// A fresh, uniquely-named temp directory for a resume test (no `tempfile`
+    /// dependency; the caller cleans it up).
+    fn unique_dir(tag: &str) -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("soulrust-{tag}-{}-{n}", std::process::id()))
+    }
+
+    #[test]
+    fn incomplete_name_is_stable_per_user_and_path() {
+        // The same (user, path) must always map to the same partial name so a
+        // retry resumes it; different users or paths must not collide.
+        let a = incomplete_name("bob", "Music\\x.mp3", "x.mp3");
+        assert_eq!(a, incomplete_name("bob", "Music\\x.mp3", "x.mp3"), "stable across calls");
+        assert_ne!(a, incomplete_name("alice", "Music\\x.mp3", "x.mp3"), "different user differs");
+        assert_ne!(a, incomplete_name("bob", "Music\\y.mp3", "y.mp3"), "different path differs");
+        assert!(a.starts_with("INCOMPLETE-") && a.ends_with("x.mp3"));
+        // The key is independent of the transfer token (not part of the inputs).
+        assert!(!a.contains("token"));
+    }
+
+    #[test]
+    fn receive_to_disk_resumes_from_an_existing_partial() {
+        // A partial from a prior attempt is kept and the transfer resumes from
+        // its length: we send that offset and append the remaining bytes.
+        runtime().block_on(async {
+            let dir = unique_dir("resume");
+            std::fs::create_dir_all(&dir).unwrap();
+            let incomplete = dir.join("INCOMPLETE-abc-song.mp3");
+            let full = b"abcdefghijklmnopqrstuvwxyz".to_vec(); // 26 bytes
+            tokio::fs::write(&incomplete, &full[..10]).await.unwrap(); // 10 already on disk
+
+            let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+            let dir2 = dir.clone();
+            let size = full.len() as u64;
+            let recv = tokio::spawn(async move {
+                receive_to_disk(&mut server, &incomplete, &dir2, "song.mp3", size).await
+            });
+
+            // Uploader side: read the resume offset, then stream the remainder.
+            let mut off = [0u8; 8];
+            client.read_exact(&mut off).await.unwrap();
+            assert_eq!(u64::from_le_bytes(off), 10, "resume offset == existing partial length");
+            client.write_all(&full[10..]).await.unwrap();
+            drop(client);
+
+            let path = recv.await.unwrap().unwrap();
+            assert_eq!(tokio::fs::read(&path).await.unwrap(), full, "partial + resumed == full file");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn receive_to_disk_restarts_when_partial_exceeds_declared_size() {
+        // A partial at least as large as the declared size is unusable (stale or
+        // corrupt): restart from offset 0 rather than trusting it.
+        runtime().block_on(async {
+            let dir = unique_dir("restart");
+            std::fs::create_dir_all(&dir).unwrap();
+            let incomplete = dir.join("INCOMPLETE-def-x.bin");
+            tokio::fs::write(&incomplete, vec![0xAAu8; 50]).await.unwrap(); // bogus 50-byte partial
+
+            let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+            let dir2 = dir.clone();
+            let fresh = vec![0x42u8; 20];
+            let recv = tokio::spawn(async move {
+                receive_to_disk(&mut server, &incomplete, &dir2, "x.bin", 20).await
+            });
+
+            let mut off = [0u8; 8];
+            client.read_exact(&mut off).await.unwrap();
+            assert_eq!(u64::from_le_bytes(off), 0, "oversized partial restarts at 0");
+            client.write_all(&fresh).await.unwrap();
+            drop(client);
+
+            let path = recv.await.unwrap().unwrap();
+            assert_eq!(tokio::fs::read(&path).await.unwrap(), fresh, "file is the fresh bytes, not the stale partial");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn failed_download_keeps_the_partial_for_resume() {
+        // A short/aborted transfer must leave the partial on disk (under the
+        // stable name) so a later attempt can resume it.
+        runtime().block_on(async {
+            let dir = unique_dir("keep-partial");
+            std::fs::create_dir_all(&dir).unwrap();
+            let (cmd_tx, cmd_rx) = unbounded_channel();
+            std::mem::forget(cmd_rx);
+            let ctx = Arc::new(ConnCtx {
+                shares: Arc::new(test_index()),
+                queue: Arc::new(Mutex::new(PendingDeliveries::default())),
+                downloads: Mutex::new(Downloads::default()),
+                uploads: Mutex::new(Uploads::default()),
+                our_username: "me".into(),
+                download_dir: dir.clone(),
+                incomplete_dir: dir.clone(),
+                cmd_tx,
+                next_token: AtomicU32::new(1),
+                excluded_phrases: Mutex::new(Vec::new()),
+            });
+            ctx.downloads.lock().unwrap().by_token.insert(
+                7,
+                ActiveDownload { username: "bob".into(), filename: "Music\\got.mp3".into(), size: 100 },
+            );
+
+            let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+            let ctx2 = ctx.clone();
+            let recv = tokio::spawn(async move {
+                recv_file(&mut server, &ctx2, "bob", &mut |_| {}).await
+            });
+
+            client.write_all(&FileTransferInit { token: 7 }.to_bytes()).await.unwrap();
+            let mut off = [0u8; 8];
+            client.read_exact(&mut off).await.unwrap();
+            client.write_all(b"partialbytes").await.unwrap(); // 12 of the promised 100
+            drop(client); // abort before completion
+
+            let outcome = recv.await.unwrap().unwrap();
+            assert!(matches!(outcome, ConnOutcome::DownloadFailed { .. }), "short transfer fails");
+
+            let partial = dir.join(incomplete_name("bob", "Music\\got.mp3", "got.mp3"));
+            let meta = std::fs::metadata(&partial).expect("partial kept on disk for resume");
+            assert_eq!(meta.len(), 12, "the bytes received so far are retained");
+            let _ = std::fs::remove_dir_all(&dir);
         });
     }
 
