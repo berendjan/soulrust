@@ -60,6 +60,35 @@ pub struct SharedFile {
     pub attributes: Vec<(u32, u32)>,
 }
 
+impl SharedFile {
+    /// First value advertised for attribute `code`, if any. Codes follow
+    /// Nicotine+'s `FileAttribute`: 0 bitrate, 1 length, 2 vbr, 3 encoder,
+    /// 4 sample rate, 5 bit depth.
+    pub fn attr(&self, code: u32) -> Option<u32> {
+        self.attributes.iter().find(|(c, _)| *c == code).map(|&(_, v)| v)
+    }
+    /// Advertised bitrate in kbps (attribute 0).
+    pub fn bitrate(&self) -> Option<u32> {
+        self.attr(0)
+    }
+    /// Track length in seconds (attribute 1).
+    pub fn length(&self) -> Option<u32> {
+        self.attr(1)
+    }
+    /// Whether the bitrate is variable (attribute 2).
+    pub fn is_vbr(&self) -> bool {
+        self.attr(2) == Some(1)
+    }
+    /// Sample rate in Hz for lossless audio (attribute 4).
+    pub fn sample_rate(&self) -> Option<u32> {
+        self.attr(4)
+    }
+    /// Bit depth for lossless audio (attribute 5).
+    pub fn bit_depth(&self) -> Option<u32> {
+        self.attr(5)
+    }
+}
+
 /// One shared directory: its virtual path (e.g. `Music\\Album`) and files.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SharedDirectory {
@@ -483,6 +512,33 @@ impl PeerMessage {
 mod tests {
     use super::*;
     use crate::frame::split_frame;
+
+    #[test]
+    fn shared_file_audio_accessors_read_attribute_codes() {
+        // Lossy: bitrate + length + vbr (codes 0, 1, 2).
+        let lossy = SharedFile {
+            name: "a.mp3".into(),
+            size: 1,
+            extension: "mp3".into(),
+            attributes: vec![(0, 256), (1, 200), (2, 1)],
+        };
+        assert_eq!(lossy.bitrate(), Some(256));
+        assert_eq!(lossy.length(), Some(200));
+        assert!(lossy.is_vbr());
+        assert_eq!(lossy.sample_rate(), None);
+
+        // Lossless: sample rate + bit depth (codes 4, 5), no vbr.
+        let lossless = SharedFile {
+            name: "b.flac".into(),
+            size: 1,
+            extension: "flac".into(),
+            attributes: vec![(1, 200), (4, 44100), (5, 16)],
+        };
+        assert_eq!(lossless.sample_rate(), Some(44100));
+        assert_eq!(lossless.bit_depth(), Some(16));
+        assert_eq!(lossless.bitrate(), None);
+        assert!(!lossless.is_vbr());
+    }
 
     #[test]
     fn get_shared_file_list_frame_is_byte_exact() {

@@ -1542,7 +1542,7 @@ dependencies = [
 [[package]]
 name = "rust-messenger"
 version = "0.1.0"
-source = "git+file:///home/berend/Developer/rust-messenger?rev=b80597f#b80597f0a7830c04517e52a58f449075012c4e72"
+source = "git+file:///home/berend/Developer/rust-messenger?rev=00fbefe#00fbefedb4d8ceaa88cb8cd66d6dfd4aecbaad26"
 dependencies = [
  "libc",
  "windows-sys 0.60.2",

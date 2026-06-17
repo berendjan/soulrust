@@ -7,7 +7,7 @@ publish = false
 [dependencies]
 soulrust = { path = "../soulrust" }
 soulseek-proto = { path = "../soulseek-proto" }
-rust-messenger = { git = "file:///home/berend/Developer/rust-messenger", rev = "b80597f" }
+rust-messenger = { git = "file:///home/berend/Developer/rust-messenger", rev = "00fbefe" }
 testcontainers = { version = "0.27", features = ["blocking"] }
 ureq = "2"
 

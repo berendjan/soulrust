@@ -100,7 +100,12 @@ fn run_check<W: traits::core::Writer>(repo: &str, api: &dyn GithubReleases, writ
     let release = match api.latest_release(repo) {
         Ok(release) => release,
         Err(error) => {
-            send_status(UpdaterStatus::Failed { error }, writer);
+            // Failing to *check* (repo has no releases, 404, offline, rate
+            // limit) is not an app failure — skip quietly rather than alarm.
+            send_status(
+                UpdaterStatus::Skipped { reason: format!("couldn't check for updates: {error}") },
+                writer,
+            );
             return;
         }
     };
@@ -336,7 +341,9 @@ mod tests {
     }
 
     #[test]
-    fn api_error_reports_failed() {
+    fn api_error_skips_rather_than_failing() {
+        // A failed update *check* (offline, rate limit, 404 repo) is benign — it
+        // must not surface as an alarming "update failed".
         let writer = CapturingWriter::default();
         let api = MockGithub {
             release: Err("rate limited".into()),
@@ -345,7 +352,7 @@ mod tests {
         run_check("owner/repo", &api, &writer);
         assert!(matches!(
             writer.statuses().last(),
-            Some(UpdaterStatus::Failed { error }) if error.contains("rate limited")
+            Some(UpdaterStatus::Skipped { reason }) if reason.contains("rate limited")
         ));
     }
 

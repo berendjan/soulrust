@@ -84,6 +84,15 @@ pub enum Page {
     StatusFragment,
     SearchesFragment,
     ConfigForm,
+    /// The login/signup screen's live connection state (friendly, no log).
+    AccountStatus,
+    /// Set the results-table sort column (toggles direction if already active),
+    /// then render the searches fragment. `key` is a column id (user/folder/
+    /// file/size/bitrate/length/slot/speed/queue).
+    SortSearches { key: String },
+    /// Set the minimum-bitrate filter (kbps; 0 clears it), then render the
+    /// searches fragment.
+    FilterBitrate { min: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,6 +377,14 @@ pub struct SetExcludedPhrases {
 pub struct SearchResultFile {
     pub name: String,
     pub size: u64,
+    /// Advertised audio attributes (Nicotine+ `FileAttribute` codes), kept so
+    /// the UI can show Quality/Length columns and filter on bitrate. `None`
+    /// where the peer didn't advertise them (non-audio or sparse responses).
+    pub bitrate: Option<u32>,
+    pub length: Option<u32>,
+    pub vbr: bool,
+    pub sample_rate: Option<u32>,
+    pub bit_depth: Option<u32>,
 }
 
 /// peer_net → ui: a peer's response to one of our searches that cleared the

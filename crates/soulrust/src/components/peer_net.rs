@@ -1191,7 +1191,15 @@ where
                     let files = resp
                         .files
                         .into_iter()
-                        .map(|f| SearchResultFile { name: f.name, size: f.size })
+                        .map(|f| SearchResultFile {
+                            bitrate: f.bitrate(),
+                            length: f.length(),
+                            vbr: f.is_vbr(),
+                            sample_rate: f.sample_rate(),
+                            bit_depth: f.bit_depth(),
+                            name: f.name,
+                            size: f.size,
+                        })
                         .collect();
                     let _ = ctx.cmd_tx.send(PeerCommand::SearchResult {
                         token: resp.token,

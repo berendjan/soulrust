@@ -20,7 +20,8 @@ use crate::extract::Job;
 use crate::messages::{
     ApplyUpdateReq, ApplyUpdateResult, BrowseAccepted, BrowseHtml, BrowseRenderReq, BrowseUser,
     ConfigSnapshot, ExtractRequest, ExtractResult, GetConfigReq, HandlerId, HttpHtml, HttpRender,
-    Page, SetConfigReq, SetConfigResult, StartSearch, StartSearchResult, StartedSearch,
+    Page, SetConfigReq, SetConfigResult, StartDownload, StartSearch, StartSearchResult,
+    StartedSearch,
 };
 
 const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -199,16 +200,30 @@ impl<W: traits::core::Writer> SharedBridge<W> {
                     "text/javascript",
                     include_bytes!("../../assets/htmx.min.js").to_vec(),
                 ),
+                ("GET", "/assets/app.js") => {
+                    (200, "text/javascript", include_bytes!("../../assets/app.js").to_vec())
+                }
                 ("GET", "/") => self.html_page(self.render(Page::Index)),
                 ("GET", "/fragments/status") => self.html_page(self.render(Page::StatusFragment)),
                 ("GET", "/fragments/searches") => {
                     self.html_page(self.render(Page::SearchesFragment))
                 }
                 ("GET", "/fragments/browse") => self.html_page(self.browse_fragment()),
+                ("GET", "/fragments/account-status") => {
+                    self.html_page(self.render(Page::AccountStatus))
+                }
+                ("GET", "/account") => self.html_page(self.account_page(None)),
                 ("GET", "/bulk") => self.html_page(self.bulk_page()),
                 ("GET", "/spotify") => self.html_page(self.spotify_page(None)),
                 ("GET", "/config") => self.html_page(self.config_page()),
+                ("POST", "/account") => self.html_page(self.save_account(&body)),
+                ("POST", "/download") => self.html_page(self.submit_download(&body)),
                 ("POST", "/search") => self.html_page(self.submit_search(&body)),
+                ("POST", "/filter") => self.html_page(self.filter_bitrate(&body)),
+                ("GET", p) if p.starts_with("/sort/") => {
+                    let key = p.trim_start_matches("/sort/").to_string();
+                    self.html_page(self.render(Page::SortSearches { key }))
+                }
                 ("POST", "/browse") => self.html_page(self.submit_browse(&body)),
                 ("POST", "/spotify") => self.html_page(self.save_spotify(&body)),
                 ("POST", "/config") => self.html_page(self.save_config(&body)),
@@ -296,6 +311,32 @@ impl<W: traits::core::Writer> SharedBridge<W> {
         Ok(format!("{banner}{fragment}"))
     }
 
+    /// POST /filter: set the minimum-bitrate filter (kbps; blank/0 clears it)
+    /// and return the refreshed results fragment.
+    fn filter_bitrate(&self, body: &str) -> Result<String, String> {
+        let min = parse_form(body)
+            .get("min_bitrate")
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+        self.render(Page::FilterBitrate { min })
+    }
+
+    /// POST /download: queue a file from a search result. Fire-and-forget —
+    /// the session resolves the peer's address and peer_net opens the file
+    /// connection; progress shows up in the activity log. We just swap the
+    /// row's button for a confirmation.
+    fn submit_download(&self, body: &str) -> Result<String, String> {
+        let form = parse_form(body);
+        let username = form.get("username").cloned().unwrap_or_default();
+        let filename = form.get("filename").cloned().unwrap_or_default();
+        let size = form.get("size").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        if username.is_empty() || filename.is_empty() {
+            return Ok(r#"<span class="pill warn">bad request</span>"#.into());
+        }
+        WebBridge::send(&StartDownload { username, filename, size }, &self.writer);
+        Ok(r#"<span class="pill ok">● queued</span>"#.into())
+    }
+
     /// GET /fragments/browse: render the current browse state (owned by the
     /// Browse read-model component).
     fn browse_fragment(&self) -> Result<String, String> {
@@ -375,6 +416,25 @@ impl<W: traits::core::Writer> SharedBridge<W> {
                 config.spotify.client_secret = Some(v);
             }
         }
+        if let Some(v) = get("download_dir") {
+            config.sharing.download_dir = v;
+        }
+        if let Some(v) = get("incomplete_dir") {
+            config.sharing.incomplete_dir = v;
+        }
+        if let Some(v) = form.get("folders") {
+            config.sharing.folders = v
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect();
+        }
+        if let Some(v) = get("upload_slots") {
+            config.sharing.upload_slots =
+                v.parse().map_err(|_| format!("invalid upload slots: {v}"))?;
+        }
+        config.sharing.respond_to_searches = form.contains_key("respond_to_searches");
         config.update.enabled = form.contains_key("update_enabled");
         config.update.auto_apply = form.contains_key("update_auto_apply");
         if let Some(v) = get("update_repo") {
@@ -404,7 +464,7 @@ impl<W: traits::core::Writer> SharedBridge<W> {
         };
 
         let banner = match &result {
-            Ok(()) => r#"<div class="banner">configuration saved — server/spotify changes apply after a restart</div>"#.to_string(),
+            Ok(()) => r#"<div class="banner">Configuration saved — reconnecting to Soulseek with the new settings. Watch the status on the <a href="/">Search</a> page.</div>"#.to_string(),
             Err(err) => format!(r#"<div class="banner error">{}</div>"#, escape(err)),
         };
         Ok(render_config_page(&config, Some(banner)))
@@ -421,6 +481,48 @@ impl<W: traits::core::Writer> SharedBridge<W> {
             Ok(()) => r#"<div class="banner">update installed — restart soulrust</div>"#.into(),
             Err(err) => format!(r#"<div class="banner error">{}</div>"#, escape(&err)),
         })
+    }
+
+    /// GET /account: the login / sign-up screen (reached from the footer chip).
+    fn account_page(&self, banner: Option<String>) -> Result<String, String> {
+        let config = self.current_config()?;
+        Ok(render_account_page(&config, banner))
+    }
+
+    /// POST /account: save the Soulseek username/password, which triggers a live
+    /// reconnect; the page then polls the connection status.
+    fn save_account(&self, body: &str) -> Result<String, String> {
+        let form = parse_form(body);
+        let mut config = self.current_config()?;
+
+        if let Some(v) = form.get("username").map(|s| s.trim().to_owned()) {
+            config.server.username = v;
+        }
+        if let Some(v) = form.get("password") {
+            if !v.is_empty() {
+                config.server.password = v.clone();
+            }
+        }
+
+        if config.server.username.trim().is_empty() {
+            return Ok(render_account_page(
+                &config,
+                Some(r#"<div class="banner error">Enter a username to sign in or create an account.</div>"#.to_string()),
+            ));
+        }
+
+        let result = match self.round_trip(|corr| {
+            WebBridge::send(&SetConfigReq { corr, config: config.clone() }, &self.writer);
+        })? {
+            BridgeReply::SetConfig(result) => result,
+            _ => return Err("unexpected reply type".into()),
+        };
+
+        let banner = match &result {
+            Ok(()) => r#"<div class="banner">Signing in to Soulseek… the status below updates in a moment.</div>"#.to_string(),
+            Err(err) => format!(r#"<div class="banner error">{}</div>"#, escape(err)),
+        };
+        Ok(render_account_page(&config, Some(banner)))
     }
 
     /// GET /bulk: a dedicated page for queuing many tracks at once. Pick a
@@ -467,6 +569,19 @@ impl<W: traits::core::Writer> SharedBridge<W> {
     }
 }
 
+/// A placeholder of one bullet per character for a configured secret, so the
+/// field shows that something is set without revealing it. `if_unset` is the
+/// hint shown when there's no secret yet. Capped so a long secret can't blow
+/// out the field width.
+fn secret_placeholder(secret: &str, if_unset: &str) -> String {
+    let len = secret.chars().count();
+    if len == 0 {
+        if_unset.to_string()
+    } else {
+        "•".repeat(len.min(40))
+    }
+}
+
 /// True when both Spotify credentials are present.
 fn spotify_connected(config: &Config) -> bool {
     config.spotify.client_id.as_deref().is_some_and(|s| !s.is_empty())
@@ -507,10 +622,12 @@ fn render_bulk_page(config: &Config) -> String {
 </form>
 </div>
 <h2>Searches</h2>
-<div id="bulk-results" hx-get="/fragments/searches" hx-trigger="load, every 2s"></div>"##,
+{col_bar}
+<div id="bulk-results" class="results" hx-get="/fragments/searches" hx-trigger="load, every 2s"></div>"##,
+        col_bar = crate::components::ui_theme::col_bar(0),
         spotify_card = spotify_status_card(config),
     );
-    shell("soulrust — bulk downloads", "bulk", &body)
+    shell("soulrust — bulk downloads", "bulk", &config.server.username, &body)
 }
 
 fn render_spotify_page(config: &Config, banner: Option<String>) -> String {
@@ -546,13 +663,43 @@ fn render_spotify_page(config: &Config, banner: Option<String>) -> String {
         status = status,
         banner = banner.unwrap_or_default(),
         client_id = escape(config.spotify.client_id.as_deref().unwrap_or("")),
-        secret_ph = if config.spotify.client_secret.as_deref().is_some_and(|s| !s.is_empty()) {
-            "saved — leave empty to keep"
-        } else {
-            "paste the client secret"
-        },
+        secret_ph = secret_placeholder(
+            config.spotify.client_secret.as_deref().unwrap_or(""),
+            "paste the client secret",
+        ),
     );
-    shell("soulrust — connect Spotify", "spotify", &body)
+    shell("soulrust — connect Spotify", "spotify", &config.server.username, &body)
+}
+
+fn render_account_page(config: &Config, banner: Option<String>) -> String {
+    let body = format!(
+        r##"<h1>Account</h1>
+<p class="sub">Sign in to Soulseek, or create a new account. Soulseek has no separate sign-up — entering a username nobody has used yet registers it on first sign-in.</p>
+{banner}
+<div id="account-status" hx-get="/fragments/account-status" hx-trigger="load, every 2s"></div>
+<div class="card">
+<form hx-post="/account" hx-target="body">
+  <label for="acc-user">Username</label>
+  <input id="acc-user" type="text" name="username" value="{username}" placeholder="your Soulseek username" autocomplete="username">
+  <label for="acc-pass" style="margin-top:0.8rem">Password</label>
+  <input id="acc-pass" type="password" name="password" value="" placeholder="{password_ph}" autocomplete="current-password">
+  <p style="margin-top:1rem"><button class="btn" type="submit">Sign in / create account</button></p>
+</form>
+</div>
+<div class="card">
+<h2 style="margin-top:0">Creating a new account</h2>
+<ol class="steps">
+  <li>Pick a <strong>username nobody else has used</strong> and any password.</li>
+  <li>Click <strong>Sign in / create account</strong> — the name is registered on first sign-in.</li>
+  <li>If it says <code>INVALIDPASS</code>, that username is already taken — choose a different one.</li>
+</ol>
+<p class="muted">There's no email or password recovery on Soulseek, so keep your password safe. It's stored locally and only ever sent to the server as a hash.</p>
+</div>"##,
+        banner = banner.unwrap_or_default(),
+        username = escape(&config.server.username),
+        password_ph = secret_placeholder(&config.server.password, "your password"),
+    );
+    shell("soulrust — account", "account", &config.server.username, &body)
 }
 
 fn render_config_page(config: &Config, banner: Option<String>) -> String {
@@ -566,13 +713,21 @@ fn render_config_page(config: &Config, banner: Option<String>) -> String {
 <label>host <input type="text" name="host" value="{host}"></label>
 <label>port <input type="text" name="port" value="{port}"></label>
 <label>username <input type="text" name="username" value="{username}"></label>
-<label>password (leave empty to keep) <input type="password" name="password" value=""></label>
+<label>password (leave empty to keep) <input type="password" name="password" value="" placeholder="{password_ph}"></label>
 <label>listen port <input type="text" name="listen_port" value="{listen_port}"></label>
+</div>
+<div class="card"><h2 style="margin-top:0">Downloads &amp; sharing</h2>
+<p class="muted" style="margin-top:0">Where finished downloads land, and which of your folders you share with the network. Applies after a restart.</p>
+<label>download folder <input type="text" name="download_dir" value="{download_dir}" placeholder="/home/you/Music/soulrust"></label>
+<label>incomplete folder (optional) <input type="text" name="incomplete_dir" value="{incomplete_dir}" placeholder="leave empty to use the download folder"></label>
+<label>shared folders — one path per line <textarea name="folders" rows="3" placeholder="/home/you/Music">{folders}</textarea></label>
+<label>upload slots <input type="text" name="upload_slots" value="{upload_slots}"></label>
+<label><input type="checkbox" name="respond_to_searches" {respond}> let other users find and download my shared files</label>
 </div>
 <div class="card"><h2 style="margin-top:0">Spotify</h2>
 <p class="muted" style="margin-top:0">Prefer the guided <a href="/spotify">Connect Spotify</a> page if you're not sure how to get these.</p>
 <label>client id <input type="text" name="spotify_client_id" value="{client_id}"></label>
-<label>client secret (leave empty to keep) <input type="password" name="spotify_client_secret" value=""></label>
+<label>client secret (leave empty to keep) <input type="password" name="spotify_client_secret" value="" placeholder="{secret_ph}"></label>
 </div>
 <div class="card"><h2 style="margin-top:0">Updates</h2>
 <label><input type="checkbox" name="update_enabled" {enabled}> check for updates on startup</label>
@@ -596,6 +751,16 @@ fn render_config_page(config: &Config, banner: Option<String>) -> String {
         username = escape(&config.server.username),
         listen_port = config.server.listen_port,
         client_id = escape(config.spotify.client_id.as_deref().unwrap_or("")),
+        password_ph = secret_placeholder(&config.server.password, ""),
+        secret_ph = secret_placeholder(
+            config.spotify.client_secret.as_deref().unwrap_or(""),
+            "",
+        ),
+        download_dir = escape(&config.sharing.download_dir),
+        incomplete_dir = escape(&config.sharing.incomplete_dir),
+        folders = escape(&config.sharing.folders.join("\n")),
+        upload_slots = config.sharing.upload_slots,
+        respond = checked(config.sharing.respond_to_searches),
         enabled = checked(config.update.enabled),
         auto_apply = checked(config.update.auto_apply),
         repo = escape(&config.update.repo),
@@ -604,7 +769,7 @@ fn render_config_page(config: &Config, banner: Option<String>) -> String {
         min_speed = config.sharing.min_peer_upload_speed,
         max_queue = config.sharing.max_peer_queue_length,
     );
-    shell("soulrust — settings", "config", &body)
+    shell("soulrust — settings", "config", &config.server.username, &body)
 }
 
 /// Minimal application/x-www-form-urlencoded parser (avoids a url dep).
@@ -696,6 +861,55 @@ mod tests {
         assert!(html.contains("server.slsknet.org"));
         // Shares the themed shell + nav.
         assert!(html.contains(r#"href="/bulk""#) && html.contains(r#"href="/spotify""#));
+    }
+
+    #[test]
+    fn config_page_exposes_download_dir_and_shared_folders() {
+        let mut config = Config::default();
+        config.sharing.download_dir = "/home/me/Music/soulrust".into();
+        config.sharing.folders = vec!["/home/me/Music".into(), "/data/flac".into()];
+        let html = render_config_page(&config, None);
+        assert!(html.contains(r#"name="download_dir""#) && html.contains("/home/me/Music/soulrust"));
+        assert!(html.contains(r#"name="incomplete_dir""#));
+        // Shared folders render one path per line inside the textarea.
+        assert!(html.contains(r#"name="folders""#));
+        assert!(html.contains("/home/me/Music\n/data/flac"));
+        assert!(html.contains(r#"name="respond_to_searches""#));
+    }
+
+    #[test]
+    fn configured_secrets_show_as_dots_not_values() {
+        let mut config = Config::default();
+        config.server.password = "hunter2".into(); // 7 chars
+        config.spotify.client_secret = Some("abcd".into()); // 4 chars
+        let html = render_config_page(&config, None);
+        // The dot placeholders appear, one bullet per character...
+        assert!(html.contains(&format!(r#"placeholder="{}""#, "•".repeat(7))));
+        assert!(html.contains(&format!(r#"placeholder="{}""#, "•".repeat(4))));
+        // ...and the real secrets are never rendered.
+        assert!(!html.contains("hunter2") && !html.contains("abcd"));
+    }
+
+    #[test]
+    fn unset_secret_has_no_dot_placeholder() {
+        assert_eq!(secret_placeholder("", "type it"), "type it");
+        assert_eq!(secret_placeholder("ab", "type it"), "••");
+    }
+
+    #[test]
+    fn account_page_is_a_login_signup_screen() {
+        let mut config = Config::default();
+        config.server.username = "dj".into();
+        config.server.password = "pw".into();
+        let html = render_account_page(&config, None);
+        // Username + password form posting to /account, with a live status region.
+        assert!(html.contains(r#"name="username""#) && html.contains(r#"name="password""#));
+        assert!(html.contains(r#"hx-post="/account""#));
+        assert!(html.contains(r#"hx-get="/fragments/account-status""#));
+        // Sign-up guidance, and the username is prefilled while the password is masked.
+        assert!(html.contains("Creating a new account") && html.contains("INVALIDPASS"));
+        assert!(html.contains(r#"value="dj""#));
+        assert!(!html.contains(r#"value="pw""#), "password is never rendered");
     }
 
     #[test]

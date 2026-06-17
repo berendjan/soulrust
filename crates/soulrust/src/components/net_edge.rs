@@ -14,7 +14,15 @@ use socket2::{SockRef, TcpKeepalive};
 use soulseek_proto::frame::split_frame;
 
 use crate::config::AppContext;
-use crate::messages::{HandlerId, NetConn, NetConnEvent, NetRx, NetTx};
+use crate::messages::{ConfigChanged, HandlerId, NetConn, NetConnEvent, NetRx, NetTx};
+
+fn server_addr(server: &crate::config::ServerConfig) -> Option<String> {
+    if server.username.trim().is_empty() {
+        None
+    } else {
+        Some(format!("{}:{}", server.host, server.port))
+    }
+}
 
 pub struct NetEdge {
     /// host:port, or None when no credentials are configured (don't connect).
@@ -27,14 +35,29 @@ pub struct NetEdge {
 
 impl NetEdge {
     pub fn new<W: traits::core::Writer>(ctx: &AppContext, _writer: &W) -> Self {
-        let server = &ctx.config.server;
-        let server_addr = if server.username.trim().is_empty() {
-            None
-        } else {
-            Some(format!("{}:{}", server.host, server.port))
-        };
         let (write_tx, write_rx) = mpsc::channel();
-        NetEdge { server_addr, write_rx, write_tx, sock: None }
+        NetEdge { server_addr: server_addr(&ctx.config.server), write_rx, write_tx, sock: None }
+    }
+
+    /// Spawn the connector/reader thread for `addr`. It emits Connected/Closed/
+    /// Failed and feeds NetRx; the session logs in on Connected.
+    fn start_connector<W: traits::core::Writer>(&self, addr: String, writer: &W) {
+        let write_tx = self.write_tx.clone();
+        let writer = writer.clone();
+        std::thread::Builder::new()
+            .name("soulrust-net".into())
+            .spawn(move || connect_and_read(&addr, &write_tx, &writer))
+            .expect("spawning network thread");
+    }
+
+    /// Tear down any live connection: shutting down the socket stops the reader
+    /// thread (its `read` returns 0), and we drop the write half + drain stale
+    /// ones so the next NetTx doesn't pick up an old socket.
+    fn disconnect(&mut self) {
+        if let Some(sock) = self.sock.take() {
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+        }
+        while self.write_rx.try_recv().is_ok() {}
     }
 }
 
@@ -43,24 +66,39 @@ impl traits::core::Handler for NetEdge {
     const ID: HandlerId = HandlerId::NetEdge;
 
     fn on_start<W: traits::core::Writer>(&mut self, writer: &W) {
-        let Some(addr) = self.server_addr.clone() else {
-            Self::send(
+        match self.server_addr.clone() {
+            Some(addr) => self.start_connector(addr, writer),
+            None => Self::send(
                 &NetConn {
                     event: NetConnEvent::Failed {
-                        reason: "no soulseek username configured (see /config)".into(),
+                        reason: "no soulseek username configured — set one in Settings".into(),
                     },
                 },
                 writer,
-            );
-            return;
-        };
+            ),
+        }
+    }
+}
 
-        let write_tx = self.write_tx.clone();
-        let writer = writer.clone();
-        std::thread::Builder::new()
-            .name("soulrust-net".into())
-            .spawn(move || connect_and_read(&addr, &write_tx, &writer))
-            .expect("spawning network thread");
+impl traits::core::Handle<ConfigChanged> for NetEdge {
+    fn handle<W: traits::core::Writer>(&mut self, message: &ConfigChanged, writer: &W) {
+        // Apply server credential/address changes live: drop any existing
+        // connection and reconnect with the new settings (the session updates
+        // its login from the same ConfigChanged and re-logs in on Connected).
+        let new_addr = server_addr(&message.config.server);
+        self.disconnect();
+        self.server_addr = new_addr.clone();
+        match new_addr {
+            Some(addr) => self.start_connector(addr, writer),
+            None => Self::send(
+                &NetConn {
+                    event: NetConnEvent::Failed {
+                        reason: "no soulseek username configured — set one in Settings".into(),
+                    },
+                },
+                writer,
+            ),
+        }
     }
 }
 

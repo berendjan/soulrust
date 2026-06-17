@@ -95,7 +95,7 @@ rust_messenger::Messenger! {
             PeerNet, PeerActivity: [ ui ],
             // broadcasts
             Session, SessionEvent: [ ui ],
-            ConfigStore, ConfigChanged: [ ui, peer_net, updater ],
+            ConfigStore, ConfigChanged: [ ui, peer_net, updater, session, net_edge ],
             Updater, UpdaterStatusChanged: [ ui ],
             // updater background thread -> updater (apply decision)
             Updater, UpdateDownloaded: [ updater ],

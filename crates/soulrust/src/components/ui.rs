@@ -28,13 +28,24 @@ enum SessionStatus {
     LoginFailed(String),
 }
 
+/// One file within a peer's response, with the audio attributes it advertised.
+struct ResultFile {
+    name: String,
+    size: u64,
+    bitrate: Option<u32>,
+    length: Option<u32>,
+    vbr: bool,
+    sample_rate: Option<u32>,
+    bit_depth: Option<u32>,
+}
+
 /// One peer's filter-passing response to a search.
 struct SearchResultRow {
     username: String,
     free_slots: bool,
     upload_speed: u32,
     in_queue: u32,
-    files: Vec<(String, u64)>,
+    files: Vec<ResultFile>,
 }
 
 struct SearchRow {
@@ -43,12 +54,47 @@ struct SearchRow {
     results: Vec<SearchResultRow>,
 }
 
+/// A column the results table can be sorted by. Mirrors the visible columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortKey {
+    User,
+    Folder,
+    File,
+    Size,
+    Bitrate,
+    Length,
+    Slot,
+    Speed,
+    Queue,
+}
+
+impl SortKey {
+    fn parse(s: &str) -> Option<SortKey> {
+        Some(match s {
+            "user" => SortKey::User,
+            "folder" => SortKey::Folder,
+            "file" => SortKey::File,
+            "size" => SortKey::Size,
+            "bitrate" => SortKey::Bitrate,
+            "length" => SortKey::Length,
+            "slot" => SortKey::Slot,
+            "speed" => SortKey::Speed,
+            "queue" => SortKey::Queue,
+            _ => return None,
+        })
+    }
+}
+
 pub struct Ui {
     session: SessionStatus,
     searches: Vec<SearchRow>,
     updater: Option<UpdaterStatus>,
     log: VecDeque<String>,
     username: String,
+    /// Active results sort: column + descending flag. `None` = arrival order.
+    sort: Option<(SortKey, bool)>,
+    /// Minimum bitrate (kbps) a result must advertise to be shown; 0 = no filter.
+    min_bitrate: u32,
 }
 
 impl Ui {
@@ -59,7 +105,18 @@ impl Ui {
             updater: None,
             log: VecDeque::new(),
             username: ctx.config.server.username.clone(),
+            sort: None,
+            min_bitrate: 0,
         }
+    }
+
+    /// Click a column header: sort by it ascending, or flip direction if it is
+    /// already the active column.
+    fn toggle_sort(&mut self, key: SortKey) {
+        self.sort = match self.sort {
+            Some((k, desc)) if k == key => Some((key, !desc)),
+            _ => Some((key, false)),
+        };
     }
 
     fn log(&mut self, line: String) {
@@ -75,11 +132,58 @@ impl Ui {
             Page::StatusFragment => self.render_status(),
             Page::SearchesFragment => self.render_searches(),
             Page::ConfigForm => self.render_config_note(),
+            Page::AccountStatus => self.render_account_status(),
+            // The sort/filter mutation happens in the HttpRender handler (it has
+            // &mut self); here we just render the updated table.
+            Page::SortSearches { .. } | Page::FilterBitrate { .. } => self.render_searches(),
+        }
+    }
+
+    /// Friendly login state for the account screen: connection result plus, on
+    /// failure, guidance (notably that INVALIDPASS usually means the username is
+    /// taken and a different one will create a new account).
+    fn render_account_status(&self) -> String {
+        match &self.session {
+            SessionStatus::LoggedIn { greeting, .. } => {
+                let note = if greeting.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(r#" <span class="muted">{}</span>"#, escape(greeting))
+                };
+                format!(
+                    r#"<div class="card"><span class="pill ok">● Signed in</span>
+<p style="margin:0.6rem 0 0">Connected as <strong>{}</strong>.{note}</p></div>"#,
+                    escape(&self.username)
+                )
+            }
+            SessionStatus::Connecting => {
+                r#"<div class="card"><span class="pill">● Connecting…</span></div>"#.into()
+            }
+            SessionStatus::Disconnected(reason) => format!(
+                r#"<div class="card"><span class="pill warn">● Not connected</span>
+<p class="muted" style="margin:0.6rem 0 0">{}</p></div>"#,
+                escape(reason)
+            ),
+            SessionStatus::LoginFailed(reason) => {
+                let hint = if reason.contains("INVALIDPASS") {
+                    "That username is already taken, or the password is wrong. To <strong>create a new account</strong>, choose a username nobody has used yet and pick any password — it's registered on first sign-in."
+                } else if reason.contains("INVALIDUSERNAME") {
+                    "That username isn't allowed — try a simpler one (letters and numbers)."
+                } else {
+                    "Check the username and password and try again."
+                };
+                format!(
+                    r#"<div class="card"><span class="pill warn">● Sign-in failed</span>
+<p style="margin:0.6rem 0 0.3rem"><strong>{}</strong></p><p class="muted" style="margin:0">{hint}</p></div>"#,
+                    escape(reason)
+                )
+            }
         }
     }
 
     fn render_index(&self) -> String {
-        let body = r##"<h1>Search</h1>
+        let body = format!(
+            r##"<h1>Search</h1>
 <p class="sub">Search the Soulseek network or browse a user's shared files. For many tracks at once, use <a href="/bulk">Bulk downloads</a>.</p>
 <div id="status" hx-get="/fragments/status" hx-trigger="load, every 2s"></div>
 <div class="card">
@@ -89,7 +193,8 @@ impl Ui {
   <button class="btn" type="submit">Search</button>
 </form>
 </div>
-<div id="searches" hx-get="/fragments/searches" hx-trigger="load, every 2s"></div>
+{col_bar}
+<div id="searches" class="results" hx-get="/fragments/searches" hx-trigger="load, every 2s"></div>
 <h2>Browse a user's shares</h2>
 <div class="card">
 <form hx-post="/browse" hx-target="#browse" hx-swap="innerHTML" style="display:flex; gap:0.5rem; align-items:flex-end;">
@@ -98,8 +203,10 @@ impl Ui {
   <button class="btn secondary" type="submit">Browse</button>
 </form>
 </div>
-<div id="browse" hx-get="/fragments/browse" hx-trigger="load, every 3s"></div>"##;
-        crate::components::ui_theme::shell("soulrust", "search", body)
+<div id="browse" hx-get="/fragments/browse" hx-trigger="load, every 3s"></div>"##,
+            col_bar = crate::components::ui_theme::col_bar(self.min_bitrate),
+        );
+        crate::components::ui_theme::shell("soulrust", "search", &self.username, &body)
     }
 
     fn render_status(&self) -> String {
@@ -177,44 +284,101 @@ impl Ui {
         self.searches.iter().rev().map(|s| self.render_search(s)).collect()
     }
 
-    /// One search: its query and the per-peer results that cleared the filter,
-    /// each result listing the peer (with slot/speed/queue) and its files.
+    /// A clickable, sort-aware column header cell. `id` is the sort key sent to
+    /// `/sort/{id}`; the active column shows a ▲/▼ arrow. `hx-target` is the
+    /// enclosing `.results` container so this works on both the search and bulk
+    /// pages (each has its own polled results div).
+    fn sort_th(&self, id: &str, title: &str, num: bool) -> String {
+        let arrow = match self.sort {
+            Some((k, desc)) if SortKey::parse(id) == Some(k) => {
+                if desc { " ▼" } else { " ▲" }
+            }
+            _ => "",
+        };
+        let active = if arrow.is_empty() { "" } else { " sorted" };
+        format!(
+            r##"<th class="col-{id}{numc}{active}"><a class="sort" hx-get="/sort/{id}" hx-target="closest .results" hx-swap="innerHTML">{title}{arrow}</a></th>"##,
+            id = id,
+            numc = if num { " num" } else { "" },
+            active = active,
+            title = escape(title),
+            arrow = arrow,
+        )
+    }
+
+    /// One search rendered as a dense, both-axis scrollable table: one row per
+    /// (peer, file). Columns mirror Nicotine+ (User, Folder, File, Size,
+    /// Bitrate, Length, plus slot/speed/queue and a Download button). Headers
+    /// sort the rows; the bitrate filter drops rows below `min_bitrate`. Column
+    /// visibility is driven by the CSS-only `.col-bar` toggles on the page
+    /// (outside this polled fragment, so their state survives the 2s refresh).
     fn render_search(&self, s: &SearchRow) -> String {
         let total_files: usize = s.results.iter().map(|r| r.files.len()).sum();
-        let body = if s.results.is_empty() {
-            "<p class=\"muted\">no results yet</p>".to_string()
+        if s.results.is_empty() {
+            return format!(
+                r#"<div class="card"><h3 style="margin-top:0">{query} <span class="muted">— no results yet</span></h3></div>"#,
+                query = escape(&s.query),
+            );
+        }
+        // Flatten to (peer, file) rows, applying the bitrate filter.
+        let mut rows: Vec<(&SearchResultRow, &ResultFile)> = s
+            .results
+            .iter()
+            .flat_map(|r| r.files.iter().map(move |f| (r, f)))
+            .filter(|(_, f)| self.min_bitrate == 0 || effective_bitrate(f).is_some_and(|b| b >= self.min_bitrate))
+            .collect();
+        if let Some((key, desc)) = self.sort {
+            rows.sort_by(|a, b| sort_cmp(key, a, b));
+            if desc {
+                rows.reverse();
+            }
+        }
+        let shown = rows.len();
+        let body: String = rows
+            .iter()
+            .map(|(r, f)| {
+                let slot = if r.free_slots {
+                    r#"<span class="pill ok">free</span>"#
+                } else {
+                    r#"<span class="pill warn">queued</span>"#
+                };
+                let length = f.length.map(length_str).unwrap_or_default();
+                // Form-encoded hidden inputs carry the exact path/size to
+                // POST /download; htmx swaps the button for "queued".
+                format!(
+                    r##"<tr><td class="col-user" title="{user}">{user}</td><td class="col-folder" title="{folder}">{folder}</td><td class="col-file" title="{path}">{file}</td><td class="col-size num">{human}</td><td class="col-bitrate num">{quality}</td><td class="col-length num">{length}</td><td class="col-slot">{slot}</td><td class="col-speed num">{speed}</td><td class="col-queue num">{queue}</td><td class="col-dl"><form hx-post="/download" hx-target="this" hx-swap="outerHTML" style="margin:0"><input type="hidden" name="username" value="{user}"><input type="hidden" name="filename" value="{path}"><input type="hidden" name="size" value="{size}"><button class="btn xs" type="submit">Get</button></form></td></tr>"##,
+                    user = escape(&r.username),
+                    folder = escape(dirname(&f.name)),
+                    path = escape(&f.name),
+                    file = escape(basename(&f.name)),
+                    human = human_size(f.size),
+                    quality = escape(&quality_str(f)),
+                    length = escape(&length),
+                    slot = slot,
+                    speed = r.upload_speed,
+                    queue = r.in_queue,
+                    size = f.size,
+                )
+            })
+            .collect();
+        let count = if shown == total_files {
+            format!("{peers} peer(s), {total_files} file(s)", peers = s.results.len())
         } else {
-            s.results
-                .iter()
-                .map(|r| {
-                    let slots = if r.free_slots { "free slot" } else { "no free slot" };
-                    let files: String = r
-                        .files
-                        .iter()
-                        .map(|(name, size)| {
-                            format!(
-                                "<li>{} <span class=\"muted\">({} bytes)</span></li>",
-                                escape(name),
-                                size
-                            )
-                        })
-                        .collect();
-                    format!(
-                        r#"<div class="result"><strong>{user}</strong> <span class="muted">— {slots}, {speed} B/s, queue {queue}</span><ul>{files}</ul></div>"#,
-                        user = escape(&r.username),
-                        slots = slots,
-                        speed = r.upload_speed,
-                        queue = r.in_queue,
-                        files = files,
-                    )
-                })
-                .collect()
+            format!("{shown} of {total_files} file(s) — bitrate filter active")
         };
         format!(
-            r#"<div class="card"><h3 style="margin-top:0">{query} <span class="muted">— {peers} peer(s), {files} file(s)</span></h3>{body}</div>"#,
+            r##"<div class="card"><h3 style="margin-top:0">{query} <span class="muted">— {count}</span></h3><div class="results-scroll"><table class="results-table"><thead><tr>{th_user}{th_folder}{th_file}{th_size}{th_bitrate}{th_length}{th_slot}{th_speed}{th_queue}<th class="col-dl"></th></tr></thead><tbody>{body}</tbody></table></div></div>"##,
             query = escape(&s.query),
-            peers = s.results.len(),
-            files = total_files,
+            count = count,
+            th_user = self.sort_th("user", "User", false),
+            th_folder = self.sort_th("folder", "Folder", false),
+            th_file = self.sort_th("file", "File", false),
+            th_size = self.sort_th("size", "Size", true),
+            th_bitrate = self.sort_th("bitrate", "Bitrate", true),
+            th_length = self.sort_th("length", "Length", true),
+            th_slot = self.sort_th("slot", "Slot", false),
+            th_speed = self.sort_th("speed", "Speed B/s", true),
+            th_queue = self.sort_th("queue", "Queue", true),
             body = body,
         )
     }
@@ -234,6 +398,16 @@ impl traits::core::Handler for Ui {
 
 impl traits::core::Handle<HttpRender> for Ui {
     fn handle<W: traits::core::Writer>(&mut self, message: &HttpRender, writer: &W) {
+        // Sort/filter pages mutate view state before rendering.
+        match &message.page {
+            Page::SortSearches { key } => {
+                if let Some(k) = SortKey::parse(key) {
+                    self.toggle_sort(k);
+                }
+            }
+            Page::FilterBitrate { min } => self.min_bitrate = *min,
+            _ => {}
+        }
         let html = self.render(&message.page);
         Self::send(&HttpHtml { corr: message.corr, html }, writer);
     }
@@ -316,7 +490,19 @@ impl traits::core::Handle<SearchResultReceived> for Ui {
             free_slots: message.free_slots,
             upload_speed: message.upload_speed,
             in_queue: message.in_queue,
-            files: message.files.iter().map(|f| (f.name.clone(), f.size)).collect(),
+            files: message
+                .files
+                .iter()
+                .map(|f| ResultFile {
+                    name: f.name.clone(),
+                    size: f.size,
+                    bitrate: f.bitrate,
+                    length: f.length,
+                    vbr: f.vbr,
+                    sample_rate: f.sample_rate,
+                    bit_depth: f.bit_depth,
+                })
+                .collect(),
         });
     }
 }
@@ -353,10 +539,127 @@ fn escape(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// The last path segment of a Soulseek virtual path (backslash- or
+/// slash-separated), for the dense File column. The full path stays in the
+/// row's `title` and the hidden download field.
+fn basename(path: &str) -> &str {
+    path.rsplit(['\\', '/']).next().filter(|s| !s.is_empty()).unwrap_or(path)
+}
+
+/// The folder portion of a Soulseek virtual path (everything before the last
+/// separator), for the Folder column.
+fn dirname(path: &str) -> &str {
+    match path.rfind(['\\', '/']) {
+        Some(i) => &path[..i],
+        None => "",
+    }
+}
+
+/// Bitrate to sort/filter on: the advertised value, or — for lossless audio
+/// that only gave sample rate + bit depth — Nicotine+'s estimate
+/// (sample_rate × bit_depth × 2 channels / 1000).
+fn effective_bitrate(f: &ResultFile) -> Option<u32> {
+    f.bitrate.or_else(|| match (f.sample_rate, f.bit_depth) {
+        (Some(sr), Some(bd)) => Some(sr.saturating_mul(bd).saturating_mul(2) / 1000),
+        _ => None,
+    })
+}
+
+/// The "Quality" cell, matching Nicotine+: `"44.1 kHz / 16 bit"` for lossless,
+/// else `"320 kbps"` (with ` (vbr)` for variable bitrate), else empty.
+fn quality_str(f: &ResultFile) -> String {
+    if let (Some(sr), Some(bd)) = (f.sample_rate, f.bit_depth) {
+        format!("{} kHz / {} bit", khz(sr), bd)
+    } else if let Some(br) = f.bitrate {
+        if f.vbr {
+            format!("{br} kbps (vbr)")
+        } else {
+            format!("{br} kbps")
+        }
+    } else {
+        String::new()
+    }
+}
+
+/// Sample rate in Hz to a compact kHz string (e.g. 44100 → `44.1`, 48000 → `48`).
+fn khz(sample_rate: u32) -> String {
+    let v = sample_rate as f64 / 1000.0;
+    if (v.fract()).abs() < 1e-9 {
+        format!("{}", v as u32)
+    } else {
+        format!("{v:.1}")
+    }
+}
+
+/// Seconds as `M:SS` (or `H:MM:SS` past an hour).
+fn length_str(secs: u32) -> String {
+    let (m, s) = (secs / 60, secs % 60);
+    let (h, m) = (m / 60, m % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// Order two flattened result rows by the active column.
+fn sort_cmp(
+    key: SortKey,
+    a: &(&SearchResultRow, &ResultFile),
+    b: &(&SearchResultRow, &ResultFile),
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (ar, af) = a;
+    let (br, bf) = b;
+    match key {
+        SortKey::User => ar.username.to_lowercase().cmp(&br.username.to_lowercase()),
+        SortKey::Folder => dirname(&af.name).to_lowercase().cmp(&dirname(&bf.name).to_lowercase()),
+        SortKey::File => basename(&af.name).to_lowercase().cmp(&basename(&bf.name).to_lowercase()),
+        SortKey::Size => af.size.cmp(&bf.size),
+        SortKey::Bitrate => effective_bitrate(af).cmp(&effective_bitrate(bf)),
+        SortKey::Length => af.length.cmp(&bf.length),
+        SortKey::Slot => ar.free_slots.cmp(&br.free_slots),
+        SortKey::Speed => ar.upload_speed.cmp(&br.upload_speed),
+        SortKey::Queue => ar.in_queue.cmp(&br.in_queue),
+    }
+    .then(Ordering::Equal)
+}
+
+/// Bytes as a compact human-readable size (e.g. `4.2 MB`).
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    #[test]
+    fn human_size_is_compact_and_unit_scaled() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1024), "1.0 KB");
+        assert_eq!(human_size(4_404_019), "4.2 MB");
+    }
+
+    #[test]
+    fn basename_takes_the_last_segment_of_either_separator() {
+        assert_eq!(basename("Music\\Gwen\\hit.mp3"), "hit.mp3");
+        assert_eq!(basename("a/b/c.flac"), "c.flac");
+        assert_eq!(basename("loose.mp3"), "loose.mp3");
+    }
 
     fn test_ui() -> Ui {
         let mut config = Config::default();
@@ -410,6 +713,7 @@ mod tests {
         let ui = test_ui();
         let html = ui.render(&Page::Index);
         assert!(html.contains("/assets/htmx.min.js"));
+        assert!(html.contains("/assets/app.js"), "scroll-preservation script is loaded");
         assert!(html.contains(r#"hx-get="/fragments/status""#));
         assert!(html.contains(r#"hx-post="/search""#));
     }
@@ -429,6 +733,22 @@ mod tests {
 
         apply(&mut ui, SessionEventKind::LoginFailed { reason: "INVALIDPASS".into() });
         assert!(ui.render(&Page::StatusFragment).contains("login failed: INVALIDPASS"));
+    }
+
+    #[test]
+    fn account_status_guides_account_creation_on_invalid_pass() {
+        let mut ui = test_ui();
+        apply(&mut ui, SessionEventKind::LoginFailed { reason: "INVALIDPASS".into() });
+        let html = ui.render(&Page::AccountStatus);
+        assert!(html.contains("Sign-in failed"));
+        assert!(html.contains("create a new account"), "explains how to make an account");
+
+        apply(&mut ui, SessionEventKind::LoggedIn {
+            greeting: "hi".into(),
+            own_ip: "1.2.3.4".into(),
+        });
+        let ok = ui.render(&Page::AccountStatus);
+        assert!(ok.contains("Signed in") && ok.contains("alice"));
     }
 
     #[test]
@@ -484,13 +804,36 @@ mod tests {
             free_slots: true,
             upload_speed: 4096,
             in_queue: 0,
-            files: vec![SearchResultFile { name: "Music\\Gwen\\hit.mp3".into(), size: 123 }],
+            files: vec![SearchResultFile {
+                name: "Music\\Gwen\\hit.mp3".into(),
+                size: 123,
+                bitrate: Some(320),
+                length: Some(184),
+                vbr: false,
+                sample_rate: None,
+                bit_depth: None,
+            }],
         };
         traits::core::Handle::<SearchResultReceived>::handle(&mut ui, &result, &NullWriter);
         let html = ui.render(&Page::SearchesFragment);
         assert!(html.contains("bob"), "peer username rendered");
-        assert!(html.contains("Music\\Gwen\\hit.mp3"), "result file rendered");
+        assert!(html.contains("Music\\Gwen\\hit.mp3"), "full path kept for download/title");
         assert!(html.contains("1 peer(s)"));
+        // Dense table: column classes drive the CSS show/hide toggles.
+        assert!(html.contains(r#"class="results-table""#), "rendered as a table");
+        assert!(html.contains(r#"class="col-user""#) && html.contains(r#"class="col-speed num""#));
+        // The File column shows the basename, the Folder column the dir.
+        assert!(html.contains(">hit.mp3<"), "file column shows the basename");
+        assert!(html.contains(r#"class="col-folder" title="Music\Gwen""#), "folder column");
+        // Audio attributes surface as Bitrate + Length columns.
+        assert!(html.contains("320 kbps"), "bitrate column rendered");
+        assert!(html.contains("3:04"), "length column rendered (184s)");
+        // Headers are clickable sort controls.
+        assert!(html.contains(r#"hx-get="/sort/bitrate""#), "sortable bitrate header");
+        // Each row carries a download form posting the exact path + size.
+        assert!(html.contains(r#"hx-post="/download""#), "row has a download action");
+        assert!(html.contains(r#"name="filename" value="Music\Gwen\hit.mp3""#));
+        assert!(html.contains(r#"name="size" value="123""#));
 
         // A result for a search we never started is ignored (token correlation).
         let stray = SearchResultReceived {
@@ -499,9 +842,79 @@ mod tests {
             free_slots: false,
             upload_speed: 0,
             in_queue: 0,
-            files: vec![SearchResultFile { name: "spam".into(), size: 1 }],
+            files: vec![SearchResultFile {
+                name: "spam".into(),
+                size: 1,
+                bitrate: None,
+                length: None,
+                vbr: false,
+                sample_rate: None,
+                bit_depth: None,
+            }],
         };
         traits::core::Handle::<SearchResultReceived>::handle(&mut ui, &stray, &NullWriter);
         assert!(!ui.render(&Page::SearchesFragment).contains("eve"), "unknown-token result dropped");
+    }
+
+    /// Feed one single-file result into a search via the real handler path.
+    fn feed_result(ui: &mut Ui, token: u32, user: &str, name: &str, bitrate: Option<u32>) {
+        use crate::messages::SearchResultFile;
+        struct W;
+        impl Clone for W {
+            fn clone(&self) -> Self {
+                W
+            }
+        }
+        impl traits::core::Writer for W {
+            fn write<M: traits::core::Message, H: traits::core::Handler, F: FnOnce(&mut [u8])>(
+                &self,
+                _size: usize,
+                _callback: F,
+            ) {
+            }
+        }
+        let msg = SearchResultReceived {
+            token,
+            username: user.into(),
+            free_slots: true,
+            upload_speed: 0,
+            in_queue: 0,
+            files: vec![SearchResultFile {
+                name: name.into(),
+                size: 1,
+                bitrate,
+                length: None,
+                vbr: false,
+                sample_rate: None,
+                bit_depth: None,
+            }],
+        };
+        traits::core::Handle::<SearchResultReceived>::handle(ui, &msg, &W);
+    }
+
+    #[test]
+    fn results_sort_by_clicked_column_and_filter_by_bitrate() {
+        let mut ui = test_ui();
+        apply(&mut ui, SessionEventKind::SearchStarted { token: 7, query: "q".into() });
+        feed_result(&mut ui, 7, "lo", "low.mp3", Some(128));
+        feed_result(&mut ui, 7, "hi", "high.mp3", Some(320));
+
+        // Sort by bitrate ascending: 128 before 320.
+        ui.toggle_sort(SortKey::Bitrate);
+        let html = ui.render(&Page::SearchesFragment);
+        assert!(html.contains("▲"), "active column shows an ascending arrow");
+        assert!(html.find("low.mp3").unwrap() < html.find("high.mp3").unwrap(), "ascending");
+
+        // Clicking the same column again flips to descending.
+        ui.toggle_sort(SortKey::Bitrate);
+        let html = ui.render(&Page::SearchesFragment);
+        assert!(html.contains("▼"));
+        assert!(html.find("high.mp3").unwrap() < html.find("low.mp3").unwrap(), "descending");
+
+        // Bitrate filter drops the 128 kbps result.
+        ui.min_bitrate = 256;
+        let html = ui.render(&Page::SearchesFragment);
+        assert!(html.contains("high.mp3") && !html.contains("low.mp3"), "filter keeps only ≥256");
+        assert!(html.contains("bitrate filter active"));
     }
 }
