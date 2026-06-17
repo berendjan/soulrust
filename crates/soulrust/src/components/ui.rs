@@ -66,41 +66,27 @@ impl Ui {
     }
 
     fn render_index(&self) -> String {
-        format!(
-            r##"<!DOCTYPE html>
-<html>
-<head>
-<title>soulrust</title>
-<script src="/assets/htmx.min.js"></script>
-<style>
-body {{ font-family: sans-serif; max-width: 56rem; margin: 2rem auto; padding: 0 1rem; }}
-table {{ border-collapse: collapse; width: 100%; }}
-td, th {{ border-bottom: 1px solid #ddd; padding: 0.4rem; text-align: left; }}
-.banner {{ padding: 0.5rem; border-radius: 4px; background: #eef; margin: 0.5rem 0; }}
-.error {{ background: #fee; }}
-form.search {{ display: flex; gap: 0.5rem; margin: 1rem 0; }}
-form.search input[type=text] {{ flex: 1; padding: 0.4rem; }}
-pre.log {{ background: #f6f6f6; padding: 0.5rem; max-height: 14rem; overflow-y: auto; }}
-</style>
-</head>
-<body>
-<h1>soulrust</h1>
+        let body = r##"<h1>Search</h1>
+<p class="sub">Search the Soulseek network or browse a user's shared files. For many tracks at once, use <a href="/bulk">Bulk downloads</a>.</p>
 <div id="status" hx-get="/fragments/status" hx-trigger="load, every 2s"></div>
-<form class="search" hx-post="/search" hx-target="#searches" hx-swap="innerHTML">
-  <input type="text" name="input" placeholder="search text or spotify playlist/album/track link" autofocus>
-  <button type="submit">Search</button>
+<div class="card">
+<form hx-post="/search" hx-target="#searches" hx-swap="innerHTML" style="display:flex; gap:0.5rem; align-items:flex-end;">
+  <div style="flex:1"><label for="q" style="margin-top:0">Search</label>
+  <input id="q" type="text" name="input" placeholder="search text, or a spotify playlist / album / track link" autofocus></div>
+  <button class="btn" type="submit">Search</button>
 </form>
+</div>
 <div id="searches" hx-get="/fragments/searches" hx-trigger="load, every 2s"></div>
-<h2>browse a user's shares</h2>
-<form class="search" hx-post="/browse" hx-target="#browse" hx-swap="innerHTML">
-  <input type="text" name="username" placeholder="soulseek username">
-  <button type="submit">Browse</button>
+<h2>Browse a user's shares</h2>
+<div class="card">
+<form hx-post="/browse" hx-target="#browse" hx-swap="innerHTML" style="display:flex; gap:0.5rem; align-items:flex-end;">
+  <div style="flex:1"><label for="u" style="margin-top:0">Username</label>
+  <input id="u" type="text" name="username" placeholder="soulseek username"></div>
+  <button class="btn secondary" type="submit">Browse</button>
 </form>
-<div id="browse" hx-get="/fragments/browse" hx-trigger="load, every 3s"></div>
-<p><a href="/config">configuration</a></p>
-</body>
-</html>"##
-        )
+</div>
+<div id="browse" hx-get="/fragments/browse" hx-trigger="load, every 3s"></div>"##;
+        crate::components::ui_theme::shell("soulrust", "search", body)
     }
 
     fn render_status(&self) -> String {

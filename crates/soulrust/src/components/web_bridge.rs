@@ -14,6 +14,7 @@ use std::time::Duration;
 use rust_messenger::traits;
 use rust_messenger::traits::extended::Sender;
 
+use crate::components::ui_theme::shell;
 use crate::config::{AppContext, Config, Control};
 use crate::extract::Job;
 use crate::messages::{
@@ -204,9 +205,12 @@ impl<W: traits::core::Writer> SharedBridge<W> {
                     self.html_page(self.render(Page::SearchesFragment))
                 }
                 ("GET", "/fragments/browse") => self.html_page(self.browse_fragment()),
+                ("GET", "/bulk") => self.html_page(self.bulk_page()),
+                ("GET", "/spotify") => self.html_page(self.spotify_page(None)),
                 ("GET", "/config") => self.html_page(self.config_page()),
                 ("POST", "/search") => self.html_page(self.submit_search(&body)),
                 ("POST", "/browse") => self.html_page(self.submit_browse(&body)),
+                ("POST", "/spotify") => self.html_page(self.save_spotify(&body)),
                 ("POST", "/config") => self.html_page(self.save_config(&body)),
                 ("POST", "/apply-update") => self.html_page(self.apply_update()),
                 ("POST", "/restart") => {
@@ -406,48 +410,168 @@ impl<W: traits::core::Writer> SharedBridge<W> {
             Err(err) => format!(r#"<div class="banner error">{}</div>"#, escape(&err)),
         })
     }
+
+    /// GET /bulk: a dedicated page for queuing many tracks at once. Pick a
+    /// source, paste a Spotify link or a track list, and start the searches.
+    fn bulk_page(&self) -> Result<String, String> {
+        let config = self.current_config()?;
+        Ok(render_bulk_page(&config))
+    }
+
+    /// GET /spotify: how to connect Spotify (create an app, get keys) plus the
+    /// credential form. `banner` is shown after a save.
+    fn spotify_page(&self, banner: Option<String>) -> Result<String, String> {
+        let config = self.current_config()?;
+        Ok(render_spotify_page(&config, banner))
+    }
+
+    /// POST /spotify: save just the Spotify credentials, then re-render the page.
+    fn save_spotify(&self, body: &str) -> Result<String, String> {
+        let form = parse_form(body);
+        let mut config = self.current_config()?;
+
+        config.spotify.client_id =
+            form.get("spotify_client_id").map(|s| s.trim().to_owned()).filter(|v| !v.is_empty());
+        if let Some(v) = form.get("spotify_client_secret").map(|s| s.trim().to_owned()) {
+            if !v.is_empty() {
+                config.spotify.client_secret = Some(v);
+            }
+        }
+
+        let result = match self.round_trip(|corr| {
+            WebBridge::send(&SetConfigReq { corr, config: config.clone() }, &self.writer);
+        })? {
+            BridgeReply::SetConfig(result) => result,
+            _ => return Err("unexpected reply type".into()),
+        };
+
+        let banner = match &result {
+            Ok(()) => {
+                r#"<div class="banner">Spotify credentials saved.</div>"#.to_string()
+            }
+            Err(err) => format!(r#"<div class="banner error">{}</div>"#, escape(err)),
+        };
+        Ok(render_spotify_page(&config, Some(banner)))
+    }
+}
+
+/// True when both Spotify credentials are present.
+fn spotify_connected(config: &Config) -> bool {
+    config.spotify.client_id.as_deref().is_some_and(|s| !s.is_empty())
+        && config.spotify.client_secret.as_deref().is_some_and(|s| !s.is_empty())
+}
+
+/// A status pill + "set up" button for Spotify, shown on the bulk + spotify
+/// pages.
+fn spotify_status_card(config: &Config) -> String {
+    if spotify_connected(config) {
+        r#"<div class="card"><span class="pill ok">● Spotify connected</span>
+<a class="btn secondary" style="margin-left:0.6rem" href="/spotify">Manage</a></div>"#
+            .to_string()
+    } else {
+        r#"<div class="card"><span class="pill warn">● Spotify not connected</span>
+<a class="btn spotify" style="margin-left:0.6rem" href="/spotify">Set up Spotify</a>
+<p class="muted" style="margin:0.6rem 0 0">Connect Spotify to paste playlist, album, and track links.</p></div>"#
+            .to_string()
+    }
+}
+
+fn render_bulk_page(config: &Config) -> String {
+    let body = format!(
+        r##"<h1>Bulk downloads</h1>
+<p class="sub">Queue many tracks at once — paste a Spotify link or a plain track list, and soulrust searches the network for each.</p>
+{spotify_card}
+<div class="card">
+<form hx-post="/search" hx-target="#bulk-results" hx-swap="innerHTML">
+  <label for="source">Source</label>
+  <select id="source" name="source">
+    <option value="spotify">Spotify link (playlist / album / track)</option>
+    <option value="tracklist">Track list (one "artist - title" per line)</option>
+  </select>
+  <label for="input" style="margin-top:0.9rem">Paste here</label>
+  <textarea id="input" name="input" placeholder="https://open.spotify.com/playlist/...&#10;— or —&#10;Daft Punk - Get Lucky&#10;Justice - Genesis"></textarea>
+  <p class="muted" style="margin:0.5rem 0 0.9rem">Spotify links need credentials set up first. Plain track lists work with no setup.</p>
+  <button class="btn" type="submit">Start searches</button>
+</form>
+</div>
+<h2>Searches</h2>
+<div id="bulk-results" hx-get="/fragments/searches" hx-trigger="load, every 2s"></div>"##,
+        spotify_card = spotify_status_card(config),
+    );
+    shell("soulrust — bulk downloads", "bulk", &body)
+}
+
+fn render_spotify_page(config: &Config, banner: Option<String>) -> String {
+    let status = if spotify_connected(config) {
+        r#"<span class="pill ok">● Connected</span>"#
+    } else {
+        r#"<span class="pill warn">● Not connected</span>"#
+    };
+    let body = format!(
+        r#"<h1>Connect Spotify</h1>
+<p class="sub">{status} &nbsp; soulrust reads <strong>public</strong> Spotify playlists, albums, and tracks to turn them into searches. You'll create a free Spotify app once and paste its two keys below.</p>
+{banner}
+<div class="card">
+<h2 style="margin-top:0">Get your keys (about 2 minutes)</h2>
+<ol class="steps">
+  <li>Open the <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noopener">Spotify Developer Dashboard</a> and log in with any Spotify account (a free account works).</li>
+  <li>Click <strong>Create app</strong>.</li>
+  <li>Fill in an <strong>App name</strong> (e.g. <code>soulrust</code>) and a short description. For <strong>Redirect URI</strong> enter <code>http://127.0.0.1/callback</code> — soulrust never uses it, but Spotify's form won't save without one. Under "Which API/SDKs…?" tick <strong>Web API</strong>, accept the terms, and click <strong>Save</strong>.</li>
+  <li>Open your new app and go to <strong>Settings</strong>.</li>
+  <li>Copy the <strong>Client ID</strong>. Click <strong>View client secret</strong> and copy the <strong>Client secret</strong>.</li>
+  <li>Paste both below and click <strong>Save</strong>. That's it.</li>
+</ol>
+<p class="muted">This uses Spotify's "Client Credentials" mode: it reads public playlists/albums/tracks only, and never logs into or touches your account, so your private and liked songs aren't visible.</p>
+</div>
+<div class="card">
+<form hx-post="/spotify" hx-target="body">
+  <label>Client ID <input type="text" name="spotify_client_id" value="{client_id}" placeholder="e.g. 1a2b3c4d5e6f..."></label>
+  <label>Client secret <input type="password" name="spotify_client_secret" value="" placeholder="{secret_ph}"></label>
+  <p style="margin-top:0.9rem"><button class="btn spotify" type="submit">Save</button>
+  <a class="btn secondary" style="margin-left:0.5rem" href="/bulk">Back to bulk downloads</a></p>
+</form>
+</div>"#,
+        status = status,
+        banner = banner.unwrap_or_default(),
+        client_id = escape(config.spotify.client_id.as_deref().unwrap_or("")),
+        secret_ph = if config.spotify.client_secret.as_deref().is_some_and(|s| !s.is_empty()) {
+            "saved — leave empty to keep"
+        } else {
+            "paste the client secret"
+        },
+    );
+    shell("soulrust — connect Spotify", "spotify", &body)
 }
 
 fn render_config_page(config: &Config, banner: Option<String>) -> String {
     let checked = |b: bool| if b { "checked" } else { "" };
-    format!(
-        r#"<!DOCTYPE html>
-<html>
-<head><title>soulrust configuration</title><script src="/assets/htmx.min.js"></script>
-<style>
-body {{ font-family: sans-serif; max-width: 36rem; margin: 2rem auto; padding: 0 1rem; }}
-label {{ display: block; margin-top: 0.8rem; }}
-input[type=text], input[type=password] {{ width: 100%; padding: 0.4rem; box-sizing: border-box; }}
-.banner {{ padding: 0.5rem; border-radius: 4px; background: #eef; margin: 0.5rem 0; }}
-.error {{ background: #fee; }}
-fieldset {{ margin-top: 1rem; }}
-</style></head>
-<body>
-<h1>configuration</h1>
+    let body = format!(
+        r#"<h1>Settings</h1>
+<p class="sub">Server, Spotify, updates, and the web UI address. Server and Spotify changes apply after a restart.</p>
 <div id="result">{banner}</div>
 <form hx-post="/config" hx-target="body">
-<fieldset><legend>soulseek server</legend>
+<div class="card"><h2 style="margin-top:0">Soulseek server</h2>
 <label>host <input type="text" name="host" value="{host}"></label>
 <label>port <input type="text" name="port" value="{port}"></label>
 <label>username <input type="text" name="username" value="{username}"></label>
 <label>password (leave empty to keep) <input type="password" name="password" value=""></label>
 <label>listen port <input type="text" name="listen_port" value="{listen_port}"></label>
-</fieldset>
-<fieldset><legend>spotify</legend>
+</div>
+<div class="card"><h2 style="margin-top:0">Spotify</h2>
+<p class="muted" style="margin-top:0">Prefer the guided <a href="/spotify">Connect Spotify</a> page if you're not sure how to get these.</p>
 <label>client id <input type="text" name="spotify_client_id" value="{client_id}"></label>
 <label>client secret (leave empty to keep) <input type="password" name="spotify_client_secret" value=""></label>
-</fieldset>
-<fieldset><legend>updates</legend>
+</div>
+<div class="card"><h2 style="margin-top:0">Updates</h2>
 <label><input type="checkbox" name="update_enabled" {enabled}> check for updates on startup</label>
 <label><input type="checkbox" name="update_auto_apply" {auto_apply}> apply automatically</label>
 <label>github repo <input type="text" name="update_repo" value="{repo}"></label>
-</fieldset>
-<fieldset><legend>ui</legend>
+</div>
+<div class="card"><h2 style="margin-top:0">Web UI</h2>
 <label>bind address <input type="text" name="bind_addr" value="{bind_addr}"></label>
-</fieldset>
-<p><button type="submit">save</button> <a href="/">back</a></p>
-</form>
-</body></html>"#,
+</div>
+<p><button class="btn" type="submit">Save</button></p>
+</form>"#,
         banner = banner.unwrap_or_default(),
         host = escape(&config.server.host),
         port = config.server.port,
@@ -458,7 +582,8 @@ fieldset {{ margin-top: 1rem; }}
         auto_apply = checked(config.update.auto_apply),
         repo = escape(&config.update.repo),
         bind_addr = escape(&config.ui.bind_addr),
-    )
+    );
+    shell("soulrust — settings", "config", &body)
 }
 
 /// Minimal application/x-www-form-urlencoded parser (avoids a url dep).
@@ -548,5 +673,41 @@ mod tests {
         assert!(!html.contains("hunter2"));
         assert!(!html.contains("sssh"));
         assert!(html.contains("server.slsknet.org"));
+        // Shares the themed shell + nav.
+        assert!(html.contains(r#"href="/bulk""#) && html.contains(r#"href="/spotify""#));
+    }
+
+    #[test]
+    fn bulk_page_has_a_source_selector_and_spotify_setup() {
+        let html = render_bulk_page(&Config::default());
+        // Source selector with a Spotify option.
+        assert!(html.contains("<select") && html.contains(r#"value="spotify""#));
+        // Posts to the search/extract pipeline and links to Spotify setup.
+        assert!(html.contains(r#"hx-post="/search""#));
+        assert!(html.contains(r#"href="/spotify""#));
+        // Not connected by default -> prompts setup.
+        assert!(html.contains("Set up Spotify"));
+    }
+
+    #[test]
+    fn spotify_page_shows_setup_steps_and_form() {
+        let html = render_spotify_page(&Config::default(), None);
+        assert!(html.contains("developer.spotify.com/dashboard"), "links to the dashboard");
+        assert!(html.contains("Create app"), "walks through creating an app");
+        assert!(html.contains(r#"name="spotify_client_id""#));
+        assert!(html.contains(r#"hx-post="/spotify""#));
+        assert!(html.contains("Not connected"));
+    }
+
+    #[test]
+    fn spotify_page_reflects_connected_state_without_leaking_the_secret() {
+        let mut config = Config::default();
+        config.spotify.client_id = Some("pub-id".into());
+        config.spotify.client_secret = Some("the-secret".into());
+        assert!(spotify_connected(&config));
+        let html = render_spotify_page(&config, None);
+        assert!(html.contains("Connected"));
+        assert!(html.contains("pub-id"), "the public client id is shown");
+        assert!(!html.contains("the-secret"), "the secret is never rendered");
     }
 }

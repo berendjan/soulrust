@@ -5,5 +5,6 @@ pub mod peer_net;
 pub mod session;
 pub mod transfer_io;
 pub mod ui;
+pub mod ui_theme;
 pub mod updater;
 pub mod web_bridge;
