@@ -4,6 +4,7 @@
 //! comes back.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
 use rust_messenger::traits;
 use rust_messenger::traits::extended::Sender;
@@ -58,13 +59,14 @@ struct SearchRow {
 }
 
 /// A user-requested download and its latest known state, for the Downloads page.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct DownloadEntry {
     username: String,
     filename: String,
     state: DownloadState,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, serde::Serialize, serde::Deserialize)]
 enum DownloadState {
     /// Requested; we're resolving the peer / waiting for it to offer the file.
     Queued,
@@ -133,10 +135,27 @@ pub struct Ui {
     min_bitrate: u32,
     /// User-requested downloads, newest last, for the Downloads page.
     downloads: Vec<DownloadEntry>,
+    /// JSON sidecar the downloads history is persisted to (next to the config).
+    downloads_path: PathBuf,
 }
 
 impl Ui {
     pub fn new<W: traits::core::Writer>(ctx: &AppContext, _writer: &W) -> Self {
+        let downloads_path = ctx.config_path.with_file_name("soulrust-downloads.json");
+        // History persisted across runs (completed/failed/partial), supplemented
+        // by a scan of the download folders for files grabbed out-of-band.
+        let mut downloads = load_downloads(&downloads_path);
+        let seen: std::collections::HashSet<String> =
+            downloads.iter().map(|d| basename(&d.filename).to_owned()).collect();
+        for entry in scan_disk_downloads(
+            &ctx.config.sharing.download_path(),
+            &ctx.config.sharing.incomplete_path(),
+        ) {
+            if !seen.contains(basename(&entry.filename)) {
+                downloads.push(entry);
+            }
+        }
+        downloads.truncate(MAX_DOWNLOADS);
         Ui {
             session: SessionStatus::Disconnected("starting up".into()),
             searches: Vec::new(),
@@ -145,12 +164,18 @@ impl Ui {
             username: ctx.config.server.username.clone(),
             sort: None,
             min_bitrate: 0,
-            // Seed the list from disk so finished and partial downloads from
-            // previous runs show up (the in-memory state itself isn't persisted).
-            downloads: scan_disk_downloads(
-                &ctx.config.sharing.download_path(),
-                &ctx.config.sharing.incomplete_path(),
-            ),
+            downloads,
+            downloads_path,
+        }
+    }
+
+    /// Persist the at-rest downloads (completed / failed / partial) so the
+    /// history survives a restart. In-flight entries are transient and skipped.
+    fn save_downloads(&self) {
+        let history: Vec<&DownloadEntry> =
+            self.downloads.iter().filter(|d| !d.state.is_active()).collect();
+        if let Ok(json) = serde_json::to_string(&history) {
+            let _ = std::fs::write(&self.downloads_path, json);
         }
     }
 
@@ -667,6 +692,7 @@ impl traits::core::Handle<CancelDownload> for Ui {
     fn handle<W: traits::core::Writer>(&mut self, message: &CancelDownload, _writer: &W) {
         self.downloads
             .retain(|d| !(d.username == message.username && d.filename == message.filename));
+        self.save_downloads();
     }
 }
 
@@ -678,6 +704,7 @@ impl traits::core::Handle<DownloadComplete> for Ui {
             &message.filename,
             DownloadState::Completed(message.path.clone()),
         );
+        self.save_downloads();
     }
 }
 
@@ -689,6 +716,7 @@ impl traits::core::Handle<DownloadFailed> for Ui {
             &message.filename,
             DownloadState::Failed(message.reason.clone()),
         );
+        self.save_downloads();
     }
 }
 
@@ -775,6 +803,15 @@ fn escape(text: &str) -> String {
 /// row's `title` and the hidden download field.
 fn basename(path: &str) -> &str {
     path.rsplit(['\\', '/']).next().filter(|s| !s.is_empty()).unwrap_or(path)
+}
+
+/// Load the persisted downloads history (JSON sidecar). Missing/corrupt file
+/// yields an empty list.
+fn load_downloads(path: &std::path::Path) -> Vec<DownloadEntry> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 /// Reconstruct the Downloads list from disk at startup: finished files in the
@@ -939,6 +976,29 @@ mod tests {
         assert_eq!(basename("Music\\Gwen\\hit.mp3"), "hit.mp3");
         assert_eq!(basename("a/b/c.flac"), "c.flac");
         assert_eq!(basename("loose.mp3"), "loose.mp3");
+    }
+
+    #[test]
+    fn downloads_history_persists_across_restarts() {
+        let mut ui = test_ui();
+        ui.downloads_path = std::env::temp_dir().join(format!("sr-dlhist-{}.json", std::process::id()));
+        ui.downloads.clear();
+        ui.set_download_state("bob", "a.mp3", DownloadState::Completed("/dl/a.mp3".into()));
+        ui.set_download_state("eve", "b.mp3", DownloadState::Failed("nope".into()));
+        ui.set_download_state("liv", "c.mp3", DownloadState::Queued); // in-flight
+        ui.save_downloads();
+
+        let loaded = load_downloads(&ui.downloads_path);
+        let _ = std::fs::remove_file(&ui.downloads_path);
+        // Terminal entries persist; the in-flight one is dropped from history.
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded
+            .iter()
+            .any(|d| d.filename == "a.mp3" && matches!(d.state, DownloadState::Completed(_))));
+        assert!(loaded
+            .iter()
+            .any(|d| d.filename == "b.mp3" && matches!(d.state, DownloadState::Failed(_))));
+        assert!(!loaded.iter().any(|d| d.filename == "c.mp3"), "in-flight not persisted");
     }
 
     fn test_ui() -> Ui {
