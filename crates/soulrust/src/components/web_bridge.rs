@@ -745,7 +745,7 @@ fn render_config_page(config: &Config, banner: Option<String>) -> String {
 <label>listen port <input type="text" name="listen_port" value="{listen_port}"></label>
 </div>
 <div class="card"><h2 style="margin-top:0">Downloads &amp; sharing</h2>
-<p class="muted" style="margin-top:0">Where finished downloads land, and which of your folders you share with the network. Applies after a restart.</p>
+<p class="muted" style="margin-top:0">Where finished downloads land, and which of your folders you share with the network. Applied live — no restart needed.</p>
 <label>download folder <input type="text" name="download_dir" value="{download_dir}" placeholder="{download_default}"></label>
 <label>incomplete folder (optional) <input type="text" name="incomplete_dir" value="{incomplete_dir}" placeholder="{incomplete_default}"></label>
 <label>shared folders — one path per line <textarea name="folders" rows="3" placeholder="/home/you/Music">{folders}</textarea></label>

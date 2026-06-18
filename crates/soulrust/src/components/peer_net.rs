@@ -151,8 +151,14 @@ enum PeerCommand {
     AdvertiseBranch,
     /// Replace the server-supplied excluded-phrase list used to filter responses.
     SetExcludedPhrases { phrases: Vec<String> },
-    /// Apply changed config live (no restart): search filter + result cap.
-    ApplyConfig { live: LiveConfig },
+    /// Apply changed config live (no restart): search filter + result cap, and
+    /// re-scan shared folders / update the download + incomplete dirs.
+    ApplyConfig {
+        live: LiveConfig,
+        folders: Vec<PathBuf>,
+        download_dir: PathBuf,
+        incomplete_dir: PathBuf,
+    },
     /// A connection task received a PlaceInQueueResponse for one of our queued
     /// downloads; forward the position to the UI (the task has no bus Writer).
     QueuePosition { username: String, filename: String, place: u32 },
@@ -209,13 +215,16 @@ struct PendingUpload {
 
 /// Shared per-reactor state handed to every connection task.
 struct ConnCtx {
-    shares: Arc<ShareIndex>,
+    /// Swappable so a `ConfigChanged` can rescan shared folders without a
+    /// restart. Readers take a cheap `Arc` clone via [`ConnCtx::shares`].
+    shares: Mutex<Arc<ShareIndex>>,
     queue: Arc<DeliveryQueue>,
     downloads: Mutex<Downloads>,
     uploads: Mutex<Uploads>,
     our_username: String,
-    download_dir: PathBuf,
-    incomplete_dir: PathBuf,
+    /// Swappable (live config): where finished / partial downloads are written.
+    download_dir: Mutex<PathBuf>,
+    incomplete_dir: Mutex<PathBuf>,
     /// Lets connection tasks signal the reactor's command loop (e.g. an approved
     /// upload needs an address resolved and a file connection opened).
     cmd_tx: UnboundedSender<PeerCommand>,
@@ -325,6 +334,19 @@ fn compute_max_children(upload_speed: u32, min_speed: u32, ratio: u32) -> usize 
 }
 
 impl ConnCtx {
+    /// A cheap snapshot of the current shares index (swapped on ConfigChanged).
+    fn shares(&self) -> Arc<ShareIndex> {
+        self.shares.lock().unwrap().clone()
+    }
+
+    fn download_dir(&self) -> PathBuf {
+        self.download_dir.lock().unwrap().clone()
+    }
+
+    fn incomplete_dir(&self) -> PathBuf {
+        self.incomplete_dir.lock().unwrap().clone()
+    }
+
     /// Current child capacity from our measured upload speed + server limits.
     fn max_children(&self) -> usize {
         compute_max_children(
@@ -544,8 +566,9 @@ impl traits::core::Handle<SetExcludedPhrases> for PeerNet {
 
 impl traits::core::Handle<ConfigChanged> for PeerNet {
     fn handle<W: traits::core::Writer>(&mut self, message: &ConfigChanged, _writer: &W) {
-        // Apply the search filter and result cap live; reconnect-bound settings
-        // (listen port, shared folders, server credentials) still need a restart.
+        // Apply the search filter / result cap, re-scan shared folders, and
+        // update the download dirs live; only listen port + server credentials
+        // still need a restart.
         let s = &message.config.sharing;
         let _ = self.cmd_tx.send(PeerCommand::ApplyConfig {
             live: LiveConfig {
@@ -556,6 +579,9 @@ impl traits::core::Handle<ConfigChanged> for PeerNet {
                 },
                 max_results: s.max_search_results as usize,
             },
+            folders: s.folders.iter().map(PathBuf::from).collect(),
+            download_dir: s.download_path(),
+            incomplete_dir: s.incomplete_path(),
         });
     }
 }
@@ -646,7 +672,7 @@ fn run_reactor<W: traits::core::Writer>(
         let shares = Arc::new(ShareIndex::scan(&config.folders));
         let _ = shares.browse_frame();
         let ctx = Arc::new(ConnCtx {
-            shares,
+            shares: Mutex::new(shares),
             queue: Arc::new(Mutex::new(PendingDeliveries::default())),
             downloads: Mutex::new(Downloads::default()),
             distrib: DistribState::default(),
@@ -654,8 +680,8 @@ fn run_reactor<W: traits::core::Writer>(
             uploads_gate: UploadGate::default(),
             uploads: Mutex::new(Uploads::default()),
             our_username: config.username,
-            download_dir: config.download_dir,
-            incomplete_dir: config.incomplete_dir,
+            download_dir: Mutex::new(config.download_dir),
+            incomplete_dir: Mutex::new(config.incomplete_dir),
             cmd_tx,
             next_token: AtomicU32::new(1),
             excluded_phrases: Mutex::new(Vec::new()),
@@ -679,7 +705,7 @@ fn run_reactor<W: traits::core::Writer>(
         };
         status(
             &writer,
-            format!("sharing {} file(s); listening for peers on port {port}", ctx.shares.num_files()),
+            format!("sharing {} file(s); listening for peers on port {port}", ctx.shares().num_files()),
         );
 
         // Commands run concurrently with the accept loop on this single thread.
@@ -855,7 +881,7 @@ async fn command_loop<W: traits::core::Writer>(
             PeerCommand::IncomingSearch { username: searcher, token, query } => {
                 let our_token = connect_token;
                 connect_token = connect_token.wrapping_add(1);
-                let shares = ctx.shares.clone();
+                let shares = ctx.shares();
                 let queue = ctx.queue.clone();
                 let writer = writer.clone();
                 let our_username = ctx.our_username.clone();
@@ -918,8 +944,26 @@ async fn command_loop<W: traits::core::Writer>(
             PeerCommand::SetExcludedPhrases { phrases } => {
                 *ctx.excluded_phrases.lock().unwrap() = phrases;
             }
-            PeerCommand::ApplyConfig { live } => {
+            PeerCommand::ApplyConfig { live, folders, download_dir, incomplete_dir } => {
                 *ctx.live.lock().unwrap() = live;
+                // Update where downloads land (creating the dirs).
+                let _ = std::fs::create_dir_all(&download_dir);
+                let _ = std::fs::create_dir_all(&incomplete_dir);
+                *ctx.download_dir.lock().unwrap() = download_dir;
+                *ctx.incomplete_dir.lock().unwrap() = incomplete_dir;
+                // Re-scan shared folders off the reactor thread (walking dirs can
+                // be slow), then swap the index in.
+                let ctx = ctx.clone();
+                let writer = writer.clone();
+                tokio::spawn(async move {
+                    if let Ok(index) =
+                        tokio::task::spawn_blocking(move || ShareIndex::scan(&folders)).await
+                    {
+                        let count = index.num_files();
+                        *ctx.shares.lock().unwrap() = Arc::new(index);
+                        status(&writer, format!("re-scanned shares: now sharing {count} file(s)"));
+                    }
+                });
             }
             PeerCommand::QueuePosition { username, filename, place } => {
                 PeerNet::send(&DownloadQueuePosition { username, filename, place }, &writer);
@@ -1345,7 +1389,7 @@ where
         };
         match message {
             PeerMessage::SharedFileListRequest => {
-                stream.write_all(ctx.shares.browse_frame()).await?;
+                stream.write_all(ctx.shares().browse_frame()).await?;
                 on_activity(format!("served browse to {peer}"));
             }
             PeerMessage::UserInfoRequest => {
@@ -1353,7 +1397,7 @@ where
                 let queued = ctx.upload_queue.lock().unwrap().len() as u32;
                 let (free_slots, in_queue) = slot_advertisement(queued as usize);
                 let info = UserInfoResponse {
-                    description: format!("soulrust — {} file(s) shared", ctx.shares.num_files()),
+                    description: format!("soulrust — {} file(s) shared", ctx.shares().num_files()),
                     picture: None,
                     total_uploads: in_queue,
                     queue_size: in_queue,
@@ -1364,7 +1408,7 @@ where
                 on_activity(format!("served user info to {peer}"));
             }
             PeerMessage::FolderContentsRequest(request) => {
-                let response = ctx.shares.folder_response(request.token, &request.directory);
+                let response = ctx.shares().folder_response(request.token, &request.directory);
                 stream.write_all(&response.to_frame()).await?;
                 on_activity(format!("served folder contents to {peer}"));
             }
@@ -1414,7 +1458,7 @@ where
                 // offered upload keyed by that token — `recv_file` matches the
                 // incoming `F` connection against it and streams the bytes. We do
                 // NOT dial out (that would be a second, stray connection).
-                match ctx.shares.resolve(&request.file) {
+                match ctx.shares().resolve(&request.file) {
                     Some((path, size)) => {
                         let transfer_id = ctx.upload_queue.lock().unwrap().enqueue(&peer);
                         {
@@ -1468,7 +1512,7 @@ where
             PeerMessage::QueueUpload(queue) => {
                 // A peer wants to download one of our files. Offer it (with a
                 // size) if we share it; otherwise decline.
-                match ctx.shares.resolve(&queue.file) {
+                match ctx.shares().resolve(&queue.file) {
                     Some((path, size)) => {
                         let token = ctx.next_token.fetch_add(1, Ordering::Relaxed);
                         let transfer_id = ctx.upload_queue.lock().unwrap().enqueue(&peer);
@@ -1707,10 +1751,10 @@ where
     // could never be found again to resume. A stable key lets a re-queued
     // download pick up exactly where a previous attempt left off.
     let incomplete = ctx
-        .incomplete_dir
+        .incomplete_dir()
         .join(incomplete_name(&active.username, &active.filename, &basename));
 
-    match receive_to_disk(stream, &incomplete, &ctx.download_dir, &basename, active.size).await {
+    match receive_to_disk(stream, &incomplete, &ctx.download_dir(), &basename, active.size).await {
         Ok(path) => Ok(ConnOutcome::Downloaded {
             username: active.username,
             filename: active.filename,
@@ -2134,7 +2178,7 @@ mod tests {
         // sends from the connection task just go nowhere.
         std::mem::forget(cmd_rx);
         Arc::new(ConnCtx {
-            shares: Arc::new(test_index()),
+            shares: Mutex::new(Arc::new(test_index())),
             queue: Arc::new(Mutex::new(PendingDeliveries::default())),
             downloads: Mutex::new(Downloads::default()),
             distrib: DistribState::default(),
@@ -2142,8 +2186,8 @@ mod tests {
             uploads_gate: UploadGate::default(),
             uploads: Mutex::new(Uploads::default()),
             our_username: "me".into(),
-            download_dir: std::env::temp_dir(),
-            incomplete_dir: std::env::temp_dir(),
+            download_dir: Mutex::new(std::env::temp_dir()),
+            incomplete_dir: Mutex::new(std::env::temp_dir()),
             cmd_tx,
             next_token: AtomicU32::new(1),
             excluded_phrases: Mutex::new(Vec::new()),
@@ -2358,7 +2402,7 @@ mod tests {
             let (cmd_tx, cmd_rx) = unbounded_channel();
             std::mem::forget(cmd_rx);
             let ctx = Arc::new(ConnCtx {
-                shares: Arc::new(test_index()),
+                shares: Mutex::new(Arc::new(test_index())),
                 queue: Arc::new(Mutex::new(PendingDeliveries::default())),
                 downloads: Mutex::new(Downloads::default()),
             distrib: DistribState::default(),
@@ -2366,8 +2410,8 @@ mod tests {
             uploads_gate: UploadGate::default(),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
-                download_dir: dir.clone(),
-                incomplete_dir: dir.clone(),
+                download_dir: Mutex::new(dir.clone()),
+                incomplete_dir: Mutex::new(dir.clone()),
                 cmd_tx,
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
@@ -2497,7 +2541,7 @@ mod tests {
             let (cmd_tx, cmd_rx) = unbounded_channel();
             std::mem::forget(cmd_rx);
             let ctx = Arc::new(ConnCtx {
-                shares: Arc::new(test_index()),
+                shares: Mutex::new(Arc::new(test_index())),
                 queue: Arc::new(Mutex::new(PendingDeliveries::default())),
                 downloads: Mutex::new(Downloads::default()),
             distrib: DistribState::default(),
@@ -2505,8 +2549,8 @@ mod tests {
             uploads_gate: UploadGate::default(),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
-                download_dir: dir.clone(),
-                incomplete_dir: dir.clone(),
+                download_dir: Mutex::new(dir.clone()),
+                incomplete_dir: Mutex::new(dir.clone()),
                 cmd_tx,
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
@@ -2745,7 +2789,7 @@ mod tests {
             let (cmd_tx, cmd_rx) = unbounded_channel();
             std::mem::forget(cmd_rx);
             let ctx = Arc::new(ConnCtx {
-                shares: Arc::new(test_index()),
+                shares: Mutex::new(Arc::new(test_index())),
                 queue: Arc::new(Mutex::new(PendingDeliveries::default())),
                 downloads: Mutex::new(Downloads::default()),
             distrib: DistribState::default(),
@@ -2753,8 +2797,8 @@ mod tests {
             uploads_gate: UploadGate::default(),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
-                download_dir: dir.clone(),
-                incomplete_dir: dir.clone(),
+                download_dir: Mutex::new(dir.clone()),
+                incomplete_dir: Mutex::new(dir.clone()),
                 cmd_tx,
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
@@ -2902,7 +2946,7 @@ mod tests {
             let (cmd_tx, cmd_rx) = unbounded_channel();
             std::mem::forget(cmd_rx);
             let ctx = Arc::new(ConnCtx {
-                shares: Arc::new(test_index()),
+                shares: Mutex::new(Arc::new(test_index())),
                 queue: Arc::new(Mutex::new(PendingDeliveries::default())),
                 downloads: Mutex::new(Downloads::default()),
             distrib: DistribState::default(),
@@ -2910,8 +2954,8 @@ mod tests {
             uploads_gate: UploadGate::default(),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
-                download_dir: dir.clone(),
-                incomplete_dir: dir.clone(),
+                download_dir: Mutex::new(dir.clone()),
+                incomplete_dir: Mutex::new(dir.clone()),
                 cmd_tx,
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
@@ -3087,7 +3131,7 @@ mod tests {
             let (mut client, mut server) = tokio::io::duplex(64 * 1024);
             let (cmd_tx, mut cmd_rx) = unbounded_channel();
             let ctx = Arc::new(ConnCtx {
-                shares: Arc::new(test_index()),
+                shares: Mutex::new(Arc::new(test_index())),
                 queue: Arc::new(Mutex::new(PendingDeliveries::default())),
                 downloads: Mutex::new(Downloads::default()),
             distrib: DistribState::default(),
@@ -3095,8 +3139,8 @@ mod tests {
             uploads_gate: UploadGate::default(),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
-                download_dir: std::env::temp_dir(),
-                incomplete_dir: std::env::temp_dir(),
+                download_dir: Mutex::new(std::env::temp_dir()),
+                incomplete_dir: Mutex::new(std::env::temp_dir()),
                 cmd_tx,
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
@@ -3162,6 +3206,46 @@ mod tests {
         assert_eq!(compute_max_children(100_000, 0, 100), 10, "capped at 10");
         assert_eq!(compute_max_children(30_000, 0, 100), 3);
         assert_eq!(compute_max_children(1000, 1000, 100), 0, "1000/100/100 = 0");
+    }
+
+    #[test]
+    fn config_change_reapplies_folders_and_dirs_live() {
+        use crate::config::{AppContext, Config};
+        struct W;
+        impl Clone for W {
+            fn clone(&self) -> Self {
+                W
+            }
+        }
+        impl traits::core::Writer for W {
+            fn write<M: traits::core::Message, H: traits::core::Handler, F: FnOnce(&mut [u8])>(
+                &self,
+                _size: usize,
+                _callback: F,
+            ) {
+            }
+        }
+        let ctx = AppContext::new(Config::default(), std::path::PathBuf::from("/tmp/x.yaml"));
+        let mut pn = PeerNet::new(&ctx, &W);
+
+        let mut changed = Config::default();
+        changed.sharing.folders = vec![std::env::temp_dir().join("sr-share").display().to_string()];
+        changed.sharing.download_dir = std::env::temp_dir().join("sr-dl").display().to_string();
+        traits::core::Handle::<ConfigChanged>::handle(
+            &mut pn,
+            &ConfigChanged { config: changed.clone() },
+            &W,
+        );
+
+        // The config change becomes an ApplyConfig carrying the new folders and
+        // the resolved download dir — applied without a restart.
+        match pn.cmd_rx.as_mut().unwrap().try_recv().expect("ApplyConfig queued") {
+            PeerCommand::ApplyConfig { folders, download_dir, .. } => {
+                assert_eq!(folders, vec![PathBuf::from(&changed.sharing.folders[0])]);
+                assert_eq!(download_dir, changed.sharing.download_path());
+            }
+            _ => panic!("expected ApplyConfig"),
+        }
     }
 
     #[test]
@@ -3280,7 +3364,7 @@ mod tests {
             let (mut client, mut server) = tokio::io::duplex(64 * 1024);
             let (cmd_tx, mut cmd_rx) = unbounded_channel();
             let ctx = Arc::new(ConnCtx {
-                shares: Arc::new(test_index()),
+                shares: Mutex::new(Arc::new(test_index())),
                 queue: Arc::new(Mutex::new(PendingDeliveries::default())),
                 downloads: Mutex::new(Downloads::default()),
             distrib: DistribState::default(),
@@ -3288,8 +3372,8 @@ mod tests {
             uploads_gate: UploadGate::default(),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
-                download_dir: std::env::temp_dir(),
-                incomplete_dir: std::env::temp_dir(),
+                download_dir: Mutex::new(std::env::temp_dir()),
+                incomplete_dir: Mutex::new(std::env::temp_dir()),
                 cmd_tx,
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
@@ -3342,7 +3426,7 @@ mod tests {
             let (mut client, server) = tokio::io::duplex(64 * 1024);
             let (cmd_tx, mut cmd_rx) = unbounded_channel();
             let ctx = Arc::new(ConnCtx {
-                shares: Arc::new(test_index()),
+                shares: Mutex::new(Arc::new(test_index())),
                 queue: Arc::new(Mutex::new(PendingDeliveries::default())),
                 downloads: Mutex::new(Downloads::default()),
             distrib: DistribState::default(),
@@ -3350,8 +3434,8 @@ mod tests {
             uploads_gate: UploadGate::default(),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
-                download_dir: std::env::temp_dir(),
-                incomplete_dir: std::env::temp_dir(),
+                download_dir: Mutex::new(std::env::temp_dir()),
+                incomplete_dir: Mutex::new(std::env::temp_dir()),
                 cmd_tx,
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
@@ -3508,7 +3592,7 @@ mod tests {
             let (mut client, server) = tokio::io::duplex(64 * 1024);
             let (cmd_tx, mut cmd_rx) = unbounded_channel();
             let ctx = Arc::new(ConnCtx {
-                shares: Arc::new(test_index()),
+                shares: Mutex::new(Arc::new(test_index())),
                 queue: Arc::new(Mutex::new(PendingDeliveries::default())),
                 downloads: Mutex::new(Downloads::default()),
             distrib: DistribState::default(),
@@ -3516,8 +3600,8 @@ mod tests {
             uploads_gate: UploadGate::default(),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
-                download_dir: std::env::temp_dir(),
-                incomplete_dir: std::env::temp_dir(),
+                download_dir: Mutex::new(std::env::temp_dir()),
+                incomplete_dir: Mutex::new(std::env::temp_dir()),
                 cmd_tx,
                 next_token: AtomicU32::new(1),
                 excluded_phrases: Mutex::new(Vec::new()),
@@ -3555,7 +3639,7 @@ mod tests {
     fn ctx_with_filter(filter: SearchFilter) -> (Arc<ConnCtx>, UnboundedReceiver<PeerCommand>) {
         let (cmd_tx, cmd_rx) = unbounded_channel();
         let ctx = Arc::new(ConnCtx {
-            shares: Arc::new(test_index()),
+            shares: Mutex::new(Arc::new(test_index())),
             queue: Arc::new(Mutex::new(PendingDeliveries::default())),
             downloads: Mutex::new(Downloads::default()),
             distrib: DistribState::default(),
@@ -3563,8 +3647,8 @@ mod tests {
             uploads_gate: UploadGate::default(),
             uploads: Mutex::new(Uploads::default()),
             our_username: "me".into(),
-            download_dir: std::env::temp_dir(),
-            incomplete_dir: std::env::temp_dir(),
+            download_dir: Mutex::new(std::env::temp_dir()),
+            incomplete_dir: Mutex::new(std::env::temp_dir()),
             cmd_tx,
             next_token: AtomicU32::new(1),
             excluded_phrases: Mutex::new(Vec::new()),
