@@ -18,12 +18,14 @@ use crate::config::ConfigStore;
 use crate::extract::ExtractorComponent;
 use crate::messages::{
     ApplyUpdateReq, ApplyUpdateResult, BrowseAccepted, BrowseFailed, BrowseHtml, BrowseListing,
-    BrowseRenderReq, BrowseUser, CancelDownload, ConfigChanged, ConfigSnapshot, DownloadComplete,
+    BrowseRenderReq, BrowseUser, CancelDownload, ConfigChanged, ConfigSnapshot, DistribSpeedLimits,
+    DownloadComplete,
     DownloadFailed,
     DownloadQueuePosition, ExtractRequest, ExtractResult, GetConfigReq, HttpHtml, HttpRender,
     IncomingSearch, NetConn,
     NetRx, NetTx, PeerActivity, PeerBrowseConnect, PeerDownloadConnect, PeerPierce, PeerPierceDistrib,
-    PeerPierceFile, PeerDistribConnect, PeerUploadConnect, ResolveUploadPeer, SearchResultReceived,
+    PeerPierceFile, PeerDistribConnect, PeerUploadConnect, RelayDistribSearch, ResolveUploadPeer,
+    SearchResultReceived,
     SetConfigReq,
     SetConfigResult, SetExcludedPhrases, SessionEvent, StartDownload, StartSearch, StartSearchResult,
     UpdateDownloaded,
@@ -77,6 +79,8 @@ rust_messenger::Messenger! {
             Session, SetExcludedPhrases: [ peer_net ],
             Session, PeerPierce: [ peer_net ],
             Session, PeerPierceFile: [ peer_net ],
+            Session, RelayDistribSearch: [ peer_net ],
+            Session, DistribSpeedLimits: [ peer_net ],
             Session, PeerPierceDistrib: [ peer_net ],
             // requesting: filtered inbound search results -> ui
             PeerNet, SearchResultReceived: [ ui ],

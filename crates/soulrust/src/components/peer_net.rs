@@ -44,8 +44,8 @@ use crate::config::AppContext;
 use crate::messages::{
     BrowseDir, BrowseFailed, BrowseFile, BrowseListing, CancelDownload, ConfigChanged, DownloadComplete,
     DownloadFailed, DownloadQueuePosition, HandlerId, IncomingSearch, NetTx, PeerActivity, PeerBrowseConnect,
-    PeerDistribConnect, PeerDownloadConnect, PeerPierce, PeerPierceDistrib, PeerPierceFile,
-    PeerUploadConnect, ResolveUploadPeer,
+    DistribSpeedLimits, PeerDistribConnect, PeerDownloadConnect, PeerPierce, PeerPierceDistrib,
+    PeerPierceFile, PeerUploadConnect, RelayDistribSearch, ResolveUploadPeer,
     SearchResultFile, SearchResultReceived, SetExcludedPhrases, UploadComplete, UploadFailed,
 };
 use crate::search_response::{self, SearchFilter};
@@ -138,6 +138,11 @@ enum PeerCommand {
     UploadConnect { username: String, ip: String, port: u16 },
     /// A slot freed (an upload finished); start any waiting uploads that fit.
     PumpUploads,
+    /// Server-injected distributed search (we're branch root): answer it and
+    /// forward it down to our children.
+    RelayDistribSearch { username: String, token: u32, query: String },
+    /// Store the server's distributed eligibility limits.
+    SetDistribLimits { min_speed: u32, ratio: u32 },
     /// Adopt a distributed parent: open a `D` connection and relay its searches.
     DistribConnect { username: String, ip: String, port: u16 },
     /// Re-advertise our branch level/root and child-acceptance to the server
@@ -288,10 +293,15 @@ struct DistribState {
     /// to that child's socket. Forwarding a search fans out over these.
     children: Mutex<HashMap<u32, UnboundedSender<Vec<u8>>>>,
     next_child_id: AtomicU32,
-    /// Whether we currently have a distributed parent. We only tell the server
+    /// Whether we currently have a distributed parent, or the server is feeding
+    /// us searches directly (branch root). We only tell the server
     /// `AcceptChildren(true)` while attached, since a detached node has no
     /// searches to relay down.
     attached: std::sync::atomic::AtomicBool,
+    /// Server distributed limits (`ParentMinSpeed` / `ParentSpeedRatio`) used to
+    /// size how many children we accept from our measured upload speed.
+    min_speed: AtomicU32,
+    speed_ratio: AtomicU32,
 }
 
 #[derive(Clone, Default)]
@@ -300,10 +310,30 @@ struct Branch {
     root: String,
 }
 
-/// How many distributed children we'll relay to at once (Nicotine+ caps at 10).
+/// Hard cap on distributed children regardless of speed (Nicotine+ uses 10).
 const MAX_DISTRIB_CHILDREN: usize = 10;
 
+/// How many children to accept, from our upload speed and the server's limits,
+/// mirroring Nicotine+: `min(speed / ratio / 100, 10)` when we're fast enough,
+/// otherwise 0 (a slow node shouldn't relay).
+fn compute_max_children(upload_speed: u32, min_speed: u32, ratio: u32) -> usize {
+    if ratio > 0 && upload_speed >= min_speed {
+        ((upload_speed / ratio / 100) as usize).min(MAX_DISTRIB_CHILDREN)
+    } else {
+        0
+    }
+}
+
 impl ConnCtx {
+    /// Current child capacity from our measured upload speed + server limits.
+    fn max_children(&self) -> usize {
+        compute_max_children(
+            self.upload_speed.load(Ordering::Relaxed),
+            self.distrib.min_speed.load(Ordering::Relaxed),
+            self.distrib.speed_ratio.load(Ordering::Relaxed),
+        )
+    }
+
     /// Re-encode and fan a distributed frame out to every child, pruning any
     /// whose socket-writer task has gone.
     fn forward_to_children(&self, frame: &[u8]) -> usize {
@@ -571,6 +601,25 @@ impl traits::core::Handle<PeerDistribConnect> for PeerNet {
     }
 }
 
+impl traits::core::Handle<RelayDistribSearch> for PeerNet {
+    fn handle<W: traits::core::Writer>(&mut self, message: &RelayDistribSearch, _writer: &W) {
+        let _ = self.cmd_tx.send(PeerCommand::RelayDistribSearch {
+            username: message.username.clone(),
+            token: message.token,
+            query: message.query.clone(),
+        });
+    }
+}
+
+impl traits::core::Handle<DistribSpeedLimits> for PeerNet {
+    fn handle<W: traits::core::Writer>(&mut self, message: &DistribSpeedLimits, _writer: &W) {
+        let _ = self.cmd_tx.send(PeerCommand::SetDistribLimits {
+            min_speed: message.min_speed,
+            ratio: message.ratio,
+        });
+    }
+}
+
 /// One-time/low-frequency status onto the bus (listener bound, fatal errors).
 /// Per-connection activity goes to stderr — it is peer-driven and must never
 /// outrun the bounded bus reader.
@@ -730,7 +779,7 @@ async fn command_loop<W: traits::core::Writer>(
                 // level/root or our child count crosses the cap.
                 let branch = ctx.branch_snapshot();
                 let accept = ctx.distrib.attached.load(Ordering::Relaxed)
-                    && ctx.child_count() < MAX_DISTRIB_CHILDREN;
+                    && ctx.child_count() < ctx.max_children();
                 PeerNet::send(&NetTx { frame: BranchLevel { level: branch.level }.to_frame() }, &writer);
                 PeerNet::send(&NetTx { frame: BranchRoot { root: branch.root }.to_frame() }, &writer);
                 PeerNet::send(&NetTx { frame: AcceptChildren { accept }.to_frame() }, &writer);
@@ -784,6 +833,25 @@ async fn command_loop<W: traits::core::Writer>(
                 pump_uploads(&ctx, &writer);
             }
             PeerCommand::PumpUploads => pump_uploads(&ctx, &writer),
+            PeerCommand::SetDistribLimits { min_speed, ratio } => {
+                ctx.distrib.min_speed.store(min_speed, Ordering::Relaxed);
+                ctx.distrib.speed_ratio.store(ratio, Ordering::Relaxed);
+            }
+            PeerCommand::RelayDistribSearch { username, token, query } => {
+                // We're a branch root: start accepting children (capacity
+                // permitting) and forward this search down, then answer it.
+                if !ctx.distrib.attached.swap(true, Ordering::Relaxed) {
+                    let _ = ctx.cmd_tx.send(PeerCommand::AdvertiseBranch);
+                }
+                let search = DistribSearch {
+                    identifier: distributed::SEARCH_IDENTIFIER,
+                    username: username.clone(),
+                    token,
+                    query: query.clone(),
+                };
+                ctx.forward_to_children(&search.to_frame());
+                let _ = ctx.cmd_tx.send(PeerCommand::IncomingSearch { username, token, query });
+            }
             PeerCommand::IncomingSearch { username: searcher, token, query } => {
                 let our_token = connect_token;
                 connect_token = connect_token.wrapping_add(1);
@@ -1918,7 +1986,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     F: FnMut(String),
 {
-    if ctx.child_count() >= MAX_DISTRIB_CHILDREN {
+    if ctx.child_count() >= ctx.max_children() {
         on_activity(format!("declining distributed child {peer} (at capacity)"));
         return Ok(());
     }
@@ -3086,6 +3154,17 @@ mod tests {
     }
 
     #[test]
+    fn max_children_scales_with_upload_speed_and_server_limits() {
+        // Below the server's min speed, or before it sends a ratio: no children.
+        assert_eq!(compute_max_children(0, 0, 0), 0);
+        assert_eq!(compute_max_children(500, 1000, 100), 0, "too slow");
+        // Fast enough: min(speed / ratio / 100, 10).
+        assert_eq!(compute_max_children(100_000, 0, 100), 10, "capped at 10");
+        assert_eq!(compute_max_children(30_000, 0, 100), 3);
+        assert_eq!(compute_max_children(1000, 1000, 100), 0, "1000/100/100 = 0");
+    }
+
+    #[test]
     fn upload_gate_caps_concurrency_at_the_slot_count() {
         let gate = UploadGate::default();
         gate.slots.store(2, Ordering::Relaxed);
@@ -3152,6 +3231,9 @@ mod tests {
                 branch.level = 2;
                 branch.root = "alice".into();
             }
+            // Enough capacity to accept a child: speed/ratio give max_children >= 1.
+            ctx.upload_speed.store(100, Ordering::Relaxed);
+            ctx.distrib.speed_ratio.store(1, Ordering::Relaxed);
             let (mut child, mut server) = tokio::io::duplex(64 * 1024);
             let ctx2 = ctx.clone();
             let task =

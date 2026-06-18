@@ -17,11 +17,11 @@ use soulseek_proto::Reader;
 
 use crate::config::AppContext;
 use crate::messages::{
-    BrowseAccepted, BrowseFailed, BrowseUser, ConfigChanged, DownloadFailed, HandlerId,
-    IncomingSearch, NetConn,
+    BrowseAccepted, BrowseFailed, BrowseUser, ConfigChanged, DistribSpeedLimits, DownloadFailed,
+    HandlerId, IncomingSearch, NetConn,
     NetConnEvent, NetRx, NetTx, PeerBrowseConnect, PeerDistribConnect, PeerDownloadConnect,
-    PeerPierce, PeerPierceDistrib, PeerPierceFile, PeerUploadConnect, ResolveUploadPeer, SessionEvent,
-    SessionEventKind,
+    PeerPierce, PeerPierceDistrib, PeerPierceFile, PeerUploadConnect, RelayDistribSearch,
+    ResolveUploadPeer, SessionEvent, SessionEventKind,
     SetExcludedPhrases, StartDownload, StartSearch, StartSearchResult, StartedSearch,
 };
 
@@ -52,6 +52,10 @@ pub struct Session {
     /// most one (Nicotine+ does the same) rather than stacking a connection per
     /// PossibleParents message.
     distrib_parent: Option<String>,
+    /// Server-supplied distributed eligibility limits, forwarded to peer_net so
+    /// it can size how many children to accept from our measured upload speed.
+    parent_min_speed: u32,
+    parent_speed_ratio: u32,
 }
 
 /// A download queued before we knew the peer's address.
@@ -76,6 +80,8 @@ impl Session {
             pending_downloads: HashMap::new(),
             pending_upload_resolves: HashSet::new(),
             distrib_parent: None,
+            parent_min_speed: 0,
+            parent_speed_ratio: 0,
         }
     }
 
@@ -199,13 +205,14 @@ impl traits::core::Handle<NetRx> for Session {
             }
             ServerMessage::EmbeddedMessage(embedded) => {
                 // We're a branch root: the server injects distributed searches
-                // directly. Respond to them like any other search.
+                // directly. Hand them to peer_net to both answer from our shares
+                // and forward down to our children.
                 if embedded.distrib_code == distributed::code::SEARCH {
                     if let Ok(search) =
                         DistribSearch::decode(&mut Reader::new(&embedded.distrib_message))
                     {
                         Self::send(
-                            &IncomingSearch {
+                            &RelayDistribSearch {
                                 username: search.username,
                                 token: search.token,
                                 query: search.query,
@@ -233,8 +240,25 @@ impl traits::core::Handle<NetRx> for Session {
                     }
                 }
             }
-            ServerMessage::ParentMinSpeed(_) | ServerMessage::ParentSpeedRatio(_) => {
-                // Eligibility/limits — informational for now.
+            ServerMessage::ParentMinSpeed(msg) => {
+                self.parent_min_speed = msg.speed;
+                Self::send(
+                    &DistribSpeedLimits {
+                        min_speed: self.parent_min_speed,
+                        ratio: self.parent_speed_ratio,
+                    },
+                    writer,
+                );
+            }
+            ServerMessage::ParentSpeedRatio(msg) => {
+                self.parent_speed_ratio = msg.ratio;
+                Self::send(
+                    &DistribSpeedLimits {
+                        min_speed: self.parent_min_speed,
+                        ratio: self.parent_speed_ratio,
+                    },
+                    writer,
+                );
             }
             ServerMessage::GetPeerAddress(response) => {
                 // 0.0.0.0:0 is the server's way of saying "unknown/offline".
@@ -562,6 +586,14 @@ mod tests {
 
         fn incoming_searches(&self) -> Vec<IncomingSearch> {
             self.decode(MessageId::IncomingSearch, IncomingSearch::deserialize_from)
+        }
+
+        fn relay_distrib_searches(&self) -> Vec<RelayDistribSearch> {
+            self.decode(MessageId::RelayDistribSearch, RelayDistribSearch::deserialize_from)
+        }
+
+        fn distrib_speed_limits(&self) -> Vec<DistribSpeedLimits> {
+            self.decode(MessageId::DistribSpeedLimits, DistribSpeedLimits::deserialize_from)
         }
 
         fn excluded_phrases(&self) -> Vec<SetExcludedPhrases> {
@@ -967,11 +999,33 @@ mod tests {
         put_string(&mut body, "distributed query");
         session.handle(&NetRx { payload: body }, &writer);
 
-        let searches = writer.incoming_searches();
-        assert_eq!(searches.len(), 1, "the embedded distributed search is responded to");
+        let searches = writer.relay_distrib_searches();
+        assert_eq!(searches.len(), 1, "the embedded distributed search is relayed to peer_net");
         assert_eq!(searches[0].username, "searcher");
         assert_eq!(searches[0].token, 0x4242);
         assert_eq!(searches[0].query, "distributed query");
+    }
+
+    #[test]
+    fn parent_speed_limits_are_forwarded_to_peer_net() {
+        use soulseek_proto::wire::put_u32;
+        let writer = CapturingWriter::default();
+        let mut session = logged_in_session(&writer);
+
+        let mut min = Vec::new();
+        put_u32(&mut min, 83); // ParentMinSpeed
+        put_u32(&mut min, 1000);
+        session.handle(&NetRx { payload: min }, &writer);
+
+        let mut ratio = Vec::new();
+        put_u32(&mut ratio, 84); // ParentSpeedRatio
+        put_u32(&mut ratio, 50);
+        session.handle(&NetRx { payload: ratio }, &writer);
+
+        let limits = writer.distrib_speed_limits();
+        // Latest carries both values (min arrived first with ratio still 0).
+        assert_eq!(limits.last().unwrap().min_speed, 1000);
+        assert_eq!(limits.last().unwrap().ratio, 50);
     }
 
     #[test]

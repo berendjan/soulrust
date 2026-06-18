@@ -74,6 +74,8 @@ rust_messenger::messenger_id_enum!(
         CancelDownload = 42,
         PeerPierceFile = 43,
         PeerPierceDistrib = 44,
+        RelayDistribSearch = 45,
+        DistribSpeedLimits = 46,
     }
 );
 
@@ -441,6 +443,25 @@ pub struct PeerPierceDistrib {
     pub token: u32,
 }
 
+/// session → peer_net: a distributed search the server injected via an
+/// EmbeddedMessage (we're a branch root). peer_net responds to it from our
+/// shares *and* forwards it down to our children.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayDistribSearch {
+    pub username: String,
+    pub token: u32,
+    pub query: String,
+}
+
+/// session → peer_net: the server's distributed eligibility limits
+/// (`ParentMinSpeed` / `ParentSpeedRatio`), used to size how many children we
+/// accept based on our measured upload speed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistribSpeedLimits {
+    pub min_speed: u32,
+    pub ratio: u32,
+}
+
 // ---------------------------------------------------------------------------
 // downloads (request a file from a peer)
 
@@ -626,6 +647,8 @@ impl_bus_message!(
     CancelDownload => MessageId::CancelDownload,
     PeerPierceFile => MessageId::PeerPierceFile,
     PeerPierceDistrib => MessageId::PeerPierceDistrib,
+    RelayDistribSearch => MessageId::RelayDistribSearch,
+    DistribSpeedLimits => MessageId::DistribSpeedLimits,
 );
 
 #[cfg(test)]
