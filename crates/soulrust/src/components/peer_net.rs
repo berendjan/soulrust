@@ -12,10 +12,10 @@
 //! over `AsyncRead + AsyncWrite`, so it is unit-testable over an in-memory
 //! duplex without a real socket.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -136,6 +136,8 @@ enum PeerCommand {
     StartUpload { username: String },
     /// session resolved the address; open the file connection(s) and stream.
     UploadConnect { username: String, ip: String, port: u16 },
+    /// A slot freed (an upload finished); start any waiting uploads that fit.
+    PumpUploads,
     /// Adopt a distributed parent: open a `D` connection and relay its searches.
     DistribConnect { username: String, ip: String, port: u16 },
     /// Re-advertise our branch level/root and child-acceptance to the server
@@ -233,6 +235,47 @@ struct ConnCtx {
     /// uploads complete. Advertised in search responses and user-info so peers'
     /// speed filters see an honest value instead of 0.
     upload_speed: AtomicU32,
+    /// Concurrency gate: caps simultaneously-streaming uploads at the configured
+    /// slot count, queueing the rest until a slot frees.
+    uploads_gate: UploadGate,
+}
+
+/// A ready-to-stream upload waiting for a free slot.
+struct UploadJob {
+    ip: String,
+    port: u16,
+    token: u32,
+    peer: String,
+    filename: String,
+    real_path: PathBuf,
+    size: u64,
+}
+
+/// Limits how many uploads stream at once. `slots == 0` means unlimited.
+#[derive(Default)]
+struct UploadGate {
+    active: AtomicU32,
+    waiting: Mutex<VecDeque<UploadJob>>,
+    slots: AtomicUsize,
+}
+
+impl UploadGate {
+    /// Take the next waiting upload iff a slot is free, marking the slot busy.
+    /// Returns `None` when at capacity or nothing is waiting.
+    fn try_claim(&self) -> Option<UploadJob> {
+        let slots = self.slots.load(Ordering::Relaxed);
+        if slots != 0 && self.active.load(Ordering::Relaxed) as usize >= slots {
+            return None;
+        }
+        let job = self.waiting.lock().unwrap().pop_front()?;
+        self.active.fetch_add(1, Ordering::Relaxed);
+        Some(job)
+    }
+
+    /// Release a slot when an upload finishes.
+    fn release(&self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Our place in the distributed search tree and the children we feed.
@@ -334,6 +377,7 @@ pub struct PeerNet {
     incomplete_dir: PathBuf,
     search_filter: SearchFilter,
     fifo: bool,
+    upload_slots: usize,
     cmd_tx: UnboundedSender<PeerCommand>,
     cmd_rx: Option<UnboundedReceiver<PeerCommand>>,
 }
@@ -361,6 +405,7 @@ impl PeerNet {
                 max_queue_length: ctx.config.sharing.max_peer_queue_length,
             },
             fifo: ctx.config.sharing.fifo_queue,
+            upload_slots: ctx.config.sharing.upload_slots as usize,
             cmd_tx,
             cmd_rx: Some(cmd_rx),
         }
@@ -381,6 +426,7 @@ impl traits::core::Handler for PeerNet {
             incomplete_dir: std::mem::take(&mut self.incomplete_dir),
             search_filter: self.search_filter,
             fifo: self.fifo,
+            upload_slots: self.upload_slots,
         };
         let cmd_rx = self.cmd_rx.take().expect("on_start called once");
         let cmd_tx = self.cmd_tx.clone();
@@ -402,6 +448,7 @@ struct ReactorConfig {
     incomplete_dir: PathBuf,
     search_filter: SearchFilter,
     fifo: bool,
+    upload_slots: usize,
 }
 
 impl traits::core::Handle<PeerBrowseConnect> for PeerNet {
@@ -555,6 +602,7 @@ fn run_reactor<W: traits::core::Writer>(
             downloads: Mutex::new(Downloads::default()),
             distrib: DistribState::default(),
             upload_speed: AtomicU32::new(0),
+            uploads_gate: UploadGate::default(),
             uploads: Mutex::new(Uploads::default()),
             our_username: config.username,
             download_dir: config.download_dir,
@@ -570,6 +618,8 @@ fn run_reactor<W: traits::core::Writer>(
         });
         // Until we adopt a parent we're our own branch root at level 0.
         ctx.distrib.branch.lock().unwrap().root = ctx.our_username.clone();
+        // Cap concurrent uploads at the configured slot count (0 = unlimited).
+        ctx.uploads_gate.slots.store(config.upload_slots, Ordering::Relaxed);
 
         let listener = match TcpListener::bind(("0.0.0.0", port)).await {
             Ok(listener) => listener,
@@ -719,23 +769,21 @@ async fn command_loop<W: traits::core::Writer>(
                         );
                         continue;
                     }
-                    let our_username = ctx.our_username.clone();
-                    let writer = writer.clone();
-                    let ctx = ctx.clone();
-                    tokio::spawn(upload_task(
-                        ip.clone(),
+                    // Hand the ready transfer to the slot gate rather than
+                    // streaming immediately; it starts as soon as a slot is free.
+                    ctx.uploads_gate.waiting.lock().unwrap().push_back(UploadJob {
+                        ip: ip.clone(),
                         port,
                         token,
-                        peer.clone(),
+                        peer: peer.clone(),
                         filename,
                         real_path,
                         size,
-                        our_username,
-                        ctx,
-                        writer,
-                    ));
+                    });
                 }
+                pump_uploads(&ctx, &writer);
             }
+            PeerCommand::PumpUploads => pump_uploads(&ctx, &writer),
             PeerCommand::IncomingSearch { username: searcher, token, query } => {
                 let our_token = connect_token;
                 connect_token = connect_token.wrapping_add(1);
@@ -1034,6 +1082,25 @@ async fn download_init_task<W: traits::core::Writer>(
 
 /// Outbound upload: open a file connection to the downloader, send the peer-init
 /// and `FileTransferInit`, then stream the file from disk. We are the uploader.
+/// Start waiting uploads up to the free slot count. `slots == 0` means
+/// unlimited. Called when new uploads are queued and whenever one finishes.
+fn pump_uploads<W: traits::core::Writer>(ctx: &Arc<ConnCtx>, writer: &W) {
+    while let Some(job) = ctx.uploads_gate.try_claim() {
+        tokio::spawn(upload_task(
+            job.ip,
+            job.port,
+            job.token,
+            job.peer,
+            job.filename,
+            job.real_path,
+            job.size,
+            ctx.our_username.clone(),
+            ctx.clone(),
+            writer.clone(),
+        ));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn upload_task<W: traits::core::Writer>(
     ip: String,
@@ -1077,6 +1144,9 @@ async fn upload_task<W: traits::core::Writer>(
         Ok(()) => PeerNet::send(&UploadComplete { username: peer, filename }, &writer),
         Err(reason) => PeerNet::send(&UploadFailed { username: peer, filename, reason }, &writer),
     }
+    // Free the slot and let any waiting uploads start.
+    ctx.uploads_gate.release();
+    let _ = ctx.cmd_tx.send(PeerCommand::PumpUploads);
 }
 
 /// Reads one length-prefixed frame, returning the payload (code + contents), or
@@ -2001,6 +2071,7 @@ mod tests {
             downloads: Mutex::new(Downloads::default()),
             distrib: DistribState::default(),
             upload_speed: AtomicU32::new(0),
+            uploads_gate: UploadGate::default(),
             uploads: Mutex::new(Uploads::default()),
             our_username: "me".into(),
             download_dir: std::env::temp_dir(),
@@ -2224,6 +2295,7 @@ mod tests {
                 downloads: Mutex::new(Downloads::default()),
             distrib: DistribState::default(),
             upload_speed: AtomicU32::new(0),
+            uploads_gate: UploadGate::default(),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
                 download_dir: dir.clone(),
@@ -2362,6 +2434,7 @@ mod tests {
                 downloads: Mutex::new(Downloads::default()),
             distrib: DistribState::default(),
             upload_speed: AtomicU32::new(0),
+            uploads_gate: UploadGate::default(),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
                 download_dir: dir.clone(),
@@ -2609,6 +2682,7 @@ mod tests {
                 downloads: Mutex::new(Downloads::default()),
             distrib: DistribState::default(),
             upload_speed: AtomicU32::new(0),
+            uploads_gate: UploadGate::default(),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
                 download_dir: dir.clone(),
@@ -2765,6 +2839,7 @@ mod tests {
                 downloads: Mutex::new(Downloads::default()),
             distrib: DistribState::default(),
             upload_speed: AtomicU32::new(0),
+            uploads_gate: UploadGate::default(),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
                 download_dir: dir.clone(),
@@ -2949,6 +3024,7 @@ mod tests {
                 downloads: Mutex::new(Downloads::default()),
             distrib: DistribState::default(),
             upload_speed: AtomicU32::new(0),
+            uploads_gate: UploadGate::default(),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
                 download_dir: std::env::temp_dir(),
@@ -3007,6 +3083,51 @@ mod tests {
             let frame = rx.recv().await.unwrap();
             assert_eq!(frame, DistribBranchLevel { level: 5 }.to_frame());
         });
+    }
+
+    #[test]
+    fn upload_gate_caps_concurrency_at_the_slot_count() {
+        let gate = UploadGate::default();
+        gate.slots.store(2, Ordering::Relaxed);
+        let job = || UploadJob {
+            ip: "1.2.3.4".into(),
+            port: 1,
+            token: 0,
+            peer: "p".into(),
+            filename: "f".into(),
+            real_path: std::path::PathBuf::from("/x"),
+            size: 1,
+        };
+        for _ in 0..3 {
+            gate.waiting.lock().unwrap().push_back(job());
+        }
+        // Only two of the three can be claimed at once.
+        assert!(gate.try_claim().is_some());
+        assert!(gate.try_claim().is_some());
+        assert!(gate.try_claim().is_none(), "at capacity");
+        // Freeing a slot lets the third start; then we're empty.
+        gate.release();
+        assert!(gate.try_claim().is_some());
+        assert!(gate.try_claim().is_none(), "nothing left waiting");
+    }
+
+    #[test]
+    fn upload_gate_zero_slots_means_unlimited() {
+        let gate = UploadGate::default(); // slots = 0
+        for _ in 0..5 {
+            gate.waiting.lock().unwrap().push_back(UploadJob {
+                ip: "1.2.3.4".into(),
+                port: 1,
+                token: 0,
+                peer: "p".into(),
+                filename: "f".into(),
+                real_path: std::path::PathBuf::from("/x"),
+                size: 1,
+            });
+        }
+        for _ in 0..5 {
+            assert!(gate.try_claim().is_some());
+        }
     }
 
     #[test]
@@ -3082,6 +3203,7 @@ mod tests {
                 downloads: Mutex::new(Downloads::default()),
             distrib: DistribState::default(),
             upload_speed: AtomicU32::new(0),
+            uploads_gate: UploadGate::default(),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
                 download_dir: std::env::temp_dir(),
@@ -3143,6 +3265,7 @@ mod tests {
                 downloads: Mutex::new(Downloads::default()),
             distrib: DistribState::default(),
             upload_speed: AtomicU32::new(0),
+            uploads_gate: UploadGate::default(),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
                 download_dir: std::env::temp_dir(),
@@ -3308,6 +3431,7 @@ mod tests {
                 downloads: Mutex::new(Downloads::default()),
             distrib: DistribState::default(),
             upload_speed: AtomicU32::new(0),
+            uploads_gate: UploadGate::default(),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
                 download_dir: std::env::temp_dir(),
@@ -3354,6 +3478,7 @@ mod tests {
             downloads: Mutex::new(Downloads::default()),
             distrib: DistribState::default(),
             upload_speed: AtomicU32::new(0),
+            uploads_gate: UploadGate::default(),
             uploads: Mutex::new(Uploads::default()),
             our_username: "me".into(),
             download_dir: std::env::temp_dir(),
