@@ -152,7 +152,9 @@ impl traits::core::Handle<NetRx> for Session {
                 // Join the distributed search tree, in Nicotine+'s order: ask for
                 // a parent (so the server sends PossibleParents and routes
                 // searches to us), declare we're our own root at level 0, and
-                // decline children for now (we don't forward down-tree yet).
+                // decline children until we attach to a parent — once peer_net
+                // adopts one it re-advertises AcceptChildren(true) and forwards
+                // searches down to any children that join.
                 Self::send(&NetTx { frame: HaveNoParent { no_parent: true }.to_frame() }, writer);
                 Self::send(
                     &NetTx { frame: BranchRoot { root: self.username.clone() }.to_frame() },
@@ -907,7 +909,7 @@ mod tests {
         );
         assert!(
             frames.contains(&AcceptChildren { accept: false }.to_frame()),
-            "AcceptChildren(false) — we don't forward down-tree yet"
+            "AcceptChildren(false) at login — peer_net flips it on once attached to a parent"
         );
     }
 

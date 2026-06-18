@@ -26,8 +26,10 @@ use soulseek_proto::peer::{ConnectionType, PeerInit, PeerInitMessage, PierceFire
 use soulseek_proto::peer_message::{
     FileSearchResponse, GetSharedFileList, PeerMessage, SharedFileListResponse, UserInfoResponse,
 };
-use soulseek_proto::server::{ConnectToPeerRequest, ServerRequest};
-use soulseek_proto::distributed::{self, DistribSearch, DistributedMessage};
+use soulseek_proto::server::{AcceptChildren, BranchLevel, BranchRoot, ConnectToPeerRequest, ServerRequest};
+use soulseek_proto::distributed::{
+    self, DistribBranchLevel, DistribBranchRoot, DistribSearch, DistributedMessage,
+};
 use soulseek_proto::Reader;
 use soulseek_proto::transfer::{
     FileTransferInit, PlaceInQueueRequest, PlaceInQueueResponse, QueueUpload, TransferDirection,
@@ -62,8 +64,10 @@ const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const BROWSE_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Byte budget for a browse listing forwarded onto the bus — it carries
-/// *locations*, not bulk data, and must stay well under the bus ring.
-const MAX_LISTING_BYTES: usize = 512 * 1024;
+/// *locations*, not bulk data. The bus message header is a u32 now (≈ ring/2,
+/// ~2 MiB per message at the default 4 MiB ring), so this fits with headroom
+/// and only the largest shares get truncated.
+const MAX_LISTING_BYTES: usize = 1536 * 1024;
 
 /// Bound on distinct pending deliveries. A searcher that never connects back
 /// (offline / firewalled / malicious) would otherwise leave its queued frame in
@@ -134,6 +138,10 @@ enum PeerCommand {
     UploadConnect { username: String, ip: String, port: u16 },
     /// Adopt a distributed parent: open a `D` connection and relay its searches.
     DistribConnect { username: String, ip: String, port: u16 },
+    /// Re-advertise our branch level/root and child-acceptance to the server
+    /// (sent from connection tasks, which lack the bus writer, after our tree
+    /// position or child count changes).
+    AdvertiseBranch,
     /// Replace the server-supplied excluded-phrase list used to filter responses.
     SetExcludedPhrases { phrases: Vec<String> },
     /// Apply changed config live (no restart): search filter + result cap.
@@ -218,6 +226,80 @@ struct ConnCtx {
     /// live (no restart): the requester-side search filter and the cap on files
     /// we return for an incoming search. Updated on `ConfigChanged`.
     live: Mutex<LiveConfig>,
+    /// Distributed-search-tree state: our branch position and the child
+    /// connections we relay searches down to.
+    distrib: DistribState,
+    /// Rolling average of our recent upload throughput (bytes/sec), updated as
+    /// uploads complete. Advertised in search responses and user-info so peers'
+    /// speed filters see an honest value instead of 0.
+    upload_speed: AtomicU32,
+}
+
+/// Our place in the distributed search tree and the children we feed.
+#[derive(Default)]
+struct DistribState {
+    /// Our branch level + root, learned from our parent (or 0 / our own name
+    /// when we're a branch root receiving searches straight from the server).
+    branch: Mutex<Branch>,
+    /// Child `D` connections: id -> a sender that writes raw distributed frames
+    /// to that child's socket. Forwarding a search fans out over these.
+    children: Mutex<HashMap<u32, UnboundedSender<Vec<u8>>>>,
+    next_child_id: AtomicU32,
+    /// Whether we currently have a distributed parent. We only tell the server
+    /// `AcceptChildren(true)` while attached, since a detached node has no
+    /// searches to relay down.
+    attached: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Clone, Default)]
+struct Branch {
+    level: u32,
+    root: String,
+}
+
+/// How many distributed children we'll relay to at once (Nicotine+ caps at 10).
+const MAX_DISTRIB_CHILDREN: usize = 10;
+
+impl ConnCtx {
+    /// Re-encode and fan a distributed frame out to every child, pruning any
+    /// whose socket-writer task has gone.
+    fn forward_to_children(&self, frame: &[u8]) -> usize {
+        let mut children = self.distrib.children.lock().unwrap();
+        children.retain(|_, tx| tx.send(frame.to_vec()).is_ok());
+        children.len()
+    }
+
+    fn branch_snapshot(&self) -> Branch {
+        self.distrib.branch.lock().unwrap().clone()
+    }
+
+    fn child_count(&self) -> usize {
+        self.distrib.children.lock().unwrap().len()
+    }
+
+    /// Register a child socket-writer; returns its id (used to deregister).
+    fn add_child(&self, tx: UnboundedSender<Vec<u8>>) -> u32 {
+        let id = self.distrib.next_child_id.fetch_add(1, Ordering::Relaxed);
+        self.distrib.children.lock().unwrap().insert(id, tx);
+        id
+    }
+
+    fn remove_child(&self, id: u32) {
+        self.distrib.children.lock().unwrap().remove(&id);
+    }
+
+    /// Fold a finished upload's throughput into the rolling average (bytes/sec).
+    /// First sample seeds it; later ones blend 70% history / 30% latest so a
+    /// single slow/fast transfer doesn't swing it wildly.
+    fn record_upload_speed(&self, bytes_per_sec: u32) {
+        let prev = self.upload_speed.load(Ordering::Relaxed);
+        let next = if prev == 0 {
+            bytes_per_sec
+        } else {
+            ((prev as u64 * 7 + bytes_per_sec as u64 * 3) / 10) as u32
+        };
+        self.upload_speed.store(next, Ordering::Relaxed);
+    }
 }
 
 /// The subset of config the peer-net reactor honors at runtime without a
@@ -251,6 +333,7 @@ pub struct PeerNet {
     download_dir: PathBuf,
     incomplete_dir: PathBuf,
     search_filter: SearchFilter,
+    fifo: bool,
     cmd_tx: UnboundedSender<PeerCommand>,
     cmd_rx: Option<UnboundedReceiver<PeerCommand>>,
 }
@@ -277,6 +360,7 @@ impl PeerNet {
                 min_upload_speed: ctx.config.sharing.min_peer_upload_speed,
                 max_queue_length: ctx.config.sharing.max_peer_queue_length,
             },
+            fifo: ctx.config.sharing.fifo_queue,
             cmd_tx,
             cmd_rx: Some(cmd_rx),
         }
@@ -296,6 +380,7 @@ impl traits::core::Handler for PeerNet {
             download_dir: std::mem::take(&mut self.download_dir),
             incomplete_dir: std::mem::take(&mut self.incomplete_dir),
             search_filter: self.search_filter,
+            fifo: self.fifo,
         };
         let cmd_rx = self.cmd_rx.take().expect("on_start called once");
         let cmd_tx = self.cmd_tx.clone();
@@ -316,6 +401,7 @@ struct ReactorConfig {
     download_dir: PathBuf,
     incomplete_dir: PathBuf,
     search_filter: SearchFilter,
+    fifo: bool,
 }
 
 impl traits::core::Handle<PeerBrowseConnect> for PeerNet {
@@ -467,6 +553,8 @@ fn run_reactor<W: traits::core::Writer>(
             shares,
             queue: Arc::new(Mutex::new(PendingDeliveries::default())),
             downloads: Mutex::new(Downloads::default()),
+            distrib: DistribState::default(),
+            upload_speed: AtomicU32::new(0),
             uploads: Mutex::new(Uploads::default()),
             our_username: config.username,
             download_dir: config.download_dir,
@@ -474,12 +562,14 @@ fn run_reactor<W: traits::core::Writer>(
             cmd_tx,
             next_token: AtomicU32::new(1),
             excluded_phrases: Mutex::new(Vec::new()),
-            upload_queue: Mutex::new(UploadQueue::new(false)),
+            upload_queue: Mutex::new(UploadQueue::new(config.fifo)),
             live: Mutex::new(LiveConfig {
                 search_filter: config.search_filter,
                 max_results: config.max_results,
             }),
         });
+        // Until we adopt a parent we're our own branch root at level 0.
+        ctx.distrib.branch.lock().unwrap().root = ctx.our_username.clone();
 
         let listener = match TcpListener::bind(("0.0.0.0", port)).await {
             Ok(listener) => listener,
@@ -584,6 +674,17 @@ async fn command_loop<W: traits::core::Writer>(
                 let ctx = ctx.clone();
                 tokio::spawn(distrib_task(ip, port, peer, ctx));
             }
+            PeerCommand::AdvertiseBranch => {
+                // Tell the server our current tree position and whether we can
+                // take (more) children — sent whenever a parent updates our
+                // level/root or our child count crosses the cap.
+                let branch = ctx.branch_snapshot();
+                let accept = ctx.distrib.attached.load(Ordering::Relaxed)
+                    && ctx.child_count() < MAX_DISTRIB_CHILDREN;
+                PeerNet::send(&NetTx { frame: BranchLevel { level: branch.level }.to_frame() }, &writer);
+                PeerNet::send(&NetTx { frame: BranchRoot { root: branch.root }.to_frame() }, &writer);
+                PeerNet::send(&NetTx { frame: AcceptChildren { accept }.to_frame() }, &writer);
+            }
             PeerCommand::StartUpload { username: peer } => {
                 // A downloader approved an upload; ask session to resolve their
                 // address so we can open the file connection.
@@ -620,6 +721,7 @@ async fn command_loop<W: traits::core::Writer>(
                     }
                     let our_username = ctx.our_username.clone();
                     let writer = writer.clone();
+                    let ctx = ctx.clone();
                     tokio::spawn(upload_task(
                         ip.clone(),
                         port,
@@ -629,6 +731,7 @@ async fn command_loop<W: traits::core::Writer>(
                         real_path,
                         size,
                         our_username,
+                        ctx,
                         writer,
                     ));
                 }
@@ -652,6 +755,7 @@ async fn command_loop<W: traits::core::Writer>(
                 // filters see honest values.
                 let (free_slots, in_queue) =
                     slot_advertisement(ctx.upload_queue.lock().unwrap().len());
+                let upload_speed = ctx.upload_speed.load(Ordering::Relaxed);
                 // Matching is CPU-bound (word-index intersection); run it off the
                 // single reactor thread so a burst of network searches can't
                 // head-of-line-block accept / serve / connect dispatch.
@@ -669,9 +773,9 @@ async fn command_loop<W: traits::core::Writer>(
                         token,
                         files,
                         free_slots,
-                        // We do not yet measure upload throughput; advertise 0
-                        // until a real speed sampler exists.
-                        upload_speed: 0,
+                        // Our rolling upload throughput (0 until we've completed
+                        // a transfer this run), so peers' speed filters rank us.
+                        upload_speed,
                         in_queue,
                         private_files: Vec::new(),
                     };
@@ -940,6 +1044,7 @@ async fn upload_task<W: traits::core::Writer>(
     real_path: PathBuf,
     size: u64,
     our_username: String,
+    ctx: Arc<ConnCtx>,
     writer: W,
 ) {
     let result = async {
@@ -954,9 +1059,16 @@ async fn upload_task<W: traits::core::Writer>(
         let file = tokio::fs::File::open(&real_path)
             .await
             .map_err(|e| format!("open {}: {e}", real_path.display()))?;
-        transfer_io::upload(&mut stream, token, file, size)
+        let started = std::time::Instant::now();
+        let sent = transfer_io::upload(&mut stream, token, file, size)
             .await
             .map_err(|e| format!("streaming: {e}"))?;
+        // Sample throughput from this transfer (ignore trivially short ones,
+        // where timing is dominated by setup rather than the stream).
+        let secs = started.elapsed().as_secs_f64();
+        if sent >= 64 * 1024 && secs > 0.0 {
+            ctx.record_upload_speed((sent as f64 / secs) as u32);
+        }
         Ok::<(), String>(())
     }
     .await;
@@ -1053,8 +1165,10 @@ where
                         return recv_file(&mut stream, ctx, &init.username, &mut on_activity).await;
                     }
                     if init.connection_type == ConnectionType::Distributed {
-                        // A distributed child connected to us; relay searches.
-                        serve_distrib(&mut stream, ctx, &init.username, &mut on_activity).await?;
+                        // An inbound D connection is a child adopting us as its
+                        // parent: feed it our branch position and forward searches
+                        // down to it.
+                        serve_child(&mut stream, ctx, &init.username, &mut on_activity).await?;
                         return Ok(ConnOutcome::Done);
                     }
                     (init.username, Vec::new())
@@ -1097,12 +1211,15 @@ where
                 on_activity(format!("served browse to {peer}"));
             }
             PeerMessage::UserInfoRequest => {
+                // Reflect our real upload load rather than fixed placeholders.
+                let queued = ctx.upload_queue.lock().unwrap().len() as u32;
+                let (free_slots, in_queue) = slot_advertisement(queued as usize);
                 let info = UserInfoResponse {
                     description: format!("soulrust — {} file(s) shared", ctx.shares.num_files()),
                     picture: None,
-                    total_uploads: 0,
-                    queue_size: 0,
-                    slots_available: true,
+                    total_uploads: in_queue,
+                    queue_size: in_queue,
+                    slots_available: free_slots,
                     upload_allowed: 1,
                 };
                 stream.write_all(&info.to_frame()).await?;
@@ -1639,31 +1756,129 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     F: FnMut(String),
 {
-    on_activity(format!("distributed peer {peer} connected"));
+    on_activity(format!("distributed parent {peer} connected"));
+    ctx.distrib.attached.store(true, Ordering::Relaxed);
+    let result = serve_distrib_loop(stream, ctx, peer, on_activity).await;
+    // Parent gone: revert to being our own branch root and stop accepting
+    // children (and tell the server + any children).
+    ctx.distrib.attached.store(false, Ordering::Relaxed);
+    {
+        let mut branch = ctx.distrib.branch.lock().unwrap();
+        branch.level = 0;
+        branch.root = ctx.our_username.clone();
+    }
+    ctx.forward_to_children(&DistribBranchLevel { level: 0 }.to_frame());
+    ctx.forward_to_children(
+        &DistribBranchRoot { root_username: ctx.our_username.clone() }.to_frame(),
+    );
+    let _ = ctx.cmd_tx.send(PeerCommand::AdvertiseBranch);
+    result
+}
+
+/// The read loop for a distributed parent connection, split out so the caller
+/// can reset our branch state once it ends however it ends.
+async fn serve_distrib_loop<S, F>(
+    stream: &mut S,
+    ctx: &ConnCtx,
+    peer: &str,
+    on_activity: &mut F,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: FnMut(String),
+{
     while let Some(payload) =
         read_frame_timeout(stream, MAX_PEER_MESSAGE_LEN, PEER_IDLE_TIMEOUT).await?
     {
-        let search = match DistributedMessage::decode(&payload) {
-            Ok(DistributedMessage::Search(search)) => Some(search),
+        match DistributedMessage::decode(&payload) {
+            Ok(DistributedMessage::Search(search)) => relay_distrib_search(ctx, search, on_activity),
             Ok(DistributedMessage::Embedded(embedded))
                 if embedded.inner_code == distributed::code::SEARCH =>
             {
-                DistribSearch::decode(&mut Reader::new(&embedded.inner_message)).ok()
+                if let Ok(search) = DistribSearch::decode(&mut Reader::new(&embedded.inner_message)) {
+                    relay_distrib_search(ctx, search, on_activity);
+                }
             }
-            Ok(_) => None,  // ping / branch level / root — informational
+            Ok(DistributedMessage::BranchLevel(bl)) => {
+                // Our level is the parent's level + 1. Record it, push it to our
+                // children, and re-advertise to the server.
+                let level = bl.level.max(0) as u32 + 1;
+                ctx.distrib.branch.lock().unwrap().level = level;
+                ctx.forward_to_children(&DistribBranchLevel { level: level as i32 }.to_frame());
+                let _ = ctx.cmd_tx.send(PeerCommand::AdvertiseBranch);
+                on_activity(format!("branch level {level} via {peer}"));
+            }
+            Ok(DistributedMessage::BranchRoot(br)) => {
+                ctx.distrib.branch.lock().unwrap().root = br.root_username.clone();
+                ctx.forward_to_children(
+                    &DistribBranchRoot { root_username: br.root_username }.to_frame(),
+                );
+                let _ = ctx.cmd_tx.send(PeerCommand::AdvertiseBranch);
+            }
+            Ok(_) => {}      // ping / child-depth — informational
             Err(_) => break, // undecodable frame; drop the connection
-        };
-        if let Some(search) = search {
-            // Respond like a server search (and, once child forwarding lands,
-            // this is where we'd relay it onward).
-            let _ = ctx.cmd_tx.send(PeerCommand::IncomingSearch {
-                username: search.username,
-                token: search.token,
-                query: search.query,
-            });
-            on_activity(format!("relayed a distributed search from {peer}"));
         }
     }
+    Ok(())
+}
+
+/// Forward a distributed search verbatim to all our children, then respond to it
+/// from our shares (same path as a server search).
+fn relay_distrib_search<F: FnMut(String)>(ctx: &ConnCtx, search: DistribSearch, on_activity: &mut F) {
+    let children = ctx.forward_to_children(&search.to_frame());
+    let _ = ctx.cmd_tx.send(PeerCommand::IncomingSearch {
+        username: search.username,
+        token: search.token,
+        query: search.query,
+    });
+    on_activity(format!("relayed a distributed search to {children} child(ren)"));
+}
+
+/// Serve an inbound distributed child: send it our branch position, register it
+/// for search forwarding, and pump forwarded frames to its socket until it
+/// disconnects. Searches flow down-tree (parent → child), so we mostly write;
+/// reads are drained and discarded (only used to notice the child leaving).
+async fn serve_child<S, F>(
+    stream: &mut S,
+    ctx: &ConnCtx,
+    peer: &str,
+    on_activity: &mut F,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: FnMut(String),
+{
+    if ctx.child_count() >= MAX_DISTRIB_CHILDREN {
+        on_activity(format!("declining distributed child {peer} (at capacity)"));
+        return Ok(());
+    }
+    let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
+    let id = ctx.add_child(tx);
+    let _ = ctx.cmd_tx.send(PeerCommand::AdvertiseBranch); // child count changed
+    on_activity(format!("adopted distributed child {peer}"));
+
+    // Tell the new child our branch position so it can set its own level/root.
+    let branch = ctx.branch_snapshot();
+    stream.write_all(&DistribBranchLevel { level: branch.level as i32 }.to_frame()).await?;
+    stream.write_all(&DistribBranchRoot { root_username: branch.root }.to_frame()).await?;
+
+    // Searches flow down-tree (parent → child), so we only write to a child:
+    // each forwarded frame, plus a periodic ping so a vanished child's socket
+    // error is noticed even when no searches are flowing.
+    loop {
+        let next = tokio::time::timeout(PEER_IDLE_TIMEOUT, rx.recv()).await;
+        let frame = match next {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,                                   // we were deregistered
+            Err(_) => distributed::DistribPing.to_frame(),       // keepalive probe
+        };
+        if stream.write_all(&frame).await.is_err() {
+            break;
+        }
+    }
+    ctx.remove_child(id);
+    let _ = ctx.cmd_tx.send(PeerCommand::AdvertiseBranch); // freed a slot
+    on_activity(format!("distributed child {peer} left"));
     Ok(())
 }
 
@@ -1784,6 +1999,8 @@ mod tests {
             shares: Arc::new(test_index()),
             queue: Arc::new(Mutex::new(PendingDeliveries::default())),
             downloads: Mutex::new(Downloads::default()),
+            distrib: DistribState::default(),
+            upload_speed: AtomicU32::new(0),
             uploads: Mutex::new(Uploads::default()),
             our_username: "me".into(),
             download_dir: std::env::temp_dir(),
@@ -1825,7 +2042,10 @@ mod tests {
             let browse = PeerMessage::decode(&read_one_frame(&mut client).await).unwrap();
             assert!(matches!(browse, PeerMessage::SharedFileList(_)));
             let info = PeerMessage::decode(&read_one_frame(&mut client).await).unwrap();
-            assert!(matches!(info, PeerMessage::UserInfoResponse(_)));
+            let PeerMessage::UserInfoResponse(ui) = info else { panic!("expected user info") };
+            // Real values from the (empty) upload queue, not fixed placeholders.
+            assert!(ui.slots_available, "free slots advertised when the queue is empty");
+            assert_eq!(ui.queue_size, 0);
             let folder = PeerMessage::decode(&read_one_frame(&mut client).await).unwrap();
             let PeerMessage::FolderContents(fc) = folder else { panic!("expected folder contents") };
             assert_eq!(fc.token, 7);
@@ -2002,6 +2222,8 @@ mod tests {
                 shares: Arc::new(test_index()),
                 queue: Arc::new(Mutex::new(PendingDeliveries::default())),
                 downloads: Mutex::new(Downloads::default()),
+            distrib: DistribState::default(),
+            upload_speed: AtomicU32::new(0),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
                 download_dir: dir.clone(),
@@ -2138,6 +2360,8 @@ mod tests {
                 shares: Arc::new(test_index()),
                 queue: Arc::new(Mutex::new(PendingDeliveries::default())),
                 downloads: Mutex::new(Downloads::default()),
+            distrib: DistribState::default(),
+            upload_speed: AtomicU32::new(0),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
                 download_dir: dir.clone(),
@@ -2383,6 +2607,8 @@ mod tests {
                 shares: Arc::new(test_index()),
                 queue: Arc::new(Mutex::new(PendingDeliveries::default())),
                 downloads: Mutex::new(Downloads::default()),
+            distrib: DistribState::default(),
+            upload_speed: AtomicU32::new(0),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
                 download_dir: dir.clone(),
@@ -2537,6 +2763,8 @@ mod tests {
                 shares: Arc::new(test_index()),
                 queue: Arc::new(Mutex::new(PendingDeliveries::default())),
                 downloads: Mutex::new(Downloads::default()),
+            distrib: DistribState::default(),
+            upload_speed: AtomicU32::new(0),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
                 download_dir: dir.clone(),
@@ -2719,6 +2947,8 @@ mod tests {
                 shares: Arc::new(test_index()),
                 queue: Arc::new(Mutex::new(PendingDeliveries::default())),
                 downloads: Mutex::new(Downloads::default()),
+            distrib: DistribState::default(),
+            upload_speed: AtomicU32::new(0),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
                 download_dir: std::env::temp_dir(),
@@ -2758,6 +2988,86 @@ mod tests {
     }
 
     #[test]
+    fn parent_branch_level_sets_our_level_and_pushes_to_children() {
+        runtime().block_on(async {
+            let ctx = test_ctx();
+            // A registered child whose forwarded frames we can read.
+            let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
+            ctx.add_child(tx);
+
+            // Feed the parent's BranchLevel(4) then end the connection.
+            let (mut parent, mut server) = tokio::io::duplex(64 * 1024);
+            parent.write_all(&DistribBranchLevel { level: 4 }.to_frame()).await.unwrap();
+            drop(parent);
+            serve_distrib_loop(&mut server, &ctx, "parent", &mut |_| {}).await.unwrap();
+
+            // Our level is the parent's + 1, and the child was pushed the update
+            // as a ready-to-send (length-prefixed) frame.
+            assert_eq!(ctx.branch_snapshot().level, 5);
+            let frame = rx.recv().await.unwrap();
+            assert_eq!(frame, DistribBranchLevel { level: 5 }.to_frame());
+        });
+    }
+
+    #[test]
+    fn upload_speed_is_a_rolling_average() {
+        let ctx = test_ctx();
+        assert_eq!(ctx.upload_speed.load(Ordering::Relaxed), 0);
+        ctx.record_upload_speed(1000); // first sample seeds the average
+        assert_eq!(ctx.upload_speed.load(Ordering::Relaxed), 1000);
+        ctx.record_upload_speed(2000); // 1000*0.7 + 2000*0.3 = 1300
+        assert_eq!(ctx.upload_speed.load(Ordering::Relaxed), 1300);
+    }
+
+    #[test]
+    fn forwards_branch_info_and_searches_to_a_child() {
+        // A child that connects to us is told our branch position and then has
+        // searches relayed down to it.
+        use soulseek_proto::distributed::{DistribSearch, SEARCH_IDENTIFIER};
+        runtime().block_on(async {
+            let ctx = test_ctx();
+            {
+                let mut branch = ctx.distrib.branch.lock().unwrap();
+                branch.level = 2;
+                branch.root = "alice".into();
+            }
+            let (mut child, mut server) = tokio::io::duplex(64 * 1024);
+            let ctx2 = ctx.clone();
+            let task =
+                tokio::spawn(async move { serve_child(&mut server, &ctx2, "kid", &mut |_| {}).await });
+
+            // On connect it receives our branch level, then root.
+            let frame = read_one_frame(&mut child).await;
+            assert_eq!(
+                DistributedMessage::decode(&frame).unwrap(),
+                DistributedMessage::BranchLevel(DistribBranchLevel { level: 2 })
+            );
+            let frame = read_one_frame(&mut child).await;
+            assert_eq!(
+                DistributedMessage::decode(&frame).unwrap(),
+                DistributedMessage::BranchRoot(DistribBranchRoot { root_username: "alice".into() })
+            );
+
+            // Registered as a child; a forwarded search reaches it verbatim.
+            assert_eq!(ctx.child_count(), 1);
+            let search = DistribSearch {
+                identifier: SEARCH_IDENTIFIER,
+                username: "carol".into(),
+                token: 7,
+                query: "wish".into(),
+            };
+            assert_eq!(ctx.forward_to_children(&search.to_frame()), 1);
+            let frame = read_one_frame(&mut child).await;
+            assert_eq!(DistributedMessage::decode(&frame).unwrap(), DistributedMessage::Search(search));
+
+            // Dropping the registration ends the child's connection task.
+            ctx.distrib.children.lock().unwrap().clear();
+            let _ = task.await;
+            assert_eq!(ctx.child_count(), 0);
+        });
+    }
+
+    #[test]
     fn pierce_distrib_relays_searches_after_piercing() {
         // Indirect distributed connect: the server relayed ConnectToPeer(D). We
         // dial back, send PierceFirewall(token), then relay the peer's
@@ -2770,6 +3080,8 @@ mod tests {
                 shares: Arc::new(test_index()),
                 queue: Arc::new(Mutex::new(PendingDeliveries::default())),
                 downloads: Mutex::new(Downloads::default()),
+            distrib: DistribState::default(),
+            upload_speed: AtomicU32::new(0),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
                 download_dir: std::env::temp_dir(),
@@ -2829,6 +3141,8 @@ mod tests {
                 shares: Arc::new(test_index()),
                 queue: Arc::new(Mutex::new(PendingDeliveries::default())),
                 downloads: Mutex::new(Downloads::default()),
+            distrib: DistribState::default(),
+            upload_speed: AtomicU32::new(0),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
                 download_dir: std::env::temp_dir(),
@@ -2992,6 +3306,8 @@ mod tests {
                 shares: Arc::new(test_index()),
                 queue: Arc::new(Mutex::new(PendingDeliveries::default())),
                 downloads: Mutex::new(Downloads::default()),
+            distrib: DistribState::default(),
+            upload_speed: AtomicU32::new(0),
                 uploads: Mutex::new(Uploads::default()),
                 our_username: "me".into(),
                 download_dir: std::env::temp_dir(),
@@ -3036,6 +3352,8 @@ mod tests {
             shares: Arc::new(test_index()),
             queue: Arc::new(Mutex::new(PendingDeliveries::default())),
             downloads: Mutex::new(Downloads::default()),
+            distrib: DistribState::default(),
+            upload_speed: AtomicU32::new(0),
             uploads: Mutex::new(Uploads::default()),
             our_username: "me".into(),
             download_dir: std::env::temp_dir(),
