@@ -1,0 +1,7 @@
+# The protobuf schema root. Source files are exported so per-crate codegen
+# genrules can reference them with `$(location //proto:<path>)` and feed
+# `--proto_path=proto`.
+exports_files(
+    glob(["**/*.proto"]),
+    visibility = ["//visibility:public"],
+)

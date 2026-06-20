@@ -7,6 +7,14 @@ module(
 
 bazel_dep(name = "rules_rust", version = "0.70.0")
 
+# Hermetic protobuf compiler (built from source) for the buffa/connectrpc
+# codegen genrules. No system `protoc` is used.
+bazel_dep(name = "protobuf", version = "33.4", repo_name = "com_google_protobuf")
+bazel_dep(name = "rules_proto", version = "7.1.0")
+
+# Host OS/CPU constraints for selecting the right pinned plugin binary in //tools.
+bazel_dep(name = "platforms", version = "0.0.11")
+
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(edition = "2021")
 use_repo(rust, "rust_toolchains")
@@ -27,3 +35,79 @@ crate.from_cargo(
     ],
 )
 use_repo(crate, "crates")
+
+# Proto/Connect dependencies, resolved directly from crates.io via `from_specs`
+# rather than the workspace `from_cargo`. The workspace pins `rust-messenger` to
+# a git source that `from_cargo` would have to re-resolve through the whole
+# workspace graph; `from_specs` resolves this independent set on its own. Carries
+# only the runtime libraries — the codegen plugins are binary-only crates (no lib
+# target) that crate_universe can't pull as dependencies, so they come from
+# pinned release binaries via `http_file` below.
+crate.spec(package = "buffa", version = "0.7", features = ["json"])
+crate.spec(package = "buffa-types", version = "0.7")
+crate.spec(
+    package = "connectrpc",
+    version = "0.7",
+    default_features = False,
+    features = [
+        "server",
+        "client",
+    ],
+)
+crate.spec(package = "futures", version = "0.3")
+crate.spec(package = "http-body", version = "1")
+crate.spec(package = "serde", version = "1", features = ["derive"])
+crate.spec(package = "serde_json", version = "1")
+crate.from_specs(
+    name = "proto_deps",
+)
+use_repo(crate, "proto_deps")
+
+# Codegen plugin binaries, pinned by version + sha256 (hermetic: Bazel fetches
+# from a fixed URL with a checksum; no system protoc/buf, no out-of-band cargo).
+# One repo per (plugin, platform); //tools selects the host platform's binary.
+http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+_BUFFA_VERSION = "v0.7.1"
+
+_CONNECT_VERSION = "v0.7.0"
+
+# (repo_name, plugin, version, platform, sha256)
+_PLUGIN_BINARIES = [
+    ("protoc_gen_buffa_darwin_aarch64", "protoc-gen-buffa", _BUFFA_VERSION, "darwin-aarch64", "2cad2fe479f8311eeb802f46adab1e2f013c8e782e90b5a69e7192ff5a59a322"),
+    ("protoc_gen_buffa_darwin_x86_64", "protoc-gen-buffa", _BUFFA_VERSION, "darwin-x86_64", "d2abeb1eeb6e96584134f230c4c5ff23214f2adc3e5c2566b369a7998eac8eb7"),
+    ("protoc_gen_buffa_linux_aarch64", "protoc-gen-buffa", _BUFFA_VERSION, "linux-aarch64", "fbb176434e2f1b4f90048d54f12fbdffaddecd259ea97ea4b1cd0958a01686db"),
+    ("protoc_gen_buffa_linux_x86_64", "protoc-gen-buffa", _BUFFA_VERSION, "linux-x86_64", "3a3e067e7d429a549d0f72646cdb558fec8403c36da298c7ff3cfddd4764d9e4"),
+    ("protoc_gen_buffa_packaging_darwin_aarch64", "protoc-gen-buffa-packaging", _BUFFA_VERSION, "darwin-aarch64", "24c638780c7d28f187a5a809d848152ef1f75c7d4deefb35ec3e08ea7bdde06a"),
+    ("protoc_gen_buffa_packaging_darwin_x86_64", "protoc-gen-buffa-packaging", _BUFFA_VERSION, "darwin-x86_64", "fa518ea3f76b7e73e73fca2b0edc1321fcecc3044e8a85bb92878625e18ee660"),
+    ("protoc_gen_buffa_packaging_linux_aarch64", "protoc-gen-buffa-packaging", _BUFFA_VERSION, "linux-aarch64", "f9ebaaa8ef56c980b70fd9340273f691f568b80d4f31c3b5a122a927acfac5f7"),
+    ("protoc_gen_buffa_packaging_linux_x86_64", "protoc-gen-buffa-packaging", _BUFFA_VERSION, "linux-x86_64", "c79c9cdf3d33326ff6716668c63d84269995e391f255abde03d69a205225bb52"),
+    ("protoc_gen_connect_rust_darwin_aarch64", "protoc-gen-connect-rust", _CONNECT_VERSION, "darwin-aarch64", "1b930ca4a6905bda838b669f0dc8c8d98e5f54eb8df21925ff91982598c20aef"),
+    ("protoc_gen_connect_rust_darwin_x86_64", "protoc-gen-connect-rust", _CONNECT_VERSION, "darwin-x86_64", "a1aae6896dc8af3a2a606dd9850aa0205d683b8e5de3ea7555c28f8ffc11dad1"),
+    ("protoc_gen_connect_rust_linux_aarch64", "protoc-gen-connect-rust", _CONNECT_VERSION, "linux-aarch64", "bb9db4fb7431c28752e70e0d5bf6105475abbd9e79497af5b68b2e62275a2103"),
+    ("protoc_gen_connect_rust_linux_x86_64", "protoc-gen-connect-rust", _CONNECT_VERSION, "linux-x86_64", "1a0f28736fe076c013ccc3f6b013d08e6a0432db1fe7617f72d2618d6c315eea"),
+    ("protoc_gen_buffa_windows_x86_64", "protoc-gen-buffa", _BUFFA_VERSION, "windows-x86_64", "87379ea7d5539c0d82a651b40cdffdd9d557e8017a3136edaf3691d1cdfacd88"),
+    ("protoc_gen_buffa_packaging_windows_x86_64", "protoc-gen-buffa-packaging", _BUFFA_VERSION, "windows-x86_64", "65032f123c0682bca5f7147b3188557b25d64d3bb1e18b306c036692b5325b0b"),
+    ("protoc_gen_connect_rust_windows_x86_64", "protoc-gen-connect-rust", _CONNECT_VERSION, "windows-x86_64", "87d46576839f302ad5234757d0ec7e543c844a6e7c31cdb2c915a7b76335e313"),
+]
+
+[
+    http_file(
+        name = repo,
+        urls = [
+            "https://github.com/anthropics/{org_repo}/releases/download/{ver}/{plugin}-{ver}-{plat}{ext}".format(
+                org_repo = "buffa" if plugin.startswith("protoc-gen-buffa") else "connect-rust",
+                ver = ver,
+                plugin = plugin,
+                plat = plat,
+                ext = ".exe" if plat.startswith("windows") else "",
+            ),
+        ],
+        sha256 = sha,
+        executable = True,
+        downloaded_file_path = plugin + (".exe" if plat.startswith("windows") else ""),
+    )
+    for (repo, plugin, ver, plat, sha) in _PLUGIN_BINARIES
+]
+# Repos created via `use_repo_rule` (http_file above) are visible to this module
+# automatically — no `use_repo` needed.

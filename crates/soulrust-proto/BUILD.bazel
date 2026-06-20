@@ -1,0 +1,79 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+# Stage-0 spike: generate buffa message types + connectrpc service stubs from
+# the greet.proto, then compile them. Hermetic — `protoc` is built from source
+# by the `protobuf` module and the three plugins are pinned release binaries
+# (see //tools and MODULE.bazel). No system protoc/buf, no build.rs.
+#
+# Output filenames are deterministic from the proto package + file: package
+# `soulrust.greet.v1`, file `greet.proto` →
+#   buffa:   soulrust.greet.v1.greet.rs (+ .__view.rs), soulrust.greet.v1.mod.rs, mod.rs
+#   connect: soulrust.greet.v1.greet.__connect.rs, soulrust.greet.v1.mod.rs, mod.rs
+# Two output trees because both plugins emit a `mod.rs`/`<pkg>.mod.rs` pair.
+genrule(
+    name = "gen_greet",
+    srcs = ["//proto:soulrust/greet/v1/greet.proto"],
+    outs = [
+        "generated/buffa/mod.rs",
+        "generated/buffa/soulrust.greet.v1.mod.rs",
+        "generated/buffa/soulrust.greet.v1.greet.rs",
+        "generated/buffa/soulrust.greet.v1.greet.__view.rs",
+        "generated/connect/mod.rs",
+        "generated/connect/soulrust.greet.v1.mod.rs",
+        "generated/connect/soulrust.greet.v1.greet.__connect.rs",
+    ],
+    cmd = """
+        mkdir -p $(RULEDIR)/generated/buffa $(RULEDIR)/generated/connect
+        $(location @com_google_protobuf//:protoc) \
+            --plugin=protoc-gen-buffa=$(location //tools:protoc-gen-buffa) \
+            --plugin=protoc-gen-buffa-packaging=$(location //tools:protoc-gen-buffa-packaging) \
+            --plugin=protoc-gen-connect-rust=$(location //tools:protoc-gen-connect-rust) \
+            --buffa_out=$(RULEDIR)/generated/buffa \
+            --buffa_opt=views=true,json=true \
+            --buffa-packaging_out=$(RULEDIR)/generated/buffa \
+            --connect-rust_out=$(RULEDIR)/generated/connect \
+            --connect-rust_opt=buffa_module=crate::proto \
+            --buffa-packaging_out=$(RULEDIR)/generated/connect \
+            --buffa-packaging_opt=filter=services \
+            --proto_path=proto \
+            soulrust/greet/v1/greet.proto
+    """,
+    tools = [
+        "@com_google_protobuf//:protoc",
+        "//tools:protoc-gen-buffa",
+        "//tools:protoc-gen-buffa-packaging",
+        "//tools:protoc-gen-connect-rust",
+    ],
+)
+
+rust_library(
+    name = "soulrust_proto",
+    srcs = [
+        "src/lib.rs",
+        "generated/buffa/mod.rs",
+        "generated/buffa/soulrust.greet.v1.mod.rs",
+        "generated/buffa/soulrust.greet.v1.greet.rs",
+        "generated/buffa/soulrust.greet.v1.greet.__view.rs",
+        "generated/connect/mod.rs",
+        "generated/connect/soulrust.greet.v1.mod.rs",
+        "generated/connect/soulrust.greet.v1.greet.__connect.rs",
+    ],
+    crate_root = "src/lib.rs",
+    edition = "2021",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@proto_deps//:buffa",
+        "@proto_deps//:buffa-types",
+        "@proto_deps//:connectrpc",
+        "@proto_deps//:futures",
+        "@proto_deps//:http-body",
+        "@proto_deps//:serde",
+        "@proto_deps//:serde_json",
+    ],
+)
+
+rust_test(
+    name = "soulrust_proto_test",
+    crate = ":soulrust_proto",
+    edition = "2021",
+)

@@ -1,0 +1,17 @@
+// Stage-0 spike: a trivial service proving hermetic buffa + connectrpc codegen
+// under Bazel. Not part of the real API surface — see proto/soulrust/api for that.
+syntax = "proto3";
+
+package soulrust.greet.v1;
+
+message GreetRequest {
+  string name = 1;
+}
+
+message GreetResponse {
+  string message = 1;
+}
+
+service GreetService {
+  rpc Greet(GreetRequest) returns (GreetResponse);
+}

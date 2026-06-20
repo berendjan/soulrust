@@ -1,0 +1,79 @@
+# Host-platform selection for the pinned codegen plugin binaries fetched by the
+# `http_file` repos in MODULE.bazel. Each `alias` resolves to the binary for the
+# building host's OS/CPU, so codegen genrules can reference a single stable label
+# (e.g. `//tools:protoc-gen-buffa`) regardless of platform.
+
+package(default_visibility = ["//visibility:public"])
+
+config_setting(
+    name = "darwin_aarch64",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
+config_setting(
+    name = "darwin_x86_64",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+config_setting(
+    name = "linux_aarch64",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
+config_setting(
+    name = "linux_x86_64",
+    constraint_values = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+config_setting(
+    name = "windows_x86_64",
+    constraint_values = [
+        "@platforms//os:windows",
+        "@platforms//cpu:x86_64",
+    ],
+)
+
+alias(
+    name = "protoc-gen-buffa",
+    actual = select({
+        ":darwin_aarch64": "@protoc_gen_buffa_darwin_aarch64//file",
+        ":darwin_x86_64": "@protoc_gen_buffa_darwin_x86_64//file",
+        ":linux_aarch64": "@protoc_gen_buffa_linux_aarch64//file",
+        ":linux_x86_64": "@protoc_gen_buffa_linux_x86_64//file",
+        ":windows_x86_64": "@protoc_gen_buffa_windows_x86_64//file",
+    }),
+)
+
+alias(
+    name = "protoc-gen-buffa-packaging",
+    actual = select({
+        ":darwin_aarch64": "@protoc_gen_buffa_packaging_darwin_aarch64//file",
+        ":darwin_x86_64": "@protoc_gen_buffa_packaging_darwin_x86_64//file",
+        ":linux_aarch64": "@protoc_gen_buffa_packaging_linux_aarch64//file",
+        ":linux_x86_64": "@protoc_gen_buffa_packaging_linux_x86_64//file",
+        ":windows_x86_64": "@protoc_gen_buffa_packaging_windows_x86_64//file",
+    }),
+)
+
+alias(
+    name = "protoc-gen-connect-rust",
+    actual = select({
+        ":darwin_aarch64": "@protoc_gen_connect_rust_darwin_aarch64//file",
+        ":darwin_x86_64": "@protoc_gen_connect_rust_darwin_x86_64//file",
+        ":linux_aarch64": "@protoc_gen_connect_rust_linux_aarch64//file",
+        ":linux_x86_64": "@protoc_gen_connect_rust_linux_x86_64//file",
+        ":windows_x86_64": "@protoc_gen_connect_rust_windows_x86_64//file",
+    }),
+)
