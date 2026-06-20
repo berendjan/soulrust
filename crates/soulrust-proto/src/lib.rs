@@ -25,6 +25,15 @@ mod bus_gen;
 /// The bus message payloads (package `soulrust.bus.v1`).
 pub use bus_gen::soulrust::bus::v1 as bus;
 
+// --- Public Connect API (soulrust.api.v1) -----------------------------------
+// `api` holds the buffa message types; the connectrpc service stubs in
+// `api_connect` reference them as `crate::api::...` (buffa_module=crate::api).
+#[path = "../generated/api_buffa/mod.rs"]
+pub mod api;
+
+#[path = "../generated/api_connect/mod.rs"]
+pub mod api_connect;
+
 // --- Bus registries (moved here from messages.rs) ---------------------------
 rust_messenger::messenger_id_enum!(
     HandlerId {
@@ -179,6 +188,27 @@ mod tests {
             connect::soulrust::greet::v1::GREET_SERVICE_SERVICE_NAME,
             "soulrust.greet.v1.GreetService"
         );
+    }
+
+    #[test]
+    fn api_status_service_generates() {
+        // The real public API service stub + message types compile and carry
+        // the right fully-qualified service name.
+        assert_eq!(
+            api_connect::soulrust::api::v1::STATUS_SERVICE_SERVICE_NAME,
+            "soulrust.api.v1.StatusService"
+        );
+        let resp = api::soulrust::api::v1::GetStatusResponse {
+            logged_in: true,
+            username: "alice".into(),
+            shared_files: 42,
+            ..Default::default()
+        };
+        let bytes = resp.encode_to_vec();
+        let back =
+            api::soulrust::api::v1::GetStatusResponse::decode_from_slice(&bytes).unwrap();
+        assert_eq!(back.username, "alice");
+        assert_eq!(back.shared_files, 42);
     }
 
     #[test]

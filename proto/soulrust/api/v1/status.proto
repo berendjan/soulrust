@@ -1,0 +1,24 @@
+// The public Connect API consumed by the web frontend and external apps. This
+// is a stable, versioned surface (soulrust.api.v1) served over Connect / gRPC /
+// gRPC-Web; its handlers bridge to the internal rust-messenger bus.
+syntax = "proto3";
+
+package soulrust.api.v1;
+
+message GetStatusRequest {}
+
+message GetStatusResponse {
+  // Soulseek session.
+  bool logged_in = 1;
+  string username = 2;
+  string greeting = 3;
+  string own_ip = 4;
+  // Sharing.
+  uint32 shared_files = 5;
+}
+
+// Session / app status. The first of several services (Search, Transfers,
+// Browse, Shares, Config) that together form the frontend's API.
+service StatusService {
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+}

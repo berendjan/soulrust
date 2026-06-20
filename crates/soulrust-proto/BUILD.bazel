@@ -75,6 +75,43 @@ genrule(
     ],
 )
 
+# Public Connect API: buffa message types + connectrpc service stubs.
+genrule(
+    name = "gen_api",
+    srcs = ["//proto:soulrust/api/v1/status.proto"],
+    outs = [
+        "generated/api_buffa/mod.rs",
+        "generated/api_buffa/soulrust.api.v1.mod.rs",
+        "generated/api_buffa/soulrust.api.v1.status.rs",
+        "generated/api_buffa/soulrust.api.v1.status.__view.rs",
+        "generated/api_connect/mod.rs",
+        "generated/api_connect/soulrust.api.v1.mod.rs",
+        "generated/api_connect/soulrust.api.v1.status.__connect.rs",
+    ],
+    cmd = """
+        mkdir -p $(RULEDIR)/generated/api_buffa $(RULEDIR)/generated/api_connect
+        $(location @com_google_protobuf//:protoc) \
+            --plugin=protoc-gen-buffa=$(location //tools:protoc-gen-buffa) \
+            --plugin=protoc-gen-buffa-packaging=$(location //tools:protoc-gen-buffa-packaging) \
+            --plugin=protoc-gen-connect-rust=$(location //tools:protoc-gen-connect-rust) \
+            --buffa_out=$(RULEDIR)/generated/api_buffa \
+            --buffa_opt=views=true,json=true \
+            --buffa-packaging_out=$(RULEDIR)/generated/api_buffa \
+            --connect-rust_out=$(RULEDIR)/generated/api_connect \
+            --connect-rust_opt=buffa_module=crate::api \
+            --buffa-packaging_out=$(RULEDIR)/generated/api_connect \
+            --buffa-packaging_opt=filter=services \
+            --proto_path=proto \
+            soulrust/api/v1/status.proto
+    """,
+    tools = [
+        "@com_google_protobuf//:protoc",
+        "//tools:protoc-gen-buffa",
+        "//tools:protoc-gen-buffa-packaging",
+        "//tools:protoc-gen-connect-rust",
+    ],
+)
+
 rust_library(
     name = "soulrust_proto",
     srcs = [
@@ -90,6 +127,13 @@ rust_library(
         "generated/bus/soulrust.bus.v1.mod.rs",
         "generated/bus/soulrust.bus.v1.bus.rs",
         "generated/bus/soulrust.bus.v1.bus.__view.rs",
+        "generated/api_buffa/mod.rs",
+        "generated/api_buffa/soulrust.api.v1.mod.rs",
+        "generated/api_buffa/soulrust.api.v1.status.rs",
+        "generated/api_buffa/soulrust.api.v1.status.__view.rs",
+        "generated/api_connect/mod.rs",
+        "generated/api_connect/soulrust.api.v1.mod.rs",
+        "generated/api_connect/soulrust.api.v1.status.__connect.rs",
     ],
     crate_root = "src/lib.rs",
     edition = "2021",
