@@ -1,21 +1,153 @@
-//! Generated protobuf wire types (buffa) and Connect service stubs
-//! (connectrpc), assembled by Bazel. The `#[path = ...]` mounts point at files
-//! produced by the `//crates/soulrust-proto:gen_greet` codegen action; they
-//! live in the Bazel output tree and are wired into the `rust_library` as srcs.
+//! soulrust's protobuf surface, assembled by Bazel.
 //!
-//! Stage 0 carries only the `greet` spike. Real packages (`soulrust.bus.v1`,
-//! `soulrust.api.v1`) are added in later stages.
+//! - `bus`: buffa wire types for the rust-messenger message bus, bridged to the
+//!   bus's `Message`/`ExtendedMessage` traits below. Migrated from the
+//!   hand-written structs in `crates/soulrust/src/messages.rs`, one batch at a
+//!   time; `soulrust` re-exports these so component imports don't churn.
+//! - `proto` / `connect`: the Stage-0 greet spike (buffa types + a connectrpc
+//!   service stub). Retained as a smoke test until the real API package lands.
+//!
+//! The `MessageId`/`HandlerId` registries live here (not in `soulrust`) so the
+//! bus-trait impls for the generated buffa types satisfy the orphan rule — both
+//! the trait's `Id` type and the impl'd-on type are local to this crate.
 
+// --- Stage-0 greet spike (buffa + connect), kept as a smoke test ------------
 #[path = "../generated/buffa/mod.rs"]
 pub mod proto;
 
 #[path = "../generated/connect/mod.rs"]
 pub mod connect;
 
+// --- Bus wire types ---------------------------------------------------------
+#[path = "../generated/bus/mod.rs"]
+mod bus_gen;
+
+/// The bus message payloads (package `soulrust.bus.v1`).
+pub use bus_gen::soulrust::bus::v1 as bus;
+
+// --- Bus registries (moved here from messages.rs) ---------------------------
+rust_messenger::messenger_id_enum!(
+    HandlerId {
+        Session = 1,
+        ConfigStore = 2,
+        Updater = 3,
+        Ui = 4,
+        NetEdge = 5,
+        WebBridge = 6,
+        Extractor = 7,
+        PeerEdge = 8,
+        Browse = 9,
+        PeerNet = 10,
+    }
+);
+
+rust_messenger::messenger_id_enum!(
+    MessageId {
+        HttpRender = 1,
+        HttpHtml = 2,
+        ExtractRequest = 3,
+        ExtractResult = 4,
+        StartSearch = 5,
+        StartSearchResult = 6,
+        GetConfigReq = 7,
+        ConfigSnapshot = 8,
+        SetConfigReq = 9,
+        SetConfigResult = 10,
+        ConfigChanged = 11,
+        UpdaterStatusChanged = 12,
+        UpdateDownloaded = 13,
+        ApplyUpdateReq = 14,
+        ApplyUpdateResult = 15,
+        SessionEvent = 16,
+        NetRx = 17,
+        NetTx = 18,
+        NetConn = 19,
+        BrowseUser = 20,
+        BrowseAccepted = 21,
+        PeerBrowseConnect = 22,
+        BrowseListing = 23,
+        BrowseFailed = 24,
+        BrowseRenderReq = 25,
+        BrowseHtml = 26,
+        PeerActivity = 27,
+        IncomingSearch = 28,
+        PeerPierce = 29,
+        StartDownload = 30,
+        PeerDownloadConnect = 31,
+        DownloadComplete = 32,
+        DownloadFailed = 33,
+        ResolveUploadPeer = 34,
+        PeerUploadConnect = 35,
+        UploadComplete = 36,
+        UploadFailed = 37,
+        PeerDistribConnect = 38,
+        SetExcludedPhrases = 39,
+        DownloadQueuePosition = 40,
+        SearchResultReceived = 41,
+        CancelDownload = 42,
+        PeerPierceFile = 43,
+        PeerPierceDistrib = 44,
+        RelayDistribSearch = 45,
+        DistribSpeedLimits = 46,
+    }
+);
+
+/// Byte length of `v` encoded as a protobuf base-128 varint.
+pub fn varint_len(mut v: u64) -> usize {
+    let mut n = 1;
+    while v >= 0x80 {
+        v >>= 7;
+        n += 1;
+    }
+    n
+}
+
+/// Bridge a buffa message type onto the rust-messenger bus traits.
+///
+/// The bus hands `deserialize_from` a slice padded to `usize` alignment, which
+/// raw protobuf can't tolerate (a trailing zero byte reads as field 0). We use
+/// buffa's **length-delimited** framing — a varint length prefix then the body —
+/// so decode reads exactly the body and ignores the padding, mirroring what the
+/// old bincode framing did via its length-delimited encoding.
+macro_rules! impl_bus_buffa {
+    ($($type:ty => $id:expr),+ $(,)?) => {
+        $(
+            impl ::rust_messenger::traits::core::Message for $type {
+                type Id = $crate::MessageId;
+                const ID: $crate::MessageId = $id;
+            }
+
+            impl $type {
+                pub fn deserialize_from(buffer: &[u8]) -> Self {
+                    <Self as ::buffa::Message>::decode_length_delimited(&mut &buffer[..])
+                        .expect("bus message failed to decode; sender/receiver out of sync")
+                }
+            }
+
+            impl ::rust_messenger::traits::extended::ExtendedMessage for $type {
+                fn get_size(&self) -> usize {
+                    let len = ::buffa::Message::encoded_len(self);
+                    $crate::varint_len(len as u64) + len as usize
+                }
+
+                fn write_into(&self, buffer: &mut [u8]) {
+                    let mut buf: &mut [u8] = buffer;
+                    ::buffa::Message::encode_length_delimited(self, &mut buf);
+                }
+            }
+        )+
+    };
+}
+
+impl_bus_buffa!(
+    bus::PeerActivity => MessageId::PeerActivity,
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use buffa::{Message, MessageView};
+    use rust_messenger::traits::extended::ExtendedMessage;
 
     #[test]
     fn greet_messages_round_trip_through_buffa() {
@@ -36,8 +168,6 @@ mod tests {
             ..Default::default()
         };
         let bytes = original.encode_to_vec();
-        // The whole point for the bus: read a borrowed view straight off the
-        // encoded bytes, no owned allocation.
         let view = proto::soulrust::greet::v1::GreetRequestView::decode_view(&bytes)
             .expect("view decode");
         assert_eq!(view.name, "berend");
@@ -49,5 +179,18 @@ mod tests {
             connect::soulrust::greet::v1::GREET_SERVICE_SERVICE_NAME,
             "soulrust.greet.v1.GreetService"
         );
+    }
+
+    #[test]
+    fn peer_activity_bridges_the_bus_traits_with_padding_tolerance() {
+        // Encode through the bus' ExtendedMessage path, then decode through
+        // deserialize_from with trailing alignment padding — the exact shape
+        // the rust-messenger ring buffer produces.
+        let msg = bus::PeerActivity { note: "listening on 2234".into(), ..Default::default() };
+        let size = msg.get_size();
+        let mut buf = vec![0u8; size + 7]; // 7 bytes of alignment padding
+        msg.write_into(&mut buf[..size]);
+        let back = bus::PeerActivity::deserialize_from(&buf);
+        assert_eq!(back.note, "listening on 2234");
     }
 }

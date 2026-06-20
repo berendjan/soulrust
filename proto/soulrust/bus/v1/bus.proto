@@ -1,0 +1,13 @@
+// Internal message-bus payloads (the rust-messenger ring). These are encoded
+// with buffa and bridged to the bus's Message/ExtendedMessage traits in the
+// soulrust-proto crate. Migrated from the hand-written Rust structs in
+// crates/soulrust/src/messages.rs, one batch at a time.
+syntax = "proto3";
+
+package soulrust.bus.v1;
+
+// peer_net → ui: a notable serving event (a peer connected, a browse served,
+// the listener bound, …). Just a log line — no bulk data.
+message PeerActivity {
+  string note = 1;
+}

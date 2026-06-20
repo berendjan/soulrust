@@ -9,6 +9,7 @@ rust_library(
     compile_data = glob(["assets/*"]),
     visibility = ["//visibility:public"],
     deps = [
+        "//crates/soulrust-proto:soulrust_proto",
         "//crates/soulseek-proto:soulseek_proto",
         "@crates//:bincode",
         "@crates//:lofty",

@@ -46,6 +46,35 @@ genrule(
     ],
 )
 
+# Bus payloads: buffa wire types only (no connect service stubs — these never
+# leave the process).
+genrule(
+    name = "gen_bus",
+    srcs = ["//proto:soulrust/bus/v1/bus.proto"],
+    outs = [
+        "generated/bus/mod.rs",
+        "generated/bus/soulrust.bus.v1.mod.rs",
+        "generated/bus/soulrust.bus.v1.bus.rs",
+        "generated/bus/soulrust.bus.v1.bus.__view.rs",
+    ],
+    cmd = """
+        mkdir -p $(RULEDIR)/generated/bus
+        $(location @com_google_protobuf//:protoc) \
+            --plugin=protoc-gen-buffa=$(location //tools:protoc-gen-buffa) \
+            --plugin=protoc-gen-buffa-packaging=$(location //tools:protoc-gen-buffa-packaging) \
+            --buffa_out=$(RULEDIR)/generated/bus \
+            --buffa_opt=views=true,json=true \
+            --buffa-packaging_out=$(RULEDIR)/generated/bus \
+            --proto_path=proto \
+            soulrust/bus/v1/bus.proto
+    """,
+    tools = [
+        "@com_google_protobuf//:protoc",
+        "//tools:protoc-gen-buffa",
+        "//tools:protoc-gen-buffa-packaging",
+    ],
+)
+
 rust_library(
     name = "soulrust_proto",
     srcs = [
@@ -57,11 +86,16 @@ rust_library(
         "generated/connect/mod.rs",
         "generated/connect/soulrust.greet.v1.mod.rs",
         "generated/connect/soulrust.greet.v1.greet.__connect.rs",
+        "generated/bus/mod.rs",
+        "generated/bus/soulrust.bus.v1.mod.rs",
+        "generated/bus/soulrust.bus.v1.bus.rs",
+        "generated/bus/soulrust.bus.v1.bus.__view.rs",
     ],
     crate_root = "src/lib.rs",
     edition = "2021",
     visibility = ["//visibility:public"],
     deps = [
+        "@crates//:rust-messenger",
         "@proto_deps//:buffa",
         "@proto_deps//:buffa-types",
         "@proto_deps//:connectrpc",

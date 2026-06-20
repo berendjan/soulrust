@@ -13,71 +13,10 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::extract::{Job, SearchJob};
 
-rust_messenger::messenger_id_enum!(
-    HandlerId {
-        Session = 1,
-        ConfigStore = 2,
-        Updater = 3,
-        Ui = 4,
-        NetEdge = 5,
-        WebBridge = 6,
-        Extractor = 7,
-        PeerEdge = 8,
-        Browse = 9,
-        PeerNet = 10,
-    }
-);
-
-rust_messenger::messenger_id_enum!(
-    MessageId {
-        HttpRender = 1,
-        HttpHtml = 2,
-        ExtractRequest = 3,
-        ExtractResult = 4,
-        StartSearch = 5,
-        StartSearchResult = 6,
-        GetConfigReq = 7,
-        ConfigSnapshot = 8,
-        SetConfigReq = 9,
-        SetConfigResult = 10,
-        ConfigChanged = 11,
-        UpdaterStatusChanged = 12,
-        UpdateDownloaded = 13,
-        ApplyUpdateReq = 14,
-        ApplyUpdateResult = 15,
-        SessionEvent = 16,
-        NetRx = 17,
-        NetTx = 18,
-        NetConn = 19,
-        BrowseUser = 20,
-        BrowseAccepted = 21,
-        PeerBrowseConnect = 22,
-        BrowseListing = 23,
-        BrowseFailed = 24,
-        BrowseRenderReq = 25,
-        BrowseHtml = 26,
-        PeerActivity = 27,
-        IncomingSearch = 28,
-        PeerPierce = 29,
-        StartDownload = 30,
-        PeerDownloadConnect = 31,
-        DownloadComplete = 32,
-        DownloadFailed = 33,
-        ResolveUploadPeer = 34,
-        PeerUploadConnect = 35,
-        UploadComplete = 36,
-        UploadFailed = 37,
-        PeerDistribConnect = 38,
-        SetExcludedPhrases = 39,
-        DownloadQueuePosition = 40,
-        SearchResultReceived = 41,
-        CancelDownload = 42,
-        PeerPierceFile = 43,
-        PeerPierceDistrib = 44,
-        RelayDistribSearch = 45,
-        DistribSpeedLimits = 46,
-    }
-);
+// The bus id registries (`HandlerId`/`MessageId`) live in `soulrust-proto` so
+// the buffa bus-type trait impls there satisfy the orphan rule. Re-exported here
+// to preserve the original `crate::messages::{HandlerId, MessageId}` paths.
+pub use soulrust_proto::{HandlerId, MessageId};
 
 // ---------------------------------------------------------------------------
 // web bridge <-> ui
@@ -356,11 +295,9 @@ pub struct BrowseHtml {
 // peer network edge → ui (serving activity, shown in the log)
 
 /// peer_net → ui: a notable serving event (a peer connected, we served a
-/// browse, the listener bound, …). Just a log line — no bulk data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeerActivity {
-    pub note: String,
-}
+/// browse, the listener bound, …). Just a log line — no bulk data. Migrated to a
+/// buffa bus message; the wire type + bus-trait bridge live in soulrust-proto.
+pub use soulrust_proto::bus::PeerActivity;
 
 /// session → peer_net: a search relayed by the server. peer_net matches it
 /// against our shares and, on a hit, delivers a FileSearchResponse to the
@@ -629,7 +566,6 @@ impl_bus_message!(
     BrowseFailed => MessageId::BrowseFailed,
     BrowseRenderReq => MessageId::BrowseRenderReq,
     BrowseHtml => MessageId::BrowseHtml,
-    PeerActivity => MessageId::PeerActivity,
     IncomingSearch => MessageId::IncomingSearch,
     PeerPierce => MessageId::PeerPierce,
     StartDownload => MessageId::StartDownload,

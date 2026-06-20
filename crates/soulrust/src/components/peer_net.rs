@@ -650,7 +650,7 @@ impl traits::core::Handle<DistribSpeedLimits> for PeerNet {
 /// Per-connection activity goes to stderr — it is peer-driven and must never
 /// outrun the bounded bus reader.
 fn status<W: traits::core::Writer>(writer: &W, note: String) {
-    PeerNet::send(&PeerActivity { note }, writer);
+    PeerNet::send(&PeerActivity { note, ..Default::default() }, writer);
 }
 
 fn run_reactor<W: traits::core::Writer>(
