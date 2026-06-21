@@ -6,10 +6,6 @@
 //! bridge, which holds the reply channel for it (see
 //! [`crate::components::web_bridge`]).
 
-
-use serde::{Deserialize, Serialize};
-
-
 // The bus id registries (`HandlerId`/`MessageId`) live in `soulrust-proto` so
 // the buffa bus-type trait impls there satisfy the orphan rule. Re-exported here
 // to preserve the original `crate::messages::{HandlerId, MessageId}` paths.
@@ -28,8 +24,9 @@ pub use soulrust_proto::bus::{
 // ---------------------------------------------------------------------------
 // web bridge <-> ui
 
-/// A page or htmx fragment the UI component can render.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A page or htmx fragment the UI component can render. Not a wire type — it is
+/// converted to the buffa `Page` via [`page_to_proto`] before crossing the bus.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Page {
     Index,
     StatusFragment,
@@ -149,5 +146,17 @@ mod tests {
         let mut buf = vec![0u8; size + 7];
         msg.write_into(&mut buf[..size]);
         assert_eq!(NetConn::deserialize_from(&buf), msg);
+    }
+
+    #[test]
+    fn decode_tolerates_padding_for_an_all_default_message() {
+        // The hardest padding case: a message whose body encodes to *zero* bytes
+        // (all proto3 defaults). The length prefix must bound the read so the
+        // trailing zero padding isn't misread as field data.
+        let msg = GetConfigReq { corr: 0, ..Default::default() };
+        let size = msg.get_size();
+        let mut buf = vec![0u8; size + 7];
+        msg.write_into(&mut buf[..size]);
+        assert_eq!(GetConfigReq::deserialize_from(&buf).corr, 0);
     }
 }

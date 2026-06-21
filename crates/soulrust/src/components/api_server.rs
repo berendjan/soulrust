@@ -21,7 +21,7 @@ use soulrust_proto::api::soulrust::api::v1::{GetStatusRequest, GetStatusResponse
 use soulrust_proto::api_connect::soulrust::api::v1::{StatusService, StatusServiceExt};
 
 use crate::config::AppContext;
-use crate::messages::{EnumValue, HandlerId, SessionEvent, SessionEventKind};
+use crate::messages::{ConfigChanged, EnumValue, HandlerId, SessionEvent, SessionEventKind};
 
 /// Default address for the Connect API. Distinct from the htmx UI's port so the
 /// two edges can run side by side during the migration.
@@ -35,6 +35,8 @@ struct StatusSnapshot {
     username: String,
     greeting: String,
     own_ip: String,
+    /// Not yet wired to a source (peer_net owns the share index); always 0 until
+    /// a share-count broadcast exists. Kept so the API response shape is stable.
     shared_files: u32,
 }
 
@@ -87,6 +89,15 @@ impl traits::core::Handle<SessionEvent> for ApiServer {
             // Search/protocol notes don't affect the status view.
             _ => {}
         }
+    }
+}
+
+impl traits::core::Handle<ConfigChanged> for ApiServer {
+    fn handle<W: traits::core::Writer>(&mut self, message: &ConfigChanged, _writer: &W) {
+        // Keep the API's reported username in step with config edits (seeded at
+        // construction, it would otherwise report the startup username forever).
+        self.snapshot.lock().unwrap().username =
+            crate::config::config_from_proto(&message.config).server.username;
     }
 }
 

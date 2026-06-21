@@ -166,6 +166,9 @@ enum PeerCommand {
     /// Throttled byte-progress for an in-flight transfer, forwarded to the UI
     /// (connection tasks have no bus Writer, so they route through here).
     TransferProgress { username: String, filename: String, bytes: u64, size: u64, upload: bool },
+    /// An upload started streaming on a connection a downloader opened (the
+    /// `TransferRequest{Download}` path); routed to the UI's upload monitor.
+    UploadStarted { username: String, filename: String, size: u64 },
     /// A connection task received a filter-passing search result; forward it to
     /// the UI (the task has no bus Writer).
     SearchResult {
@@ -663,8 +666,13 @@ impl traits::core::Handle<CancelDownload> for PeerNet {
 
 impl traits::core::Handle<PauseDownload> for PeerNet {
     fn handle<W: traits::core::Writer>(&mut self, message: &PauseDownload, _writer: &W) {
-        // Pause is an abort that keeps the partial — same reactor action as
-        // cancel; the UI is what distinguishes them (it keeps a Paused row).
+        // Pause stops the download the same way cancel does: it forgets the
+        // pending request + negotiated token so nothing new starts, and the
+        // partial file is kept for resume. A transfer already streaming to disk
+        // isn't interrupted mid-write (see the CancelDownload reactor arm) — it
+        // finishes its current attempt. The UI distinguishes the two (Paused row
+        // vs delete); truly aborting a live stream would need a per-transfer
+        // abort handle, which we don't yet track.
         let _ = self.cmd_tx.send(PeerCommand::CancelDownload {
             username: message.username.clone(),
             filename: message.filename.clone(),
@@ -1041,6 +1049,12 @@ async fn command_loop<W: traits::core::Writer>(
             PeerCommand::TransferProgress { username, filename, bytes, size, upload } => {
                 PeerNet::send(
                     &TransferProgress { username, filename, bytes, size, upload, ..Default::default() },
+                    &writer,
+                );
+            }
+            PeerCommand::UploadStarted { username, filename, size } => {
+                PeerNet::send(
+                    &UploadStarted { username, filename, size, ..Default::default() },
                     &writer,
                 );
             }
@@ -1816,6 +1830,14 @@ where
         };
         if let Some(up) = offered {
             ctx.upload_queue.lock().unwrap().dequeue(up.transfer_id);
+            // Surface this upload to the monitor (this path — the downloader
+            // opened the file connection — doesn't go through pump_uploads, which
+            // is the only other place UploadStarted is emitted).
+            let _ = ctx.cmd_tx.send(PeerCommand::UploadStarted {
+                username: up.username.clone(),
+                filename: up.filename.clone(),
+                size: up.size,
+            });
             let mut rep = ProgressReporter::new(
                 ctx.cmd_tx.clone(),
                 up.username.clone(),
