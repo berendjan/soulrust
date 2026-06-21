@@ -557,7 +557,7 @@ impl traits::core::Handle<PeerBrowseConnect> for PeerNet {
         let _ = self.cmd_tx.send(PeerCommand::Browse {
             username: message.username.clone(),
             ip: message.ip.clone(),
-            port: message.port,
+            port: message.port as u16,
         });
     }
 }
@@ -567,7 +567,7 @@ impl traits::core::Handle<PeerPierce> for PeerNet {
         let _ = self.cmd_tx.send(PeerCommand::Pierce {
             username: message.username.clone(),
             ip: message.ip.clone(),
-            port: message.port,
+            port: message.port as u16,
             token: message.token,
         });
     }
@@ -578,7 +578,7 @@ impl traits::core::Handle<PeerPierceFile> for PeerNet {
         let _ = self.cmd_tx.send(PeerCommand::PierceFile {
             username: message.username.clone(),
             ip: message.ip.clone(),
-            port: message.port,
+            port: message.port as u16,
             token: message.token,
         });
     }
@@ -589,7 +589,7 @@ impl traits::core::Handle<PeerPierceDistrib> for PeerNet {
         let _ = self.cmd_tx.send(PeerCommand::PierceDistrib {
             username: message.username.clone(),
             ip: message.ip.clone(),
-            port: message.port,
+            port: message.port as u16,
             token: message.token,
         });
     }
@@ -644,7 +644,7 @@ impl traits::core::Handle<PeerDownloadConnect> for PeerNet {
         let _ = self.cmd_tx.send(PeerCommand::Download {
             username: message.username.clone(),
             ip: message.ip.clone(),
-            port: message.port,
+            port: message.port as u16,
             filename: message.filename.clone(),
             size: message.size,
         });
@@ -676,7 +676,7 @@ impl traits::core::Handle<PeerUploadConnect> for PeerNet {
         let _ = self.cmd_tx.send(PeerCommand::UploadConnect {
             username: message.username.clone(),
             ip: message.ip.clone(),
-            port: message.port,
+            port: message.port as u16,
         });
     }
 }
@@ -686,7 +686,7 @@ impl traits::core::Handle<PeerDistribConnect> for PeerNet {
         let _ = self.cmd_tx.send(PeerCommand::DistribConnect {
             username: message.username.clone(),
             ip: message.ip.clone(),
-            port: message.port,
+            port: message.port as u16,
         });
     }
 }

@@ -181,6 +181,13 @@ impl_bus_buffa!(
     bus::StartSearchResult => MessageId::StartSearchResult,
     bus::BrowseListing => MessageId::BrowseListing,
     bus::SearchResultReceived => MessageId::SearchResultReceived,
+    bus::PeerBrowseConnect => MessageId::PeerBrowseConnect,
+    bus::PeerPierce => MessageId::PeerPierce,
+    bus::PeerPierceFile => MessageId::PeerPierceFile,
+    bus::PeerPierceDistrib => MessageId::PeerPierceDistrib,
+    bus::PeerDownloadConnect => MessageId::PeerDownloadConnect,
+    bus::PeerUploadConnect => MessageId::PeerUploadConnect,
+    bus::PeerDistribConnect => MessageId::PeerDistribConnect,
 );
 
 #[cfg(test)]

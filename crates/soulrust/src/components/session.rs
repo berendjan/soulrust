@@ -231,8 +231,7 @@ impl traits::core::Handle<NetRx> for Session {
                             &PeerDistribConnect {
                                 username: parent.username,
                                 ip: parent.ip.to_string(),
-                                port: parent.port as u16,
-                            },
+                                port: u32::from(parent.port), ..Default::default() },
                             writer,
                         );
                     }
@@ -281,8 +280,7 @@ impl traits::core::Handle<NetRx> for Session {
                             &PeerBrowseConnect {
                                 username: response.username.clone(),
                                 ip: ip.clone(),
-                                port,
-                            },
+                                port: u32::from(port), ..Default::default() },
                             writer,
                         );
                     }
@@ -302,10 +300,9 @@ impl traits::core::Handle<NetRx> for Session {
                             &PeerDownloadConnect {
                                 username: response.username.clone(),
                                 ip: ip.clone(),
-                                port,
+                                port: u32::from(port),
                                 filename: download.filename,
-                                size: download.size,
-                            },
+                                size: download.size, ..Default::default() },
                             writer,
                         );
                     }
@@ -315,7 +312,7 @@ impl traits::core::Handle<NetRx> for Session {
                     // peer_net checks the offline sentinel (0.0.0.0:0) and fails
                     // the queued uploads itself (it holds their filenames).
                     Self::send(
-                        &PeerUploadConnect { username: response.username.clone(), ip: ip.clone(), port },
+                        &PeerUploadConnect { username: response.username.clone(), ip: ip.clone(), port: u32::from(port), ..Default::default() },
                         writer,
                     );
                 }
@@ -346,13 +343,13 @@ impl traits::core::Handle<NetRx> for Session {
                 );
                 match request.connection_type {
                     ConnectionType::Peer => {
-                        Self::send(&PeerPierce { username, ip, port, token }, writer)
+                        Self::send(&PeerPierce { username, ip, port: u32::from(port), token, ..Default::default() }, writer)
                     }
                     ConnectionType::File => {
-                        Self::send(&PeerPierceFile { username, ip, port, token }, writer)
+                        Self::send(&PeerPierceFile { username, ip, port: u32::from(port), token, ..Default::default() }, writer)
                     }
                     ConnectionType::Distributed => {
-                        Self::send(&PeerPierceDistrib { username, ip, port, token }, writer)
+                        Self::send(&PeerPierceDistrib { username, ip, port: u32::from(port), token, ..Default::default() }, writer)
                     }
                 }
             }

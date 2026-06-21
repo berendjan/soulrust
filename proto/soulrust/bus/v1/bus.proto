@@ -186,3 +186,53 @@ message SearchResultReceived {
   uint32 in_queue = 5;
   repeated SearchResultFile files = 6;
 }
+
+// --- Batch 2: peer address (location) messages. `port` is uint32 (proto has no
+// u16); call sites cast to/from u16 at the soulseek-proto boundary. ----------
+
+message PeerBrowseConnect {
+  string username = 1;
+  string ip = 2;
+  uint32 port = 3;
+}
+
+message PeerPierce {
+  string username = 1;
+  string ip = 2;
+  uint32 port = 3;
+  uint32 token = 4;
+}
+
+message PeerPierceFile {
+  string username = 1;
+  string ip = 2;
+  uint32 port = 3;
+  uint32 token = 4;
+}
+
+message PeerPierceDistrib {
+  string username = 1;
+  string ip = 2;
+  uint32 port = 3;
+  uint32 token = 4;
+}
+
+message PeerDownloadConnect {
+  string username = 1;
+  string ip = 2;
+  uint32 port = 3;
+  string filename = 4;
+  uint64 size = 5;
+}
+
+message PeerUploadConnect {
+  string username = 1;
+  string ip = 2;
+  uint32 port = 3;
+}
+
+message PeerDistribConnect {
+  string username = 1;
+  string ip = 2;
+  uint32 port = 3;
+}

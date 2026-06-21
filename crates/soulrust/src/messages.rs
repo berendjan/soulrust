@@ -176,14 +176,6 @@ pub enum NetConnEvent {
 pub struct NetConn {
     pub event: NetConnEvent,
 }
-/// session → peer edge: the resolved address to open a peer connection to.
-/// A location, not data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeerBrowseConnect {
-    pub username: String,
-    pub ip: String,
-    pub port: u16,
-}
 // ---------------------------------------------------------------------------
 // peer network edge → ui (serving activity, shown in the log)
 
@@ -193,75 +185,13 @@ pub use soulrust_proto::bus::{
     ApplyUpdateReq, BrowseAccepted, BrowseDir, BrowseFailed, BrowseFile, BrowseHtml, BrowseListing,
     BrowseRenderReq, BrowseUser, CancelDownload, DistribSpeedLimits, DownloadComplete,
     DownloadFailed, DownloadQueuePosition, ExtractRequest, GetConfigReq, HttpHtml, IncomingSearch,
-    PauseDownload, PeerActivity, RelayDistribSearch, ResolveUploadPeer, SearchResultFile,
-    SearchResultReceived, SetExcludedPhrases, StartDownload, StartSearchResult, StartedSearch,
-    TransferProgress, UploadComplete, UploadFailed, UploadStarted,
+    PauseDownload, PeerActivity, PeerBrowseConnect, PeerDistribConnect, PeerDownloadConnect,
+    PeerPierce, PeerPierceDistrib, PeerPierceFile, PeerUploadConnect, RelayDistribSearch,
+    ResolveUploadPeer, SearchResultFile, SearchResultReceived, SetExcludedPhrases, StartDownload,
+    StartSearchResult, StartedSearch, TransferProgress, UploadComplete, UploadFailed, UploadStarted,
 };
-/// session → peer_net: a server ConnectToPeer — a (likely firewalled) peer
-/// wants to reach us. We connect to `ip:port` and send PierceFirewall(token).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeerPierce {
-    pub username: String,
-    pub ip: String,
-    pub port: u16,
-    pub token: u32,
-}
-
-/// session → peer_net: a server ConnectToPeer for a **file** (`F`) connection —
-/// a (likely firewalled) peer can't open the transfer connection to us, so we
-/// dial `ip:port`, send PierceFirewall(token), and then run the transfer (a
-/// download we queued, or an upload we offered) over that connection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeerPierceFile {
-    pub username: String,
-    pub ip: String,
-    pub port: u16,
-    pub token: u32,
-}
-
-/// session → peer_net: a server ConnectToPeer for a **distributed** (`D`)
-/// connection — a (likely firewalled) peer wants to join the distributed search
-/// tree with us. We dial `ip:port`, send PierceFirewall(token), and then relay
-/// its distributed searches (same as an inbound `D` connection).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeerPierceDistrib {
-    pub username: String,
-    pub ip: String,
-    pub port: u16,
-    pub token: u32,
-}
-/// session → peer_net: the resolved address to open a peer connection to and
-/// queue a download. A location, not data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeerDownloadConnect {
-    pub username: String,
-    pub ip: String,
-    pub port: u16,
-    pub filename: String,
-    pub size: u64,
-}
-// ---------------------------------------------------------------------------
-// uploads (serve a file to a peer)
-/// session → peer_net: the resolved address to open an upload (`F`) connection
-/// to. A location, not data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeerUploadConnect {
-    pub username: String,
-    pub ip: String,
-    pub port: u16,
-}
 // ---------------------------------------------------------------------------
 // distributed search network
-
-/// session → peer_net: a candidate parent (from the server's PossibleParents) to
-/// open a distributed (`D`) connection to. A location, not data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeerDistribConnect {
-    pub username: String,
-    pub ip: String,
-    pub port: u16,
-}
-
 // ---------------------------------------------------------------------------
 // bus plumbing: Message + ExtendedMessage + deserialize_from for every type
 
@@ -312,13 +242,6 @@ impl_bus_message!(
     NetRx => MessageId::NetRx,
     NetTx => MessageId::NetTx,
     NetConn => MessageId::NetConn,
-    PeerBrowseConnect => MessageId::PeerBrowseConnect,
-    PeerPierce => MessageId::PeerPierce,
-    PeerDownloadConnect => MessageId::PeerDownloadConnect,
-    PeerUploadConnect => MessageId::PeerUploadConnect,
-    PeerDistribConnect => MessageId::PeerDistribConnect,
-    PeerPierceFile => MessageId::PeerPierceFile,
-    PeerPierceDistrib => MessageId::PeerPierceDistrib,
 );
 
 #[cfg(test)]
