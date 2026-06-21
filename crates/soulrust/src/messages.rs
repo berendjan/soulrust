@@ -34,6 +34,10 @@ pub enum Page {
     /// finished transfers.
     Downloads,
     DownloadsFragment,
+    /// The Uploads monitor page (full shell) and its live fragment listing
+    /// active + finished uploads served to peers.
+    Uploads,
+    UploadsFragment,
     /// Set the results-table sort column (toggles direction if already active),
     /// then render the searches fragment. `key` is a column id (user/folder/
     /// file/size/bitrate/length/slot/speed/queue).
@@ -477,6 +481,15 @@ pub struct PeerUploadConnect {
     pub port: u16,
 }
 
+/// peer_net → ui: an upload has started streaming to a peer (a slot opened and
+/// the file connection is being served), so the UI can show it as active.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadStarted {
+    pub username: String,
+    pub filename: String,
+    pub size: u64,
+}
+
 /// peer_net → ui: a file was fully uploaded to a peer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadComplete {
@@ -574,6 +587,7 @@ impl_bus_message!(
     DownloadFailed => MessageId::DownloadFailed,
     ResolveUploadPeer => MessageId::ResolveUploadPeer,
     PeerUploadConnect => MessageId::PeerUploadConnect,
+    UploadStarted => MessageId::UploadStarted,
     UploadComplete => MessageId::UploadComplete,
     UploadFailed => MessageId::UploadFailed,
     PeerDistribConnect => MessageId::PeerDistribConnect,

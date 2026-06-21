@@ -227,6 +227,7 @@ pub fn shell(title: &str, active: &str, user: &str, body: &str) -> String {
     {search}
     {bulk}
     {downloads}
+    {uploads}
     {spotify}
     {config}
   </nav>
@@ -248,6 +249,7 @@ pub fn shell(title: &str, active: &str, user: &str, body: &str) -> String {
         search = nav("search", "/", "Search", ICON_SEARCH),
         bulk = nav("bulk", "/bulk", "Bulk downloads", ICON_BULK),
         downloads = nav("downloads", "/downloads", "Downloads", ICON_DOWNLOAD),
+        uploads = nav("uploads", "/uploads", "Uploads", ICON_DOWNLOAD),
         spotify = nav("spotify", "/spotify", "Spotify", ICON_SPOTIFY),
         config = nav("config", "/config", "Settings", ICON_SETTINGS),
         user_icon = ICON_USER,

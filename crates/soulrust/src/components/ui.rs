@@ -14,7 +14,7 @@ use crate::messages::{
     CancelDownload, ConfigChanged, DownloadComplete, DownloadFailed, DownloadQueuePosition,
     HandlerId, HttpHtml, HttpRender, Page, PeerActivity, SearchResultReceived, SessionEvent,
     SessionEventKind, StartDownload, UpdaterStatus, UpdaterStatusChanged, UploadComplete,
-    UploadFailed,
+    UploadFailed, UploadStarted,
 };
 
 const MAX_LOG_LINES: usize = 100;
@@ -137,6 +137,32 @@ pub struct Ui {
     downloads: Vec<DownloadEntry>,
     /// JSON sidecar the downloads history is persisted to (next to the config).
     downloads_path: PathBuf,
+    /// Uploads served to peers, newest last, for the Uploads monitor. Transient
+    /// (not persisted) — they reflect this run's serving activity.
+    uploads: Vec<UploadEntry>,
+}
+
+/// One upload served to a peer and its latest state, for the Uploads monitor.
+struct UploadEntry {
+    username: String,
+    filename: String,
+    size: u64,
+    state: UploadState,
+}
+
+enum UploadState {
+    /// Streaming to the peer right now.
+    Active,
+    /// Fully sent.
+    Completed,
+    /// Gave up — holds the reason.
+    Failed(String),
+}
+
+impl UploadState {
+    fn is_active(&self) -> bool {
+        matches!(self, UploadState::Active)
+    }
 }
 
 impl Ui {
@@ -166,6 +192,7 @@ impl Ui {
             min_bitrate: 0,
             downloads,
             downloads_path,
+            uploads: Vec::new(),
         }
     }
 
@@ -205,6 +232,18 @@ impl Ui {
         }
     }
 
+    /// Update the latest state of an upload (keyed by user + virtual path); the
+    /// row was created on `UploadStarted`, so a missing match is ignored.
+    fn set_upload_state(&mut self, username: &str, filename: &str, state: UploadState) {
+        if let Some(u) = self
+            .uploads
+            .iter_mut()
+            .find(|u| u.username == username && u.filename == filename && u.state.is_active())
+        {
+            u.state = state;
+        }
+    }
+
     /// Click a column header: sort by it ascending, or flip direction if it is
     /// already the active column.
     fn toggle_sort(&mut self, key: SortKey) {
@@ -230,6 +269,8 @@ impl Ui {
             Page::AccountStatus => self.render_account_status(),
             Page::Downloads => self.render_downloads_page(),
             Page::DownloadsFragment => self.render_downloads(),
+            Page::Uploads => self.render_uploads_page(),
+            Page::UploadsFragment => self.render_uploads(),
             // The sort/filter mutation happens in the HttpRender handler (it has
             // &mut self); here we just render the updated table.
             Page::SortSearches { .. } | Page::FilterBitrate { .. } => self.render_searches(),
@@ -602,6 +643,62 @@ impl Ui {
         )
     }
 
+    /// The full Uploads monitor page: a shell around the live uploads fragment.
+    fn render_uploads_page(&self) -> String {
+        let body = r##"<h1>Uploads</h1>
+<p class="sub">Files other users are downloading from you. Active transfers are up top; finished and failed ones below.</p>
+<div id="uploads" class="results" hx-get="/fragments/uploads" hx-trigger="load, every 2s"></div>"##;
+        crate::components::ui_theme::shell("soulrust — uploads", "uploads", &self.username, body)
+    }
+
+    /// One uploads table: in-flight rows (`active` = true) or at-rest ones.
+    fn render_uploads_table(&self, active: bool) -> String {
+        let rows: String = self
+            .uploads
+            .iter()
+            .filter(|u| u.state.is_active() == active)
+            .rev()
+            .map(|u| {
+                let status = match &u.state {
+                    UploadState::Active => r#"<span class="pill ok">uploading…</span>"#.to_string(),
+                    UploadState::Completed => r#"<span class="pill ok">done</span>"#.to_string(),
+                    UploadState::Failed(reason) => format!(
+                        r#"<span class="pill warn">failed</span> <span class="muted">{}</span>"#,
+                        escape(reason)
+                    ),
+                };
+                format!(
+                    r##"<tr><td class="col-file" title="{path}">{file}</td><td class="col-user">{user}</td><td class="muted">{size}</td><td>{status}</td></tr>"##,
+                    path = escape(&u.filename),
+                    file = escape(basename(&u.filename)),
+                    user = escape(&u.username),
+                    size = u.size,
+                    status = status,
+                )
+            })
+            .collect();
+        if rows.is_empty() {
+            let what = if active { "nothing uploading right now" } else { "no finished uploads yet" };
+            return format!(r#"<p class="muted">{what}</p>"#);
+        }
+        format!(
+            r##"<div class="results-scroll"><table class="results-table"><thead><tr><th class="col-file">File</th><th class="col-user">User</th><th>Bytes</th><th>Status</th></tr></thead><tbody>{rows}</tbody></table></div>"##,
+        )
+    }
+
+    /// The live uploads fragment: an Active section then a Previous section.
+    fn render_uploads(&self) -> String {
+        let active = self.uploads.iter().filter(|u| u.state.is_active()).count();
+        let done = self.uploads.len() - active;
+        format!(
+            r##"<div class="card"><h3 style="margin-top:0">Active <span class="muted">— {active}</span></h3>{active_tbl}</div><div class="card"><h3 style="margin-top:0">Previous <span class="muted">— {done}</span></h3>{prev_tbl}</div>"##,
+            active = active,
+            done = done,
+            active_tbl = self.render_uploads_table(true),
+            prev_tbl = self.render_uploads_table(false),
+        )
+    }
+
     /// The config page itself is rendered by the web bridge (it owns the
     /// current Config via the bus round trip); the Ui only renders a pointer
     /// for the unexpected case it gets asked.
@@ -779,14 +876,34 @@ impl traits::core::Handle<DownloadQueuePosition> for Ui {
     }
 }
 
+impl traits::core::Handle<UploadStarted> for Ui {
+    fn handle<W: traits::core::Writer>(&mut self, message: &UploadStarted, _writer: &W) {
+        if self.uploads.len() >= MAX_DOWNLOADS {
+            self.uploads.remove(0);
+        }
+        self.uploads.push(UploadEntry {
+            username: message.username.clone(),
+            filename: message.filename.clone(),
+            size: message.size,
+            state: UploadState::Active,
+        });
+    }
+}
+
 impl traits::core::Handle<UploadComplete> for Ui {
     fn handle<W: traits::core::Writer>(&mut self, message: &UploadComplete, _writer: &W) {
+        self.set_upload_state(&message.username, &message.filename, UploadState::Completed);
         self.log(format!("uploaded {} to {}", message.filename, message.username));
     }
 }
 
 impl traits::core::Handle<UploadFailed> for Ui {
     fn handle<W: traits::core::Writer>(&mut self, message: &UploadFailed, _writer: &W) {
+        self.set_upload_state(
+            &message.username,
+            &message.filename,
+            UploadState::Failed(message.reason.clone()),
+        );
         self.log(format!("upload of {} to {} failed: {}", message.filename, message.username, message.reason));
     }
 }

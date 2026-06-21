@@ -217,6 +217,10 @@ impl<W: traits::core::Writer> SharedBridge<W> {
                 ("GET", "/fragments/downloads") => {
                     self.html_page(self.render(Page::DownloadsFragment))
                 }
+                ("GET", "/uploads") => self.html_page(self.render(Page::Uploads)),
+                ("GET", "/fragments/uploads") => {
+                    self.html_page(self.render(Page::UploadsFragment))
+                }
                 ("GET", "/bulk") => self.html_page(self.bulk_page()),
                 ("GET", "/spotify") => self.html_page(self.spotify_page(None)),
                 ("GET", "/config") => self.html_page(self.config_page()),

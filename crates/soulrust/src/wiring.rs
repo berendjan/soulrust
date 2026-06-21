@@ -30,7 +30,7 @@ use crate::messages::{
     SetConfigReq,
     SetConfigResult, SetExcludedPhrases, SessionEvent, StartDownload, StartSearch, StartSearchResult,
     UpdateDownloaded,
-    UpdaterStatusChanged, UploadComplete, UploadFailed,
+    UpdaterStatusChanged, UploadComplete, UploadFailed, UploadStarted,
 };
 
 rust_messenger::Messenger! {
@@ -98,6 +98,7 @@ rust_messenger::Messenger! {
             // then opens the file connection and streams.
             PeerNet, ResolveUploadPeer: [ session ],
             Session, PeerUploadConnect: [ peer_net ],
+            PeerNet, UploadStarted: [ ui ],
             PeerNet, UploadComplete: [ ui ],
             PeerNet, UploadFailed: [ ui ],
             // distributed search tree: session adopts a parent -> peer_net D conn

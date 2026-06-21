@@ -99,6 +99,7 @@ rust_messenger::messenger_id_enum!(
         PeerPierceDistrib = 44,
         RelayDistribSearch = 45,
         DistribSpeedLimits = 46,
+        UploadStarted = 47,
     }
 );
 

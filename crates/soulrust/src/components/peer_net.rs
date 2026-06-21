@@ -47,6 +47,7 @@ use crate::messages::{
     DistribSpeedLimits, PeerDistribConnect, PeerDownloadConnect, PeerPierce, PeerPierceDistrib,
     PeerPierceFile, PeerUploadConnect, RelayDistribSearch, ResolveUploadPeer,
     SearchResultFile, SearchResultReceived, SetExcludedPhrases, UploadComplete, UploadFailed,
+    UploadStarted,
 };
 use crate::search_response::{self, SearchFilter};
 use crate::shares::ShareIndex;
@@ -1207,6 +1208,15 @@ async fn download_init_task<W: traits::core::Writer>(
 /// unlimited. Called when new uploads are queued and whenever one finishes.
 fn pump_uploads<W: traits::core::Writer>(ctx: &Arc<ConnCtx>, writer: &W) {
     while let Some(job) = ctx.uploads_gate.try_claim() {
+        // Surface the upload to the UI's monitor as it starts streaming.
+        PeerNet::send(
+            &UploadStarted {
+                username: job.peer.clone(),
+                filename: job.filename.clone(),
+                size: job.size,
+            },
+            writer,
+        );
         tokio::spawn(upload_task(
             job.ip,
             job.port,
