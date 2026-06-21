@@ -750,7 +750,7 @@ impl traits::core::Handle<HttpRender> for Ui {
             _ => {}
         }
         let html = self.render(&message.page);
-        Self::send(&HttpHtml { corr: message.corr, html }, writer);
+        Self::send(&HttpHtml { corr: message.corr, html, ..Default::default() }, writer);
     }
 }
 
@@ -1340,8 +1340,8 @@ mod tests {
                 vbr: false,
                 sample_rate: None,
                 bit_depth: None,
-            }],
-        };
+                ..Default::default()
+            }], ..Default::default() };
         traits::core::Handle::<SearchResultReceived>::handle(&mut ui, &result, &NullWriter);
         let html = ui.render(&Page::SearchesFragment);
         assert!(html.contains("bob"), "peer username rendered");
@@ -1378,8 +1378,8 @@ mod tests {
                 vbr: false,
                 sample_rate: None,
                 bit_depth: None,
-            }],
-        };
+                ..Default::default()
+            }], ..Default::default() };
         traits::core::Handle::<SearchResultReceived>::handle(&mut ui, &stray, &NullWriter);
         assert!(!ui.render(&Page::SearchesFragment).contains("eve"), "unknown-token result dropped");
     }
@@ -1415,8 +1415,8 @@ mod tests {
                 vbr: false,
                 sample_rate: None,
                 bit_depth: None,
-            }],
-        };
+                ..Default::default()
+            }], ..Default::default() };
         traits::core::Handle::<SearchResultReceived>::handle(ui, &msg, &W);
     }
 
@@ -1442,7 +1442,7 @@ mod tests {
         // Clicking Get → StartDownload → an active "queued" entry.
         traits::core::Handle::<StartDownload>::handle(
             &mut ui,
-            &StartDownload { username: "bob".into(), filename: "M\\song.mp3".into(), size: 9 },
+            &StartDownload { username: "bob".into(), filename: "M\\song.mp3".into(), size: 9, ..Default::default() },
             &W,
         );
         let html = ui.render(&Page::DownloadsFragment);
@@ -1452,7 +1452,7 @@ mod tests {
         // Queue position update keeps it active.
         traits::core::Handle::<DownloadQueuePosition>::handle(
             &mut ui,
-            &DownloadQueuePosition { username: "bob".into(), filename: "M\\song.mp3".into(), place: 3 },
+            &DownloadQueuePosition { username: "bob".into(), filename: "M\\song.mp3".into(), place: 3, ..Default::default() },
             &W,
         );
         assert!(ui.render(&Page::DownloadsFragment).contains("queue #3"));
@@ -1463,8 +1463,7 @@ mod tests {
             &DownloadComplete {
                 username: "bob".into(),
                 filename: "M\\song.mp3".into(),
-                path: "/dl/song.mp3".into(),
-            },
+                path: "/dl/song.mp3".into(), ..Default::default() },
             &W,
         );
         let html = ui.render(&Page::DownloadsFragment);
@@ -1492,7 +1491,7 @@ mod tests {
         let mut ui = test_ui();
         traits::core::Handle::<StartDownload>::handle(
             &mut ui,
-            &StartDownload { username: "bob".into(), filename: "a.mp3".into(), size: 1 },
+            &StartDownload { username: "bob".into(), filename: "a.mp3".into(), size: 1, ..Default::default() },
             &W,
         );
         assert!(ui.render(&Page::DownloadsFragment).contains("Active <span class=\"muted\">— 1"));
@@ -1501,7 +1500,7 @@ mod tests {
 
         traits::core::Handle::<CancelDownload>::handle(
             &mut ui,
-            &CancelDownload { username: "bob".into(), filename: "a.mp3".into() },
+            &CancelDownload { username: "bob".into(), filename: "a.mp3".into(), ..Default::default() },
             &W,
         );
         let html = ui.render(&Page::DownloadsFragment);
@@ -1536,7 +1535,7 @@ mod tests {
         // rather than reverting to a Get button.
         traits::core::Handle::<StartDownload>::handle(
             &mut ui,
-            &StartDownload { username: "carol".into(), filename: "Album\\tune.mp3".into(), size: 1 },
+            &StartDownload { username: "carol".into(), filename: "Album\\tune.mp3".into(), size: 1, ..Default::default() },
             &W,
         );
         let html = ui.render(&Page::SearchesFragment);

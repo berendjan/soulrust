@@ -154,6 +154,33 @@ macro_rules! impl_bus_buffa {
 
 impl_bus_buffa!(
     bus::PeerActivity => MessageId::PeerActivity,
+    bus::HttpHtml => MessageId::HttpHtml,
+    bus::ExtractRequest => MessageId::ExtractRequest,
+    bus::GetConfigReq => MessageId::GetConfigReq,
+    bus::ApplyUpdateReq => MessageId::ApplyUpdateReq,
+    bus::BrowseUser => MessageId::BrowseUser,
+    bus::BrowseAccepted => MessageId::BrowseAccepted,
+    bus::BrowseFailed => MessageId::BrowseFailed,
+    bus::BrowseRenderReq => MessageId::BrowseRenderReq,
+    bus::BrowseHtml => MessageId::BrowseHtml,
+    bus::IncomingSearch => MessageId::IncomingSearch,
+    bus::SetExcludedPhrases => MessageId::SetExcludedPhrases,
+    bus::RelayDistribSearch => MessageId::RelayDistribSearch,
+    bus::DistribSpeedLimits => MessageId::DistribSpeedLimits,
+    bus::StartDownload => MessageId::StartDownload,
+    bus::CancelDownload => MessageId::CancelDownload,
+    bus::PauseDownload => MessageId::PauseDownload,
+    bus::DownloadComplete => MessageId::DownloadComplete,
+    bus::DownloadFailed => MessageId::DownloadFailed,
+    bus::DownloadQueuePosition => MessageId::DownloadQueuePosition,
+    bus::ResolveUploadPeer => MessageId::ResolveUploadPeer,
+    bus::UploadStarted => MessageId::UploadStarted,
+    bus::TransferProgress => MessageId::TransferProgress,
+    bus::UploadComplete => MessageId::UploadComplete,
+    bus::UploadFailed => MessageId::UploadFailed,
+    bus::StartSearchResult => MessageId::StartSearchResult,
+    bus::BrowseListing => MessageId::BrowseListing,
+    bus::SearchResultReceived => MessageId::SearchResultReceived,
 );
 
 #[cfg(test)]

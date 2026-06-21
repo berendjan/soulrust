@@ -191,8 +191,7 @@ impl traits::core::Handle<NetRx> for Session {
                     &IncomingSearch {
                         username: broadcast.username.clone(),
                         token: broadcast.token,
-                        query: broadcast.query.clone(),
-                    },
+                        query: broadcast.query.clone(), ..Default::default() },
                     writer,
                 );
                 Self::emit(
@@ -215,8 +214,7 @@ impl traits::core::Handle<NetRx> for Session {
                             &RelayDistribSearch {
                                 username: search.username,
                                 token: search.token,
-                                query: search.query,
-                            },
+                                query: search.query, ..Default::default() },
                             writer,
                         );
                     }
@@ -245,8 +243,7 @@ impl traits::core::Handle<NetRx> for Session {
                 Self::send(
                     &DistribSpeedLimits {
                         min_speed: self.parent_min_speed,
-                        ratio: self.parent_speed_ratio,
-                    },
+                        ratio: self.parent_speed_ratio, ..Default::default() },
                     writer,
                 );
             }
@@ -255,8 +252,7 @@ impl traits::core::Handle<NetRx> for Session {
                 Self::send(
                     &DistribSpeedLimits {
                         min_speed: self.parent_min_speed,
-                        ratio: self.parent_speed_ratio,
-                    },
+                        ratio: self.parent_speed_ratio, ..Default::default() },
                     writer,
                 );
             }
@@ -277,8 +273,7 @@ impl traits::core::Handle<NetRx> for Session {
                         Self::send(
                             &BrowseFailed {
                                 username: response.username.clone(),
-                                reason: "user is offline or not reachable".into(),
-                            },
+                                reason: "user is offline or not reachable".into(), ..Default::default() },
                             writer,
                         );
                     } else {
@@ -299,8 +294,7 @@ impl traits::core::Handle<NetRx> for Session {
                             &DownloadFailed {
                                 username: response.username.clone(),
                                 filename: download.filename,
-                                reason: "user is offline or not reachable".into(),
-                            },
+                                reason: "user is offline or not reachable".into(), ..Default::default() },
                             writer,
                         );
                     } else {
@@ -375,7 +369,7 @@ impl traits::core::Handle<NetRx> for Session {
                 // Hand the phrases to peer_net so it suppresses matching files in
                 // the responses it serves (the matcher is already there; without
                 // this it ran against an empty list and never filtered).
-                Self::send(&SetExcludedPhrases { phrases: excluded.phrases }, writer);
+                Self::send(&SetExcludedPhrases { phrases: excluded.phrases, ..Default::default() }, writer);
             }
             ServerMessage::Unknown { code, body } => {
                 Self::emit(
@@ -396,8 +390,7 @@ impl traits::core::Handle<StartSearch> for Session {
                 &StartSearchResult {
                     corr: message.corr,
                     started: Vec::new(),
-                    error: Some("not logged in to the soulseek server".into()),
-                },
+                    error: Some("not logged in to the soulseek server".into()), ..Default::default() },
                 writer,
             );
             return;
@@ -417,11 +410,11 @@ impl traits::core::Handle<StartSearch> for Session {
                 SessionEventKind::SearchStarted { token, query: query.clone() },
                 writer,
             );
-            started.push(StartedSearch { token, query });
+            started.push(StartedSearch { token, query, ..Default::default() });
         }
 
         Self::send(
-            &StartSearchResult { corr: message.corr, started, error: None },
+            &StartSearchResult { corr: message.corr, started, error: None, ..Default::default() },
             writer,
         );
     }
@@ -434,8 +427,7 @@ impl traits::core::Handle<BrowseUser> for Session {
             Self::send(
                 &BrowseAccepted {
                     corr: message.corr,
-                    error: Some("not logged in to the soulseek server".into()),
-                },
+                    error: Some("not logged in to the soulseek server".into()), ..Default::default() },
                 writer,
             );
             return;
@@ -444,8 +436,7 @@ impl traits::core::Handle<BrowseUser> for Session {
             Self::send(
                 &BrowseAccepted {
                     corr: message.corr,
-                    error: Some("enter a username to browse".into()),
-                },
+                    error: Some("enter a username to browse".into()), ..Default::default() },
                 writer,
             );
             return;
@@ -456,7 +447,7 @@ impl traits::core::Handle<BrowseUser> for Session {
         let request = GetPeerAddressRequest { username: username.to_owned() };
         Self::send(&NetTx { frame: request.to_frame() }, writer);
         self.pending_browses.insert(username.to_owned());
-        Self::send(&BrowseAccepted { corr: message.corr, error: None }, writer);
+        Self::send(&BrowseAccepted { corr: message.corr, error: None, ..Default::default() }, writer);
     }
 }
 
@@ -468,8 +459,7 @@ impl traits::core::Handle<StartDownload> for Session {
                 &DownloadFailed {
                     username: message.username.clone(),
                     filename: message.filename.clone(),
-                    reason: "not logged in to the soulseek server".into(),
-                },
+                    reason: "not logged in to the soulseek server".into(), ..Default::default() },
                 writer,
             );
             return;
@@ -479,8 +469,7 @@ impl traits::core::Handle<StartDownload> for Session {
                 &DownloadFailed {
                     username: message.username.clone(),
                     filename: message.filename.clone(),
-                    reason: "a username and filename are required".into(),
-                },
+                    reason: "a username and filename are required".into(), ..Default::default() },
                 writer,
             );
             return;
@@ -847,7 +836,7 @@ mod tests {
     fn browse_before_login_is_rejected_without_network_traffic() {
         let writer = CapturingWriter::default();
         let mut session = test_session();
-        session.handle(&BrowseUser { corr: 7, username: "alice".into() }, &writer);
+        session.handle(&BrowseUser { corr: 7, username: "alice".into(), ..Default::default() }, &writer);
 
         assert!(writer.frames().is_empty());
         let accepts = writer.browse_accepts();
@@ -860,7 +849,7 @@ mod tests {
     fn browse_when_logged_in_requests_peer_address_and_accepts() {
         let writer = CapturingWriter::default();
         let mut session = logged_in_session(&writer);
-        session.handle(&BrowseUser { corr: 3, username: "  alice  ".into() }, &writer);
+        session.handle(&BrowseUser { corr: 3, username: "  alice  ".into(), ..Default::default() }, &writer);
 
         // login + wait port + GetPeerAddress request.
         let frames = writer.frames();
@@ -877,7 +866,7 @@ mod tests {
     fn peer_address_for_a_pending_browse_triggers_a_peer_connection() {
         let writer = CapturingWriter::default();
         let mut session = logged_in_session(&writer);
-        session.handle(&BrowseUser { corr: 1, username: "alice".into() }, &writer);
+        session.handle(&BrowseUser { corr: 1, username: "alice".into(), ..Default::default() }, &writer);
         session.handle(
             &NetRx { payload: get_peer_address_payload("alice", Ipv4Addr::new(198, 51, 100, 7), 2234) },
             &writer,
@@ -895,7 +884,7 @@ mod tests {
     fn offline_peer_address_fails_the_browse() {
         let writer = CapturingWriter::default();
         let mut session = logged_in_session(&writer);
-        session.handle(&BrowseUser { corr: 1, username: "ghost".into() }, &writer);
+        session.handle(&BrowseUser { corr: 1, username: "ghost".into(), ..Default::default() }, &writer);
         session.handle(
             &NetRx { payload: get_peer_address_payload("ghost", Ipv4Addr::UNSPECIFIED, 0) },
             &writer,
@@ -1076,8 +1065,7 @@ mod tests {
             &StartDownload {
                 username: "alice".into(),
                 filename: "Music\\song.mp3".into(),
-                size: 4096,
-            },
+                size: 4096, ..Default::default() },
             &writer,
         );
         // Looks the peer up.
@@ -1105,7 +1093,7 @@ mod tests {
         let writer = CapturingWriter::default();
         let mut session = logged_in_session(&writer);
         session.handle(
-            &StartDownload { username: "ghost".into(), filename: "a.mp3".into(), size: 1 },
+            &StartDownload { username: "ghost".into(), filename: "a.mp3".into(), size: 1, ..Default::default() },
             &writer,
         );
         session.handle(
@@ -1123,7 +1111,7 @@ mod tests {
         let writer = CapturingWriter::default();
         let mut session = test_session(); // not logged in
         session.handle(
-            &StartDownload { username: "alice".into(), filename: "a.mp3".into(), size: 1 },
+            &StartDownload { username: "alice".into(), filename: "a.mp3".into(), size: 1, ..Default::default() },
             &writer,
         );
         let failures = writer.download_failures();

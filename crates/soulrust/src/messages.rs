@@ -52,22 +52,8 @@ pub struct HttpRender {
     pub corr: u64,
     pub page: Page,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HttpHtml {
-    pub corr: u64,
-    pub html: String,
-}
-
 // ---------------------------------------------------------------------------
 // web bridge <-> extractor
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExtractRequest {
-    pub corr: u64,
-    pub input: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractResult {
     pub corr: u64,
@@ -83,28 +69,8 @@ pub struct StartSearch {
     pub source_label: String,
     pub jobs: Vec<SearchJob>,
 }
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct StartedSearch {
-    pub token: u32,
-    pub query: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StartSearchResult {
-    pub corr: u64,
-    pub started: Vec<StartedSearch>,
-    pub error: Option<String>,
-}
-
 // ---------------------------------------------------------------------------
 // web bridge <-> config store
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetConfigReq {
-    pub corr: u64,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigSnapshot {
     pub corr: u64,
@@ -157,12 +123,6 @@ pub struct UpdateDownloaded {
     pub latest: String,
     pub artifact: PathBuf,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApplyUpdateReq {
-    pub corr: u64,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplyUpdateResult {
     pub corr: u64,
@@ -216,31 +176,6 @@ pub enum NetConnEvent {
 pub struct NetConn {
     pub event: NetConnEvent,
 }
-
-// ---------------------------------------------------------------------------
-// peer browse (look at another user's shared files)
-//
-// Per the bus discipline, these carry *locations* (the peer's ip/port, the
-// virtual paths of shared files) and lightweight metadata (sizes) — never file
-// contents. A downloader, when added, will write bytes to disk and put only the
-// resulting path on the bus, exactly as the updater does with `artifact`.
-
-/// web bridge → session: begin browsing `username`'s shares.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BrowseUser {
-    pub corr: u64,
-    pub username: String,
-}
-
-/// session → web bridge: whether the browse request was accepted (it can be
-/// rejected immediately, e.g. when not logged in). Success here only means the
-/// lookup started; the listing arrives later for the UI to poll.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BrowseAccepted {
-    pub corr: u64,
-    pub error: Option<String>,
-}
-
 /// session → peer edge: the resolved address to open a peer connection to.
 /// A location, not data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,107 +184,19 @@ pub struct PeerBrowseConnect {
     pub ip: String,
     pub port: u16,
 }
-
-/// One shared file as shown in the browse view: its name and size only.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BrowseFile {
-    pub name: String,
-    pub size: u64,
-}
-
-/// One shared directory: its virtual path and the files within it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BrowseDir {
-    pub path: String,
-    pub files: Vec<BrowseFile>,
-}
-
-/// peer edge → browse: the fetched share tree (paths + sizes). `truncated` is
-/// set when the peer's list was larger than the cap the edge forwards, so the
-/// UI can say so rather than silently implying completeness.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BrowseListing {
-    pub username: String,
-    pub directories: Vec<BrowseDir>,
-    pub total_files: u64,
-    pub truncated: bool,
-}
-
-/// peer edge / session → browse: the browse could not be completed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BrowseFailed {
-    pub username: String,
-    pub reason: String,
-}
-
-/// web bridge → browse: render the browse fragment for the current state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BrowseRenderReq {
-    pub corr: u64,
-}
-
-/// browse → web bridge: the rendered browse fragment.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BrowseHtml {
-    pub corr: u64,
-    pub html: String,
-}
-
 // ---------------------------------------------------------------------------
 // peer network edge → ui (serving activity, shown in the log)
 
-/// peer_net → ui: a notable serving event (a peer connected, we served a
-/// browse, the listener bound, …). Just a log line — no bulk data. Migrated to a
-/// buffa bus message; the wire type + bus-trait bridge live in soulrust-proto.
-pub use soulrust_proto::bus::PeerActivity;
-
-/// session → peer_net: a search relayed by the server. peer_net matches it
-/// against our shares and, on a hit, delivers a FileSearchResponse to the
-/// searcher (queue + ConnectToPeer relay).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IncomingSearch {
-    pub username: String,
-    pub token: u32,
-    pub query: String,
-}
-
-/// session → peer_net: the server's list of phrases that must not appear in any
-/// file we return for a search (ExcludedSearchPhrasesNotification, code 160).
-/// peer_net stores the latest list and drops matching files from every
-/// FileSearchResponse it builds.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SetExcludedPhrases {
-    pub phrases: Vec<String>,
-}
-
-/// One file in an inbound search result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchResultFile {
-    pub name: String,
-    pub size: u64,
-    /// Advertised audio attributes (Nicotine+ `FileAttribute` codes), kept so
-    /// the UI can show Quality/Length columns and filter on bitrate. `None`
-    /// where the peer didn't advertise them (non-audio or sparse responses).
-    pub bitrate: Option<u32>,
-    pub length: Option<u32>,
-    pub vbr: bool,
-    pub sample_rate: Option<u32>,
-    pub bit_depth: Option<u32>,
-}
-
-/// peer_net → ui: a peer's response to one of our searches that cleared the
-/// requester-side filter (min files / min speed / max queue). Correlated to the
-/// originating search by `token`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchResultReceived {
-    pub token: u32,
-    pub username: String,
-    pub free_slots: bool,
-    pub upload_speed: u32,
-    pub in_queue: u32,
-    pub files: Vec<SearchResultFile>,
-}
-
+// Buffa bus messages (wire types + bus-trait bridge live in soulrust-proto).
+// Re-exported here so components keep importing them from `crate::messages`.
+pub use soulrust_proto::bus::{
+    ApplyUpdateReq, BrowseAccepted, BrowseDir, BrowseFailed, BrowseFile, BrowseHtml, BrowseListing,
+    BrowseRenderReq, BrowseUser, CancelDownload, DistribSpeedLimits, DownloadComplete,
+    DownloadFailed, DownloadQueuePosition, ExtractRequest, GetConfigReq, HttpHtml, IncomingSearch,
+    PauseDownload, PeerActivity, RelayDistribSearch, ResolveUploadPeer, SearchResultFile,
+    SearchResultReceived, SetExcludedPhrases, StartDownload, StartSearchResult, StartedSearch,
+    TransferProgress, UploadComplete, UploadFailed, UploadStarted,
+};
 /// session → peer_net: a server ConnectToPeer — a (likely firewalled) peer
 /// wants to reach us. We connect to `ip:port` and send PierceFirewall(token).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -383,58 +230,6 @@ pub struct PeerPierceDistrib {
     pub port: u16,
     pub token: u32,
 }
-
-/// session → peer_net: a distributed search the server injected via an
-/// EmbeddedMessage (we're a branch root). peer_net responds to it from our
-/// shares *and* forwards it down to our children.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RelayDistribSearch {
-    pub username: String,
-    pub token: u32,
-    pub query: String,
-}
-
-/// session → peer_net: the server's distributed eligibility limits
-/// (`ParentMinSpeed` / `ParentSpeedRatio`), used to size how many children we
-/// accept based on our measured upload speed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DistribSpeedLimits {
-    pub min_speed: u32,
-    pub ratio: u32,
-}
-
-// ---------------------------------------------------------------------------
-// downloads (request a file from a peer)
-
-/// ui / web bridge → session: start downloading `filename` (a peer's virtual
-/// path) from `username`. `size` comes from the search/browse result the user
-/// picked, so we know how many bytes to expect.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StartDownload {
-    pub username: String,
-    pub filename: String,
-    pub size: u64,
-}
-
-/// ui / web bridge → ui + peer_net: drop a queued/active download. The UI
-/// forgets it; peer_net removes the pending request and token so it won't be
-/// accepted or continued.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CancelDownload {
-    pub username: String,
-    pub filename: String,
-}
-
-/// ui / web bridge → ui + peer_net: pause an active download. Like
-/// [`CancelDownload`] it aborts the transfer in peer_net, but the UI keeps the
-/// row in a `Paused` state (the partial on disk stays), so resuming re-requests
-/// and picks up where it left off.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PauseDownload {
-    pub username: String,
-    pub filename: String,
-}
-
 /// session → peer_net: the resolved address to open a peer connection to and
 /// queue a download. A location, not data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,43 +240,8 @@ pub struct PeerDownloadConnect {
     pub filename: String,
     pub size: u64,
 }
-
-/// peer_net → ui: a download finished and was moved to its final path.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DownloadComplete {
-    pub username: String,
-    pub filename: String,
-    pub path: String,
-}
-
-/// peer_net → ui: a download could not be completed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DownloadFailed {
-    pub username: String,
-    pub filename: String,
-    pub reason: String,
-}
-
-/// peer_net → ui: the uploader's reported position of our queued download
-/// (answer to a PlaceInQueueRequest). `place` is 1-based; 0 means the uploader
-/// no longer has it queued (about to send it, or it was dropped).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DownloadQueuePosition {
-    pub username: String,
-    pub filename: String,
-    pub place: u32,
-}
-
 // ---------------------------------------------------------------------------
 // uploads (serve a file to a peer)
-
-/// peer_net → session: a downloader approved a transfer; resolve their address
-/// so we can open the file connection to send the bytes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResolveUploadPeer {
-    pub username: String,
-}
-
 /// session → peer_net: the resolved address to open an upload (`F`) connection
 /// to. A location, not data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -490,43 +250,6 @@ pub struct PeerUploadConnect {
     pub ip: String,
     pub port: u16,
 }
-
-/// peer_net → ui: an upload has started streaming to a peer (a slot opened and
-/// the file connection is being served), so the UI can show it as active.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UploadStarted {
-    pub username: String,
-    pub filename: String,
-    pub size: u64,
-}
-
-/// peer_net → ui: throttled byte-progress for an in-flight transfer (≈2/sec, so
-/// it stays a trickle on the bus — never per byte). `upload` selects the upload
-/// vs download monitor; correlated to a row by (username, filename).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TransferProgress {
-    pub username: String,
-    pub filename: String,
-    pub bytes: u64,
-    pub size: u64,
-    pub upload: bool,
-}
-
-/// peer_net → ui: a file was fully uploaded to a peer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UploadComplete {
-    pub username: String,
-    pub filename: String,
-}
-
-/// peer_net / session → ui: an upload could not be completed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UploadFailed {
-    pub username: String,
-    pub filename: String,
-    pub reason: String,
-}
-
 // ---------------------------------------------------------------------------
 // distributed search network
 
@@ -576,53 +299,26 @@ macro_rules! impl_bus_message {
 
 impl_bus_message!(
     HttpRender => MessageId::HttpRender,
-    HttpHtml => MessageId::HttpHtml,
-    ExtractRequest => MessageId::ExtractRequest,
     ExtractResult => MessageId::ExtractResult,
     StartSearch => MessageId::StartSearch,
-    StartSearchResult => MessageId::StartSearchResult,
-    GetConfigReq => MessageId::GetConfigReq,
     ConfigSnapshot => MessageId::ConfigSnapshot,
     SetConfigReq => MessageId::SetConfigReq,
     SetConfigResult => MessageId::SetConfigResult,
     ConfigChanged => MessageId::ConfigChanged,
     UpdaterStatusChanged => MessageId::UpdaterStatusChanged,
     UpdateDownloaded => MessageId::UpdateDownloaded,
-    ApplyUpdateReq => MessageId::ApplyUpdateReq,
     ApplyUpdateResult => MessageId::ApplyUpdateResult,
     SessionEvent => MessageId::SessionEvent,
     NetRx => MessageId::NetRx,
     NetTx => MessageId::NetTx,
     NetConn => MessageId::NetConn,
-    BrowseUser => MessageId::BrowseUser,
-    BrowseAccepted => MessageId::BrowseAccepted,
     PeerBrowseConnect => MessageId::PeerBrowseConnect,
-    BrowseListing => MessageId::BrowseListing,
-    BrowseFailed => MessageId::BrowseFailed,
-    BrowseRenderReq => MessageId::BrowseRenderReq,
-    BrowseHtml => MessageId::BrowseHtml,
-    IncomingSearch => MessageId::IncomingSearch,
     PeerPierce => MessageId::PeerPierce,
-    StartDownload => MessageId::StartDownload,
     PeerDownloadConnect => MessageId::PeerDownloadConnect,
-    DownloadComplete => MessageId::DownloadComplete,
-    DownloadFailed => MessageId::DownloadFailed,
-    ResolveUploadPeer => MessageId::ResolveUploadPeer,
     PeerUploadConnect => MessageId::PeerUploadConnect,
-    UploadStarted => MessageId::UploadStarted,
-    TransferProgress => MessageId::TransferProgress,
-    UploadComplete => MessageId::UploadComplete,
-    UploadFailed => MessageId::UploadFailed,
     PeerDistribConnect => MessageId::PeerDistribConnect,
-    SetExcludedPhrases => MessageId::SetExcludedPhrases,
-    DownloadQueuePosition => MessageId::DownloadQueuePosition,
-    SearchResultReceived => MessageId::SearchResultReceived,
-    CancelDownload => MessageId::CancelDownload,
-    PauseDownload => MessageId::PauseDownload,
     PeerPierceFile => MessageId::PeerPierceFile,
     PeerPierceDistrib => MessageId::PeerPierceDistrib,
-    RelayDistribSearch => MessageId::RelayDistribSearch,
-    DistribSpeedLimits => MessageId::DistribSpeedLimits,
 );
 
 #[cfg(test)]

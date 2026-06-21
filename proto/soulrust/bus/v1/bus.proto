@@ -11,3 +11,178 @@ package soulrust.bus.v1;
 message PeerActivity {
   string note = 1;
 }
+
+// --- Batch 1: flat request/response + event messages -----------------------
+
+message HttpHtml {
+  uint64 corr = 1;
+  string html = 2;
+}
+
+message ExtractRequest {
+  uint64 corr = 1;
+  string input = 2;
+}
+
+message GetConfigReq {
+  uint64 corr = 1;
+}
+
+message ApplyUpdateReq {
+  uint64 corr = 1;
+}
+
+message BrowseUser {
+  uint64 corr = 1;
+  string username = 2;
+}
+
+message BrowseAccepted {
+  uint64 corr = 1;
+  optional string error = 2;
+}
+
+message BrowseFailed {
+  string username = 1;
+  string reason = 2;
+}
+
+message BrowseRenderReq {
+  uint64 corr = 1;
+}
+
+message BrowseHtml {
+  uint64 corr = 1;
+  string html = 2;
+}
+
+message IncomingSearch {
+  string username = 1;
+  uint32 token = 2;
+  string query = 3;
+}
+
+message SetExcludedPhrases {
+  repeated string phrases = 1;
+}
+
+message RelayDistribSearch {
+  string username = 1;
+  uint32 token = 2;
+  string query = 3;
+}
+
+message DistribSpeedLimits {
+  uint32 min_speed = 1;
+  uint32 ratio = 2;
+}
+
+message StartDownload {
+  string username = 1;
+  string filename = 2;
+  uint64 size = 3;
+}
+
+message CancelDownload {
+  string username = 1;
+  string filename = 2;
+}
+
+message PauseDownload {
+  string username = 1;
+  string filename = 2;
+}
+
+message DownloadComplete {
+  string username = 1;
+  string filename = 2;
+  string path = 3;
+}
+
+message DownloadFailed {
+  string username = 1;
+  string filename = 2;
+  string reason = 3;
+}
+
+message DownloadQueuePosition {
+  string username = 1;
+  string filename = 2;
+  uint32 place = 3;
+}
+
+message ResolveUploadPeer {
+  string username = 1;
+}
+
+message UploadStarted {
+  string username = 1;
+  string filename = 2;
+  uint64 size = 3;
+}
+
+message TransferProgress {
+  string username = 1;
+  string filename = 2;
+  uint64 bytes = 3;
+  uint64 size = 4;
+  bool upload = 5;
+}
+
+message UploadComplete {
+  string username = 1;
+  string filename = 2;
+}
+
+message UploadFailed {
+  string username = 1;
+  string filename = 2;
+  string reason = 3;
+}
+
+message StartedSearch {
+  uint32 token = 1;
+  string query = 2;
+}
+
+message StartSearchResult {
+  uint64 corr = 1;
+  repeated StartedSearch started = 2;
+  optional string error = 3;
+}
+
+message BrowseFile {
+  string name = 1;
+  uint64 size = 2;
+}
+
+message BrowseDir {
+  string path = 1;
+  repeated BrowseFile files = 2;
+}
+
+message BrowseListing {
+  string username = 1;
+  repeated BrowseDir directories = 2;
+  uint64 total_files = 3;
+  bool truncated = 4;
+}
+
+message SearchResultFile {
+  string name = 1;
+  uint64 size = 2;
+  optional uint32 bitrate = 3;
+  optional uint32 length = 4;
+  bool vbr = 5;
+  optional uint32 sample_rate = 6;
+  optional uint32 bit_depth = 7;
+}
+
+message SearchResultReceived {
+  uint32 token = 1;
+  string username = 2;
+  bool free_slots = 3;
+  uint32 upload_speed = 4;
+  uint32 in_queue = 5;
+  repeated SearchResultFile files = 6;
+}

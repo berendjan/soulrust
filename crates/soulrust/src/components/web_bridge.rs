@@ -276,7 +276,7 @@ impl<W: traits::core::Writer> SharedBridge<W> {
         let input = form.get("input").cloned().unwrap_or_default();
 
         let extract = match self.round_trip(|corr| {
-            WebBridge::send(&ExtractRequest { corr, input: input.clone() }, &self.writer);
+            WebBridge::send(&ExtractRequest { corr, input: input.clone(), ..Default::default() }, &self.writer);
         })? {
             BridgeReply::Extract(result) => result,
             _ => return Err("unexpected reply type".into()),
@@ -343,7 +343,7 @@ impl<W: traits::core::Writer> SharedBridge<W> {
         if username.is_empty() || filename.is_empty() {
             return Ok(r#"<span class="pill warn">bad request</span>"#.into());
         }
-        WebBridge::send(&StartDownload { username, filename, size }, &self.writer);
+        WebBridge::send(&StartDownload { username, filename, size, ..Default::default() }, &self.writer);
         // Matches how the polled row renders a queued download, so it doesn't
         // visibly change when the next 2s refresh lands.
         Ok(r#"<span class="pill">queued</span>"#.into())
@@ -359,7 +359,7 @@ impl<W: traits::core::Writer> SharedBridge<W> {
         let filename = form.get("filename").cloned().unwrap_or_default();
         let size = form.get("size").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
         WebBridge::send(
-            &CancelDownload { username: username.clone(), filename: filename.clone() },
+            &CancelDownload { username: username.clone(), filename: filename.clone(), ..Default::default() },
             &self.writer,
         );
         Ok(format!(
@@ -378,7 +378,7 @@ impl<W: traits::core::Writer> SharedBridge<W> {
         let form = parse_form(body);
         let username = form.get("username").cloned().unwrap_or_default();
         let filename = form.get("filename").cloned().unwrap_or_default();
-        WebBridge::send(&PauseDownload { username, filename }, &self.writer);
+        WebBridge::send(&PauseDownload { username, filename, ..Default::default() }, &self.writer);
         Ok(String::new())
     }
 
@@ -386,7 +386,7 @@ impl<W: traits::core::Writer> SharedBridge<W> {
     /// Browse read-model component).
     fn browse_fragment(&self) -> Result<String, String> {
         match self.round_trip(|corr| {
-            WebBridge::send(&BrowseRenderReq { corr }, &self.writer);
+            WebBridge::send(&BrowseRenderReq { corr, ..Default::default() }, &self.writer);
         })? {
             BridgeReply::Html(html) => Ok(html),
             _ => Err("unexpected reply type".into()),
@@ -401,7 +401,7 @@ impl<W: traits::core::Writer> SharedBridge<W> {
         let username = form.get("username").cloned().unwrap_or_default();
 
         let error = match self.round_trip(|corr| {
-            WebBridge::send(&BrowseUser { corr, username: username.clone() }, &self.writer);
+            WebBridge::send(&BrowseUser { corr, username: username.clone(), ..Default::default() }, &self.writer);
         })? {
             BridgeReply::Browse(error) => error,
             _ => return Err("unexpected reply type".into()),
@@ -420,7 +420,7 @@ impl<W: traits::core::Writer> SharedBridge<W> {
 
     fn current_config(&self) -> Result<Config, String> {
         match self.round_trip(|corr| {
-            WebBridge::send(&GetConfigReq { corr }, &self.writer);
+            WebBridge::send(&GetConfigReq { corr, ..Default::default() }, &self.writer);
         })? {
             BridgeReply::Config(config) => Ok(*config),
             _ => Err("unexpected reply type".into()),
@@ -525,7 +525,7 @@ impl<W: traits::core::Writer> SharedBridge<W> {
 
     fn apply_update(&self) -> Result<String, String> {
         let result = match self.round_trip(|corr| {
-            WebBridge::send(&ApplyUpdateReq { corr }, &self.writer);
+            WebBridge::send(&ApplyUpdateReq { corr, ..Default::default() }, &self.writer);
         })? {
             BridgeReply::Apply(result) => result,
             _ => return Err("unexpected reply type".into()),

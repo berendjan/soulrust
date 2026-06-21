@@ -812,16 +812,16 @@ fn report_outcome<W: traits::core::Writer>(
     match result {
         Ok(ConnOutcome::Done) => {}
         Ok(ConnOutcome::Downloaded { username, filename, path }) => {
-            PeerNet::send(&DownloadComplete { username, filename, path }, writer);
+            PeerNet::send(&DownloadComplete { username, filename, path, ..Default::default() }, writer);
         }
         Ok(ConnOutcome::DownloadFailed { username, filename, reason }) => {
-            PeerNet::send(&DownloadFailed { username, filename, reason }, writer);
+            PeerNet::send(&DownloadFailed { username, filename, reason, ..Default::default() }, writer);
         }
         Ok(ConnOutcome::Uploaded { username, filename }) => {
-            PeerNet::send(&UploadComplete { username, filename }, writer);
+            PeerNet::send(&UploadComplete { username, filename, ..Default::default() }, writer);
         }
         Ok(ConnOutcome::UploadFailed { username, filename, reason }) => {
-            PeerNet::send(&UploadFailed { username, filename, reason }, writer);
+            PeerNet::send(&UploadFailed { username, filename, reason, ..Default::default() }, writer);
         }
         Err(err) => eprintln!("[peer-net {addr}] connection ended: {err}"),
     }
@@ -877,7 +877,7 @@ async fn command_loop<W: traits::core::Writer>(
             PeerCommand::StartUpload { username: peer } => {
                 // A downloader approved an upload; ask session to resolve their
                 // address so we can open the file connection.
-                PeerNet::send(&ResolveUploadPeer { username: peer }, &writer);
+                PeerNet::send(&ResolveUploadPeer { username: peer, ..Default::default() }, &writer);
             }
             PeerCommand::UploadConnect { username: peer, ip, port } => {
                 // Collect the approved uploads for this peer.
@@ -902,8 +902,7 @@ async fn command_loop<W: traits::core::Writer>(
                             &UploadFailed {
                                 username: peer.clone(),
                                 filename,
-                                reason: "peer is offline or not reachable".into(),
-                            },
+                                reason: "peer is offline or not reachable".into(), ..Default::default() },
                             &writer,
                         );
                         continue;
@@ -1030,17 +1029,17 @@ async fn command_loop<W: traits::core::Writer>(
                 });
             }
             PeerCommand::QueuePosition { username, filename, place } => {
-                PeerNet::send(&DownloadQueuePosition { username, filename, place }, &writer);
+                PeerNet::send(&DownloadQueuePosition { username, filename, place, ..Default::default() }, &writer);
             }
             PeerCommand::SearchResult { token, username, free_slots, upload_speed, in_queue, files } => {
                 PeerNet::send(
-                    &SearchResultReceived { token, username, free_slots, upload_speed, in_queue, files },
+                    &SearchResultReceived { token, username, free_slots, upload_speed, in_queue, files, ..Default::default() },
                     &writer,
                 );
             }
             PeerCommand::TransferProgress { username, filename, bytes, size, upload } => {
                 PeerNet::send(
-                    &TransferProgress { username, filename, bytes, size, upload },
+                    &TransferProgress { username, filename, bytes, size, upload, ..Default::default() },
                     &writer,
                 );
             }
@@ -1078,7 +1077,7 @@ async fn browse_task<W: traits::core::Writer>(
 ) {
     match browse_fetch(&ip, port, &our_username).await {
         Ok(response) => PeerNet::send(&to_listing(&peer, &response), &writer),
-        Err(reason) => PeerNet::send(&BrowseFailed { username: peer, reason }, &writer),
+        Err(reason) => PeerNet::send(&BrowseFailed { username: peer, reason, ..Default::default() }, &writer),
     }
 }
 
@@ -1222,8 +1221,7 @@ async fn download_init_task<W: traits::core::Writer>(
                 &DownloadFailed {
                     username: peer,
                     filename,
-                    reason: format!("connect {ip}:{port}: {err}"),
-                },
+                    reason: format!("connect {ip}:{port}: {err}"), ..Default::default() },
                 &writer,
             );
             return;
@@ -1245,7 +1243,7 @@ async fn download_init_task<W: traits::core::Writer>(
     .await;
     if let Err(err) = queued {
         PeerNet::send(
-            &DownloadFailed { username: peer, filename, reason: format!("queueing: {err}") },
+            &DownloadFailed { username: peer, filename, reason: format!("queueing: {err}"), ..Default::default() },
             &writer,
         );
         return;
@@ -1273,8 +1271,7 @@ fn pump_uploads<W: traits::core::Writer>(ctx: &Arc<ConnCtx>, writer: &W) {
             &UploadStarted {
                 username: job.peer.clone(),
                 filename: job.filename.clone(),
-                size: job.size,
-            },
+                size: job.size, ..Default::default() },
             writer,
         );
         tokio::spawn(upload_task(
@@ -1334,8 +1331,8 @@ async fn upload_task<W: traits::core::Writer>(
     .await;
 
     match result {
-        Ok(()) => PeerNet::send(&UploadComplete { username: peer, filename }, &writer),
-        Err(reason) => PeerNet::send(&UploadFailed { username: peer, filename, reason }, &writer),
+        Ok(()) => PeerNet::send(&UploadComplete { username: peer, filename, ..Default::default() }, &writer),
+        Err(reason) => PeerNet::send(&UploadFailed { username: peer, filename, reason, ..Default::default() }, &writer),
     }
     // Free the slot and let any waiting uploads start.
     ctx.uploads_gate.release();
@@ -1753,8 +1750,7 @@ where
                             sample_rate: f.sample_rate(),
                             bit_depth: f.bit_depth(),
                             name: f.name,
-                            size: f.size,
-                        })
+                            size: f.size, ..Default::default() })
                         .collect();
                     let _ = ctx.cmd_tx.send(PeerCommand::SearchResult {
                         token: resp.token,
@@ -2253,16 +2249,26 @@ fn to_listing(username: &str, response: &SharedFileListResponse) -> BrowseListin
             let cost = file_cost(&file.name);
             if cost > budget {
                 truncated = true;
-                directories.push(BrowseDir { path: dir.path.clone(), files });
+                directories.push(BrowseDir { path: dir.path.clone(), files, ..Default::default() });
                 break 'dirs;
             }
             budget -= cost;
-            files.push(BrowseFile { name: file.name.clone(), size: file.size });
+            files.push(BrowseFile {
+                name: file.name.clone(),
+                size: file.size,
+                ..Default::default()
+            });
         }
-        directories.push(BrowseDir { path: dir.path.clone(), files });
+        directories.push(BrowseDir { path: dir.path.clone(), files, ..Default::default() });
     }
 
-    BrowseListing { username: username.to_owned(), directories, total_files, truncated }
+    BrowseListing {
+        username: username.to_owned(),
+        directories,
+        total_files,
+        truncated,
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]

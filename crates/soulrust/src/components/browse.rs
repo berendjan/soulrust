@@ -117,7 +117,7 @@ impl traits::core::Handle<BrowseFailed> for Browse {
 
 impl traits::core::Handle<BrowseRenderReq> for Browse {
     fn handle<W: traits::core::Writer>(&mut self, message: &BrowseRenderReq, writer: &W) {
-        Self::send(&BrowseHtml { corr: message.corr, html: self.render() }, writer);
+        Self::send(&BrowseHtml { corr: message.corr, html: self.render(), ..Default::default() }, writer);
     }
 }
 
@@ -172,16 +172,22 @@ mod tests {
             username: username.into(),
             directories: vec![BrowseDir {
                 path: "Music\\Album".into(),
-                files: vec![BrowseFile { name: "song.mp3".into(), size: 5_242_880 }],
+                files: vec![BrowseFile {
+                    name: "song.mp3".into(),
+                    size: 5_242_880,
+                    ..Default::default()
+                }],
+                ..Default::default()
             }],
             total_files: 1,
             truncated: false,
+            ..Default::default()
         }
     }
 
     fn render(b: &mut Browse) -> String {
         let writer = CapturingWriter::default();
-        traits::core::Handle::<BrowseRenderReq>::handle(b, &BrowseRenderReq { corr: 1 }, &writer);
+        traits::core::Handle::<BrowseRenderReq>::handle(b, &BrowseRenderReq { corr: 1, ..Default::default() }, &writer);
         writer.rendered().pop().unwrap()
     }
 
@@ -207,7 +213,7 @@ mod tests {
         let mut b = browse();
         traits::core::Handle::<BrowseFailed>::handle(
             &mut b,
-            &BrowseFailed { username: "bob".into(), reason: "offline".into() },
+            &BrowseFailed { username: "bob".into(), reason: "offline".into(), ..Default::default() },
             &CapturingWriter::default(),
         );
         let html = render(&mut b);
@@ -226,7 +232,7 @@ mod tests {
         // A later failure for alice replaces her loaded listing.
         traits::core::Handle::<BrowseFailed>::handle(
             &mut b,
-            &BrowseFailed { username: "alice".into(), reason: "lost connection".into() },
+            &BrowseFailed { username: "alice".into(), reason: "lost connection".into(), ..Default::default() },
             &CapturingWriter::default(),
         );
         let html = render(&mut b);

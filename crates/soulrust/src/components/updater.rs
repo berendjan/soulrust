@@ -402,7 +402,7 @@ mod tests {
         let mut updater = Updater::for_test(false);
         traits::core::Handle::<ApplyUpdateReq>::handle(
             &mut updater,
-            &ApplyUpdateReq { corr: 3 },
+            &ApplyUpdateReq { corr: 3, ..Default::default() },
             &writer,
         );
         let results: Vec<ApplyUpdateResult> = writer
