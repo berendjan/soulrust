@@ -18,8 +18,8 @@ use crate::components::web_bridge::WebBridge;
 use crate::config::ConfigStore;
 use crate::extract::ExtractorComponent;
 use crate::messages::{
-    ApplyUpdateReq, ApplyUpdateResult, BrowseAccepted, BrowseFailed, BrowseHtml, BrowseListing,
-    BrowseRenderReq, BrowseUser, CancelDownload, ConfigChanged, ConfigSnapshot, DistribSpeedLimits,
+    ApplyUpdateReq, ApplyUpdateResult, BrowseAccepted, BrowseFailed, BrowseHtml,
+    BrowseListingOwnedView, BrowseRenderReq, BrowseUser, CancelDownload, ConfigChanged, ConfigSnapshot, DistribSpeedLimits,
     DownloadComplete,
     DownloadFailed,
     DownloadQueuePosition, ExtractRequest, ExtractResult, GetConfigReq, HttpHtml, HttpRender,
@@ -73,7 +73,7 @@ rust_messenger::Messenger! {
             Session, BrowseAccepted: [ web_bridge ],
             Session, PeerBrowseConnect: [ peer_net ],
             Session, BrowseFailed: [ browse ],
-            PeerNet, BrowseListing: [ browse ],
+            PeerNet, BrowseListingOwnedView: [ browse ],
             PeerNet, BrowseFailed: [ browse ],
             WebBridge, BrowseRenderReq: [ browse ],
             Browse, BrowseHtml: [ web_bridge ],

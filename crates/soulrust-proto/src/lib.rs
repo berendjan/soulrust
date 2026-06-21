@@ -157,6 +157,50 @@ macro_rules! impl_bus_buffa {
     };
 }
 
+/// Bridge a buffa **owned-view** type (`FooOwnedView` = a zero-copy view over a
+/// backing `Bytes`) onto the bus. Used for large read-mostly messages so the
+/// receiving read-model holds a view — the payload is copied once into `Bytes`
+/// on decode and never re-allocated field-by-field, and `clone()` is an O(1)
+/// refcount bump rather than a deep copy. Framed with a u32-LE length prefix so
+/// decode reads exactly the body and ignores the ring's alignment padding.
+macro_rules! impl_bus_buffa_owned {
+    ($($type:ty => $id:expr),+ $(,)?) => {
+        $(
+            impl ::rust_messenger::traits::core::Message for $type {
+                type Id = $crate::MessageId;
+                const ID: $crate::MessageId = $id;
+            }
+
+            impl $type {
+                pub fn deserialize_from(buffer: &[u8]) -> Self {
+                    let len = u32::from_le_bytes(
+                        buffer[..4].try_into().expect("bus owned-view: short length prefix"),
+                    ) as usize;
+                    let body = ::buffa::bytes::Bytes::copy_from_slice(&buffer[4..4 + len]);
+                    <$type>::decode(body)
+                        .expect("bus message failed to decode; sender/receiver out of sync")
+                }
+            }
+
+            impl ::rust_messenger::traits::extended::ExtendedMessage for $type {
+                fn get_size(&self) -> usize {
+                    4 + self.bytes().len()
+                }
+
+                fn write_into(&self, buffer: &mut [u8]) {
+                    let body = self.bytes();
+                    buffer[..4].copy_from_slice(&(body.len() as u32).to_le_bytes());
+                    buffer[4..4 + body.len()].copy_from_slice(body);
+                }
+            }
+        )+
+    };
+}
+
+impl_bus_buffa_owned!(
+    bus::BrowseListingOwnedView => MessageId::BrowseListing,
+);
+
 impl_bus_buffa!(
     bus::PeerActivity => MessageId::PeerActivity,
     bus::HttpHtml => MessageId::HttpHtml,
@@ -184,7 +228,6 @@ impl_bus_buffa!(
     bus::UploadComplete => MessageId::UploadComplete,
     bus::UploadFailed => MessageId::UploadFailed,
     bus::StartSearchResult => MessageId::StartSearchResult,
-    bus::BrowseListing => MessageId::BrowseListing,
     bus::SearchResultReceived => MessageId::SearchResultReceived,
     bus::PeerBrowseConnect => MessageId::PeerBrowseConnect,
     bus::PeerPierce => MessageId::PeerPierce,

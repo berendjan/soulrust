@@ -42,7 +42,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::components::transfer_io;
 use crate::config::AppContext;
 use crate::messages::{
-    BrowseDir, BrowseFailed, BrowseFile, BrowseListing, CancelDownload, ConfigChanged, DownloadComplete,
+    BrowseDir, BrowseFailed, BrowseFile, BrowseListing, BrowseListingOwnedView, CancelDownload, ConfigChanged, DownloadComplete,
     DownloadFailed, DownloadQueuePosition, HandlerId, IncomingSearch, NetTx, PeerActivity, PeerBrowseConnect,
     DistribSpeedLimits, PeerDistribConnect, PeerDownloadConnect, PeerPierce, PeerPierceDistrib,
     PauseDownload, PeerPierceFile, PeerUploadConnect, RelayDistribSearch, ResolveUploadPeer,
@@ -2236,7 +2236,7 @@ where
 
 /// Maps a decoded share list to the bus message, capping the forwarded listing
 /// to a byte budget while still reporting the true file count.
-fn to_listing(username: &str, response: &SharedFileListResponse) -> BrowseListing {
+fn to_listing(username: &str, response: &SharedFileListResponse) -> BrowseListingOwnedView {
     let all_dirs = response.directories.iter().chain(response.private_directories.iter());
     let total_files: u64 = all_dirs.clone().map(|d| d.files.len() as u64).sum();
 
@@ -2263,13 +2263,16 @@ fn to_listing(username: &str, response: &SharedFileListResponse) -> BrowseListin
         directories.push(BrowseDir { path: dir.path.clone(), files, ..Default::default() });
     }
 
-    BrowseListing {
+    let owned = BrowseListing {
         username: username.to_owned(),
         directories,
         total_files,
         truncated,
         ..Default::default()
-    }
+    };
+    // Send as an owned-view: the Browse read-model holds it as a zero-copy view
+    // (one Bytes copy, no second deep allocation of the up-to-512 KB tree).
+    BrowseListingOwnedView::from_owned(&owned).expect("re-encode our own listing")
 }
 
 #[cfg(test)]
@@ -2457,8 +2460,9 @@ mod tests {
                 }
             };
             let listing = to_listing("alice", &resp);
-            assert_eq!(listing.total_files, 1);
-            assert_eq!(listing.directories[0].files[0].name, "a.mp3");
+            let view = listing.view();
+            assert_eq!(view.total_files, 1);
+            assert_eq!(view.directories.iter().next().unwrap().files.iter().next().unwrap().name, "a.mp3");
             stub.await.unwrap();
         });
     }

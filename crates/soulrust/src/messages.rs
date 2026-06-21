@@ -97,7 +97,7 @@ pub fn page_from_proto(p: &soulrust_proto::bus::Page) -> Page {
 // Re-exported here so components keep importing them from `crate::messages`.
 pub use soulrust_proto::bus::{
     ApplyUpdateReq, BrowseAccepted, BrowseDir, BrowseFailed, BrowseFile, BrowseHtml, BrowseListing,
-    BrowseRenderReq, BrowseUser, CancelDownload, DistribSpeedLimits, DownloadComplete,
+    BrowseListingOwnedView, BrowseRenderReq, BrowseUser, CancelDownload, DistribSpeedLimits, DownloadComplete,
     DownloadFailed, DownloadQueuePosition, ExtractRequest, GetConfigReq, HttpHtml, IncomingSearch,
     NetRx, NetTx, PauseDownload, PeerActivity, PeerBrowseConnect, PeerDistribConnect, PeerDownloadConnect,
     PeerPierce, PeerPierceDistrib, PeerPierceFile, PeerUploadConnect, RelayDistribSearch,

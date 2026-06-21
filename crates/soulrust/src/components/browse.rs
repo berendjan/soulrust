@@ -12,11 +12,13 @@ use rust_messenger::traits::extended::Sender;
 
 use crate::config::AppContext;
 use crate::messages::{
-    BrowseFailed, BrowseHtml, BrowseListing, BrowseRenderReq, HandlerId,
+    BrowseFailed, BrowseHtml, BrowseListingOwnedView, BrowseRenderReq, HandlerId,
 };
 
 enum Entry {
-    Loaded(BrowseListing),
+    /// The fetched listing, held as a zero-copy owned-view: the (up to 512 KB)
+    /// tree is copied once into `Bytes` on decode and read by reference here.
+    Loaded(BrowseListingOwnedView),
     Failed(String),
 }
 
@@ -58,20 +60,22 @@ impl Browse {
     }
 }
 
-fn render_listing(listing: &BrowseListing) -> String {
-    let partial = if listing.truncated { " (partial — share is larger)" } else { "" };
+fn render_listing(listing: &BrowseListingOwnedView) -> String {
+    // Read everything through the zero-copy view — no owned tree is materialised.
+    let view = listing.view();
+    let partial = if view.truncated { " (partial — share is larger)" } else { "" };
     let mut out = format!(
         r#"<details open><summary><b>{}</b> — {} file(s){}</summary>"#,
-        escape(&listing.username),
-        listing.total_files,
+        escape(view.username),
+        view.total_files,
         partial
     );
-    for dir in &listing.directories {
-        out.push_str(&format!(r#"<div class="dir">{}</div><ul>"#, escape(&dir.path)));
-        for file in &dir.files {
+    for dir in view.directories.iter() {
+        out.push_str(&format!(r#"<div class="dir">{}</div><ul>"#, escape(dir.path)));
+        for file in dir.files.iter() {
             out.push_str(&format!(
                 "<li>{} <span class=\"size\">({})</span></li>",
-                escape(&file.name),
+                escape(file.name),
                 human_size(file.size)
             ));
         }
@@ -101,10 +105,12 @@ impl traits::core::Handler for Browse {
     const ID: HandlerId = HandlerId::Browse;
 }
 
-impl traits::core::Handle<BrowseListing> for Browse {
-    fn handle<W: traits::core::Writer>(&mut self, message: &BrowseListing, _writer: &W) {
-        self.touch(&message.username);
-        self.entries.insert(message.username.clone(), Entry::Loaded(message.clone()));
+impl traits::core::Handle<BrowseListingOwnedView> for Browse {
+    fn handle<W: traits::core::Writer>(&mut self, message: &BrowseListingOwnedView, _writer: &W) {
+        let username = message.view().username;
+        self.touch(username);
+        // `clone()` is an O(1) Bytes refcount bump — no deep copy of the tree.
+        self.entries.insert(username.to_owned(), Entry::Loaded(message.clone()));
     }
 }
 
@@ -131,7 +137,7 @@ fn escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::messages::{BrowseDir, BrowseFile, MessageId};
+    use crate::messages::{BrowseDir, BrowseFile, BrowseListing, MessageId};
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]
@@ -200,7 +206,7 @@ mod tests {
     #[test]
     fn loaded_listing_shows_files_with_human_sizes() {
         let mut b = browse();
-        traits::core::Handle::<BrowseListing>::handle(&mut b, &listing("alice"), &CapturingWriter::default());
+        traits::core::Handle::<BrowseListingOwnedView>::handle(&mut b, &BrowseListingOwnedView::from_owned(&listing("alice")).unwrap(), &CapturingWriter::default());
         let html = render(&mut b);
         assert!(html.contains("<b>alice</b>"));
         assert!(html.contains("Music\\Album"));
@@ -224,8 +230,8 @@ mod tests {
     #[test]
     fn newest_browse_renders_first_and_replaces_prior_state() {
         let mut b = browse();
-        traits::core::Handle::<BrowseListing>::handle(&mut b, &listing("alice"), &CapturingWriter::default());
-        traits::core::Handle::<BrowseListing>::handle(&mut b, &listing("bob"), &CapturingWriter::default());
+        traits::core::Handle::<BrowseListingOwnedView>::handle(&mut b, &BrowseListingOwnedView::from_owned(&listing("alice")).unwrap(), &CapturingWriter::default());
+        traits::core::Handle::<BrowseListingOwnedView>::handle(&mut b, &BrowseListingOwnedView::from_owned(&listing("bob")).unwrap(), &CapturingWriter::default());
         let html = render(&mut b);
         assert!(html.find("bob").unwrap() < html.find("alice").unwrap());
 
@@ -246,7 +252,7 @@ mod tests {
         let mut l = listing("alice");
         l.truncated = true;
         l.total_files = 99999;
-        traits::core::Handle::<BrowseListing>::handle(&mut b, &l, &CapturingWriter::default());
+        traits::core::Handle::<BrowseListingOwnedView>::handle(&mut b, &BrowseListingOwnedView::from_owned(&l).unwrap(), &CapturingWriter::default());
         assert!(render(&mut b).contains("partial"));
     }
 
@@ -255,7 +261,7 @@ mod tests {
         let mut b = browse();
         let mut l = listing("alice");
         l.directories[0].path = "<script>".into();
-        traits::core::Handle::<BrowseListing>::handle(&mut b, &l, &CapturingWriter::default());
+        traits::core::Handle::<BrowseListingOwnedView>::handle(&mut b, &BrowseListingOwnedView::from_owned(&l).unwrap(), &CapturingWriter::default());
         let html = render(&mut b);
         assert!(!html.contains("<script>"));
         assert!(html.contains("&lt;script&gt;"));
