@@ -483,6 +483,14 @@ impl<W: traits::core::Writer> SharedBridge<W> {
             config.sharing.max_peer_queue_length =
                 v.parse().map_err(|_| format!("invalid maximum queue length: {v}"))?;
         }
+        if let Some(v) = get("max_download_speed") {
+            config.sharing.max_download_speed =
+                v.parse().map_err(|_| format!("invalid max download speed: {v}"))?;
+        }
+        if let Some(v) = get("max_upload_speed") {
+            config.sharing.max_upload_speed =
+                v.parse().map_err(|_| format!("invalid max upload speed: {v}"))?;
+        }
 
         let result = match self.round_trip(|corr| {
             WebBridge::send(&SetConfigReq { corr, config: config.clone() }, &self.writer);
@@ -771,6 +779,11 @@ fn render_config_page(config: &Config, banner: Option<String>) -> String {
 <label>minimum peer upload speed (B/s, 0 = any) <input type="text" name="min_peer_upload_speed" value="{min_speed}"></label>
 <label>maximum peer queue length (0 = no limit) <input type="text" name="max_peer_queue_length" value="{max_queue}"></label>
 </div>
+<div class="card"><h2 style="margin-top:0">Bandwidth limits</h2>
+<p class="muted" style="margin-top:0">Aggregate throttles across all transfers, in bytes/second (0 = unlimited). Applied live.</p>
+<label>max download speed (B/s, 0 = unlimited) <input type="text" name="max_download_speed" value="{max_down}"></label>
+<label>max upload speed (B/s, 0 = unlimited) <input type="text" name="max_upload_speed" value="{max_up}"></label>
+</div>
 <p><button class="btn" type="submit">Save</button></p>
 </form>"#,
         banner = banner.unwrap_or_default(),
@@ -798,6 +811,8 @@ fn render_config_page(config: &Config, banner: Option<String>) -> String {
         min_files = config.sharing.min_result_files,
         min_speed = config.sharing.min_peer_upload_speed,
         max_queue = config.sharing.max_peer_queue_length,
+        max_down = config.sharing.max_download_speed,
+        max_up = config.sharing.max_upload_speed,
     );
     shell("soulrust — settings", "config", &config.server.username, &body)
 }

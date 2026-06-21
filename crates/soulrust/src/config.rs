@@ -100,6 +100,12 @@ pub struct SharingConfig {
     pub min_peer_upload_speed: u32,
     /// Drop a peer's response whose queue is longer than this (0 = no limit).
     pub max_peer_queue_length: u32,
+    /// Aggregate download throttle in bytes/second across all transfers
+    /// (0 = unlimited).
+    pub max_download_speed: u32,
+    /// Aggregate upload throttle in bytes/second across all transfers
+    /// (0 = unlimited).
+    pub max_upload_speed: u32,
 }
 
 impl SharingConfig {
@@ -148,6 +154,8 @@ impl Default for SharingConfig {
             min_result_files: 1,
             min_peer_upload_speed: 0,
             max_peer_queue_length: 0,
+            max_download_speed: 0,
+            max_upload_speed: 0,
         }
     }
 }

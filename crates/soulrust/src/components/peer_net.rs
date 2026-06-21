@@ -444,6 +444,11 @@ impl PeerNet {
         let incomplete_dir = ctx.config.sharing.incomplete_path();
         let _ = std::fs::create_dir_all(&download_dir);
         let _ = std::fs::create_dir_all(&incomplete_dir);
+        // Seed the aggregate bandwidth caps from config; refreshed on ConfigChanged.
+        transfer_io::set_bandwidth_limits(
+            ctx.config.sharing.max_download_speed as u64,
+            ctx.config.sharing.max_upload_speed as u64,
+        );
         PeerNet {
             listen_port: ctx.config.server.listen_port as u16,
             folders: ctx.config.sharing.folders.iter().map(PathBuf::from).collect(),
@@ -570,6 +575,10 @@ impl traits::core::Handle<ConfigChanged> for PeerNet {
         // update the download dirs live; only listen port + server credentials
         // still need a restart.
         let s = &message.config.sharing;
+        // Bandwidth caps live in process-global token buckets the transfer tasks
+        // read, so apply them directly (a relaxed atomic store) rather than
+        // routing through the reactor.
+        transfer_io::set_bandwidth_limits(s.max_download_speed as u64, s.max_upload_speed as u64);
         let _ = self.cmd_tx.send(PeerCommand::ApplyConfig {
             live: LiveConfig {
                 search_filter: SearchFilter {

@@ -15,15 +15,103 @@
 //! testable over an in-memory duplex.
 
 use std::io::{self, SeekFrom};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use soulseek_proto::transfer::{FileOffset, FileTransferInit};
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
+/// A token-bucket rate limiter shared across all transfers in one direction.
+/// `rate` is bytes/second; `0` means unlimited (the hot path then does a single
+/// relaxed atomic load and returns). The bucket allows up to one second of burst.
+pub struct RateLimiter {
+    rate: AtomicU64,
+    state: Mutex<BucketState>,
+}
+
+struct BucketState {
+    allowance: f64,
+    last: Instant,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        RateLimiter {
+            rate: AtomicU64::new(0),
+            state: Mutex::new(BucketState { allowance: 0.0, last: Instant::now() }),
+        }
+    }
+
+    /// Set the limit in bytes/second (`0` = unlimited).
+    pub fn set_rate(&self, bytes_per_sec: u64) {
+        self.rate.store(bytes_per_sec, Ordering::Relaxed);
+    }
+
+    /// Wait until `n` bytes may pass under the current rate. Unlimited returns
+    /// immediately; otherwise refills the bucket by elapsed time and sleeps off
+    /// any deficit. Sleeping happens outside the lock.
+    async fn acquire(&self, n: u64) {
+        let rate = self.rate.load(Ordering::Relaxed);
+        if rate == 0 {
+            return;
+        }
+        let sleep = {
+            let mut s = self.state.lock().unwrap();
+            let now = Instant::now();
+            let elapsed = now.duration_since(s.last).as_secs_f64();
+            s.last = now;
+            let cap = rate as f64; // one second of burst
+            s.allowance = (s.allowance + elapsed * rate as f64).min(cap);
+            s.allowance -= n as f64;
+            if s.allowance < 0.0 {
+                Some(Duration::from_secs_f64(-s.allowance / rate as f64))
+            } else {
+                None
+            }
+        };
+        if let Some(delay) = sleep {
+            tokio::time::sleep(delay).await;
+        }
+    }
+}
+
+/// Process-global (download, upload) limiters, shared by every transfer so the
+/// caps are aggregate, not per-connection. Set from config at reactor start and
+/// updated live on a config change.
+static LIMITS: OnceLock<(RateLimiter, RateLimiter)> = OnceLock::new();
+
+fn limits() -> &'static (RateLimiter, RateLimiter) {
+    LIMITS.get_or_init(|| (RateLimiter::new(), RateLimiter::new()))
+}
+
+/// The shared download-direction limiter (bytes we receive).
+pub fn download_limiter() -> &'static RateLimiter {
+    &limits().0
+}
+
+/// The shared upload-direction limiter (bytes we send).
+pub fn upload_limiter() -> &'static RateLimiter {
+    &limits().1
+}
+
+/// Apply aggregate bandwidth caps (bytes/second; `0` = unlimited).
+pub fn set_bandwidth_limits(download_bps: u64, upload_bps: u64) {
+    download_limiter().set_rate(download_bps);
+    upload_limiter().set_rate(upload_bps);
+}
+
 /// Copy exactly `len` bytes from `src` to `dst` in 64 KiB chunks, erroring if
 /// `src` ends before `len` bytes have been read. The fixed buffer bounds memory
-/// regardless of transfer size.
-async fn copy_exact<R, W>(src: &mut R, dst: &mut W, len: u64) -> io::Result<u64>
+/// regardless of transfer size. `limiter` throttles throughput (unlimited by
+/// default), gating each chunk against the shared per-direction token bucket.
+async fn copy_exact<R, W>(
+    src: &mut R,
+    dst: &mut W,
+    len: u64,
+    limiter: &RateLimiter,
+) -> io::Result<u64>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -39,6 +127,7 @@ where
                 "source ended before the expected number of bytes",
             ));
         }
+        limiter.acquire(read as u64).await;
         dst.write_all(&buf[..read]).await?;
         remaining -= read as u64;
     }
@@ -81,7 +170,7 @@ where
     }
 
     file.seek(SeekFrom::Start(offset)).await?;
-    let sent = copy_exact(&mut file, stream, size - offset).await?;
+    let sent = copy_exact(&mut file, stream, size - offset, upload_limiter()).await?;
     stream.flush().await?;
     Ok(sent)
 }
@@ -111,7 +200,7 @@ where
     // Flush whatever we received even if the transfer ends early: tokio's File
     // buffers writes, and a dropped buffer would lose the partial we need on disk
     // to resume later. Persist first, then surface any short-transfer error.
-    let copied = copy_exact(stream, &mut sink, expected_size - offset).await;
+    let copied = copy_exact(stream, &mut sink, expected_size - offset, download_limiter()).await;
     sink.flush().await?;
     let received = copied?;
     Ok(received)
@@ -126,6 +215,32 @@ mod tests {
 
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    }
+
+    #[test]
+    fn rate_limiter_throttles_when_over_budget() {
+        runtime().block_on(async {
+            let limiter = RateLimiter::new();
+            limiter.set_rate(1000); // 1000 B/s
+            // From an empty bucket, 100 bytes is a 0.1s deficit at 1000 B/s.
+            let start = Instant::now();
+            limiter.acquire(100).await;
+            assert!(
+                start.elapsed() >= Duration::from_millis(80),
+                "expected ~100ms throttle, got {:?}",
+                start.elapsed()
+            );
+        });
+    }
+
+    #[test]
+    fn rate_limiter_unlimited_returns_immediately() {
+        runtime().block_on(async {
+            let limiter = RateLimiter::new(); // rate 0 = unlimited
+            let start = Instant::now();
+            limiter.acquire(100_000_000).await;
+            assert!(start.elapsed() < Duration::from_millis(50));
+        });
     }
 
     /// A unique temp path that removes itself on drop (the suite uses
