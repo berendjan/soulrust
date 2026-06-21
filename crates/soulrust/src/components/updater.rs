@@ -12,9 +12,23 @@ use crate::components::github::{
 };
 use crate::config::{AppContext, UpdateConfig};
 use crate::messages::{
-    ApplyUpdateReq, ApplyUpdateResult, ConfigChanged, HandlerId, UpdateDownloaded, UpdaterStatus,
+    ApplyUpdateReq, ApplyUpdateResult, ConfigChanged, HandlerId, UpdateDownloaded,
     UpdaterStatusChanged,
 };
+
+/// Updater status, kept as a local rich enum for ergonomic `send_status` calls;
+/// mapped to the flat buffa `UpdaterStatusChanged` (kind + payload fields).
+#[derive(Debug, Clone, PartialEq)]
+enum UpdaterStatus {
+    Checking,
+    UpToDate { current: String },
+    Available { latest: String },
+    Downloading { latest: String },
+    ReadyToApply { latest: String },
+    RestartRequired { latest: String },
+    Failed { error: String },
+    Skipped { reason: String },
+}
 use crate::version::VERSION;
 
 pub struct Updater {
@@ -79,7 +93,70 @@ impl traits::core::Handler for Updater {
 }
 
 fn send_status<W: traits::core::Writer>(status: UpdaterStatus, writer: &W) {
-    Updater::send(&UpdaterStatusChanged { status }, writer);
+    use soulrust_proto::bus::UpdaterStatusKind as K;
+    let msg = match status {
+        UpdaterStatus::Checking => {
+            UpdaterStatusChanged { kind: K::UpdaterChecking.into(), ..Default::default() }
+        }
+        UpdaterStatus::UpToDate { current } => {
+            UpdaterStatusChanged { kind: K::UpdaterUpToDate.into(), current, ..Default::default() }
+        }
+        UpdaterStatus::Available { latest } => {
+            UpdaterStatusChanged { kind: K::UpdaterAvailable.into(), latest, ..Default::default() }
+        }
+        UpdaterStatus::Downloading { latest } => UpdaterStatusChanged {
+            kind: K::UpdaterDownloading.into(),
+            latest,
+            ..Default::default()
+        },
+        UpdaterStatus::ReadyToApply { latest } => UpdaterStatusChanged {
+            kind: K::UpdaterReadyToApply.into(),
+            latest,
+            ..Default::default()
+        },
+        UpdaterStatus::RestartRequired { latest } => UpdaterStatusChanged {
+            kind: K::UpdaterRestartRequired.into(),
+            latest,
+            ..Default::default()
+        },
+        UpdaterStatus::Failed { error } => {
+            UpdaterStatusChanged { kind: K::UpdaterFailed.into(), error, ..Default::default() }
+        }
+        UpdaterStatus::Skipped { reason } => {
+            UpdaterStatusChanged { kind: K::UpdaterSkipped.into(), reason, ..Default::default() }
+        }
+    };
+    Updater::send(&msg, writer);
+}
+
+/// Reverse of [`send_status`]'s mapping (buffa → local rich), for tests.
+#[cfg(test)]
+fn local_updater_status(msg: &UpdaterStatusChanged) -> UpdaterStatus {
+    use soulrust_proto::bus::UpdaterStatusKind as K;
+    match msg.kind {
+        crate::messages::EnumValue::Known(K::UpdaterUpToDate) => {
+            UpdaterStatus::UpToDate { current: msg.current.clone() }
+        }
+        crate::messages::EnumValue::Known(K::UpdaterAvailable) => {
+            UpdaterStatus::Available { latest: msg.latest.clone() }
+        }
+        crate::messages::EnumValue::Known(K::UpdaterDownloading) => {
+            UpdaterStatus::Downloading { latest: msg.latest.clone() }
+        }
+        crate::messages::EnumValue::Known(K::UpdaterReadyToApply) => {
+            UpdaterStatus::ReadyToApply { latest: msg.latest.clone() }
+        }
+        crate::messages::EnumValue::Known(K::UpdaterRestartRequired) => {
+            UpdaterStatus::RestartRequired { latest: msg.latest.clone() }
+        }
+        crate::messages::EnumValue::Known(K::UpdaterFailed) => {
+            UpdaterStatus::Failed { error: msg.error.clone() }
+        }
+        crate::messages::EnumValue::Known(K::UpdaterSkipped) => {
+            UpdaterStatus::Skipped { reason: msg.reason.clone() }
+        }
+        _ => UpdaterStatus::Checking,
+    }
 }
 
 /// The startup check, on its own thread so HTTP can't block any worker.
@@ -246,7 +323,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter(|(id, _)| *id == u16::from(MessageId::UpdaterStatusChanged))
-                .map(|(_, buf)| UpdaterStatusChanged::deserialize_from(buf).status)
+                .map(|(_, buf)| local_updater_status(&UpdaterStatusChanged::deserialize_from(buf)))
                 .collect()
         }
 

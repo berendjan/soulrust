@@ -13,7 +13,7 @@ use crate::config::AppContext;
 use crate::messages::{
     CancelDownload, EnumValue, ConfigChanged, DownloadComplete, DownloadFailed, DownloadQueuePosition,
     HandlerId, HttpHtml, HttpRender, Page, PauseDownload, PeerActivity, SearchResultReceived, SessionEvent,
-    SessionEventKind, StartDownload, TransferProgress, UpdaterStatus, UpdaterStatusChanged,
+    SessionEventKind, StartDownload, TransferProgress, UpdaterStatusChanged, UpdaterStatusKind,
     UploadComplete, UploadFailed, UploadStarted,
 };
 
@@ -135,7 +135,7 @@ impl SortKey {
 pub struct Ui {
     session: SessionStatus,
     searches: Vec<SearchRow>,
-    updater: Option<UpdaterStatus>,
+    updater: Option<UpdaterStatusChanged>,
     log: VecDeque<String>,
     username: String,
     /// Active results sort: column + descending flag. `None` = arrival order.
@@ -384,35 +384,40 @@ impl Ui {
         let updater = match &self.updater {
             None => String::new(),
             Some(status) => {
-                let (class, text) = match status {
-                    UpdaterStatus::Checking => ("banner", "checking for updates…".to_owned()),
-                    UpdaterStatus::UpToDate { current } => {
-                        ("banner", format!("up to date (v{current})"))
+                use UpdaterStatusKind as K;
+                let latest = &status.latest;
+                let (class, text) = match status.kind {
+                    EnumValue::Known(K::UpdaterChecking) => {
+                        ("banner", "checking for updates…".to_owned())
                     }
-                    UpdaterStatus::Available { latest } => {
+                    EnumValue::Known(K::UpdaterUpToDate) => {
+                        ("banner", format!("up to date (v{})", status.current))
+                    }
+                    EnumValue::Known(K::UpdaterAvailable) => {
                         ("banner", format!("update v{latest} available"))
                     }
-                    UpdaterStatus::Downloading { latest } => {
+                    EnumValue::Known(K::UpdaterDownloading) => {
                         ("banner", format!("downloading v{latest}…"))
                     }
-                    UpdaterStatus::ReadyToApply { latest } => (
+                    EnumValue::Known(K::UpdaterReadyToApply) => (
                         "banner",
                         format!(
                             r##"v{latest} downloaded — <button hx-post="/apply-update" hx-target="#status">install</button>"##
                         ),
                     ),
-                    UpdaterStatus::RestartRequired { latest } => (
+                    EnumValue::Known(K::UpdaterRestartRequired) => (
                         "banner",
                         format!(
                             r##"v{latest} installed — <button hx-post="/restart" hx-target="#status">restart soulrust</button>"##
                         ),
                     ),
-                    UpdaterStatus::Failed { error } => {
-                        ("banner error", format!("update failed: {}", escape(error)))
+                    EnumValue::Known(K::UpdaterFailed) => {
+                        ("banner error", format!("update failed: {}", escape(&status.error)))
                     }
-                    UpdaterStatus::Skipped { reason } => {
-                        ("banner", format!("updates skipped: {}", escape(reason)))
+                    EnumValue::Known(K::UpdaterSkipped) => {
+                        ("banner", format!("updates skipped: {}", escape(&status.reason)))
                     }
+                    _ => ("banner", String::new()),
                 };
                 format!(r#"<div class="{class}">{text}</div>"#)
             }
@@ -795,7 +800,7 @@ impl traits::core::Handle<SessionEvent> for Ui {
 
 impl traits::core::Handle<UpdaterStatusChanged> for Ui {
     fn handle<W: traits::core::Writer>(&mut self, message: &UpdaterStatusChanged, _writer: &W) {
-        self.updater = Some(message.status.clone());
+        self.updater = Some(message.clone());
     }
 }
 

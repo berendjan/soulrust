@@ -18,7 +18,9 @@ use crate::extract::{Job, SearchJob};
 pub use soulrust_proto::{EnumValue, HandlerId, MessageField, MessageId};
 
 // Buffa bus message + enum types migrated from this module.
-pub use soulrust_proto::bus::{NetConn, NetConnKind, SessionEvent, SessionEventKind};
+pub use soulrust_proto::bus::{
+    NetConn, NetConnKind, SessionEvent, SessionEventKind, UpdaterStatusChanged, UpdaterStatusKind,
+};
 
 // ---------------------------------------------------------------------------
 // web bridge <-> ui
@@ -96,27 +98,6 @@ pub struct SetConfigResult {
 pub struct ConfigChanged {
     pub config: Config,
 }
-
-// ---------------------------------------------------------------------------
-// updater
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum UpdaterStatus {
-    Checking,
-    UpToDate { current: String },
-    Available { latest: String },
-    Downloading { latest: String },
-    /// Downloaded but waiting for a manual apply (auto_apply = false).
-    ReadyToApply { latest: String },
-    RestartRequired { latest: String },
-    Failed { error: String },
-    Skipped { reason: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdaterStatusChanged {
-    pub status: UpdaterStatus,
-}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplyUpdateResult {
     pub corr: u64,
@@ -183,7 +164,6 @@ impl_bus_message!(
     SetConfigReq => MessageId::SetConfigReq,
     SetConfigResult => MessageId::SetConfigResult,
     ConfigChanged => MessageId::ConfigChanged,
-    UpdaterStatusChanged => MessageId::UpdaterStatusChanged,
     ApplyUpdateResult => MessageId::ApplyUpdateResult,
 );
 
