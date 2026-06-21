@@ -29,7 +29,7 @@ use crate::messages::{
     SearchResultReceived,
     SetConfigReq,
     SetConfigResult, SetExcludedPhrases, SessionEvent, StartDownload, StartSearch, StartSearchResult,
-    UpdateDownloaded,
+    TransferProgress, UpdateDownloaded,
     UpdaterStatusChanged, UploadComplete, UploadFailed, UploadStarted,
 };
 
@@ -99,6 +99,7 @@ rust_messenger::Messenger! {
             PeerNet, ResolveUploadPeer: [ session ],
             Session, PeerUploadConnect: [ peer_net ],
             PeerNet, UploadStarted: [ ui ],
+            PeerNet, TransferProgress: [ ui ],
             PeerNet, UploadComplete: [ ui ],
             PeerNet, UploadFailed: [ ui ],
             // distributed search tree: session adopts a parent -> peer_net D conn

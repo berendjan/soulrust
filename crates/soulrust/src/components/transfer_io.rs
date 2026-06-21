@@ -111,6 +111,7 @@ async fn copy_exact<R, W>(
     dst: &mut W,
     len: u64,
     limiter: &RateLimiter,
+    progress: &mut (dyn FnMut(u64) + Send),
 ) -> io::Result<u64>
 where
     R: AsyncRead + Unpin,
@@ -130,6 +131,7 @@ where
         limiter.acquire(read as u64).await;
         dst.write_all(&buf[..read]).await?;
         remaining -= read as u64;
+        progress(len - remaining);
     }
     Ok(len)
 }
@@ -140,12 +142,18 @@ where
 /// and writes the remaining `size - offset` bytes. Returns the number of bytes
 /// sent. A file shorter than the advertised `size` errors rather than silently
 /// short-transferring (the peer would otherwise wait for bytes that never come).
-pub async fn upload<S>(stream: &mut S, token: u32, file: File, size: u64) -> io::Result<u64>
+pub async fn upload<S>(
+    stream: &mut S,
+    token: u32,
+    file: File,
+    size: u64,
+    progress: &mut (dyn FnMut(u64) + Send),
+) -> io::Result<u64>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     stream.write_all(&FileTransferInit { token }.to_bytes()).await?;
-    stream_from_offset(stream, file, size).await
+    stream_from_offset(stream, file, size, progress).await
 }
 
 /// The second half of an upload, for when the `FileTransferInit` token has
@@ -153,7 +161,12 @@ where
 /// the remaining `size - offset` bytes. This is the whole upload when *the
 /// downloader* opened the file connection (it sent the token, so we must not
 /// send it again) — the `TransferRequest{Download}` request path.
-pub async fn stream_from_offset<S>(stream: &mut S, mut file: File, size: u64) -> io::Result<u64>
+pub async fn stream_from_offset<S>(
+    stream: &mut S,
+    mut file: File,
+    size: u64,
+    progress: &mut (dyn FnMut(u64) + Send),
+) -> io::Result<u64>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -170,7 +183,9 @@ where
     }
 
     file.seek(SeekFrom::Start(offset)).await?;
-    let sent = copy_exact(&mut file, stream, size - offset, upload_limiter()).await?;
+    // Report absolute bytes sent (resume offset + this call's progress).
+    let mut report = |done: u64| progress(offset + done);
+    let sent = copy_exact(&mut file, stream, size - offset, upload_limiter(), &mut report).await?;
     stream.flush().await?;
     Ok(sent)
 }
@@ -186,6 +201,7 @@ pub async fn download<S>(
     offset: u64,
     expected_size: u64,
     mut sink: File,
+    progress: &mut (dyn FnMut(u64) + Send),
 ) -> io::Result<u64>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -200,7 +216,10 @@ where
     // Flush whatever we received even if the transfer ends early: tokio's File
     // buffers writes, and a dropped buffer would lose the partial we need on disk
     // to resume later. Persist first, then surface any short-transfer error.
-    let copied = copy_exact(stream, &mut sink, expected_size - offset, download_limiter()).await;
+    // Report absolute bytes on disk (resume offset + this call's progress).
+    let mut report = |done: u64| progress(offset + done);
+    let copied =
+        copy_exact(stream, &mut sink, expected_size - offset, download_limiter(), &mut report).await;
     sink.flush().await?;
     let received = copied?;
     Ok(received)
@@ -271,7 +290,7 @@ mod tests {
             let (mut client, mut server) = tokio::io::duplex(64 * 1024);
 
             let size = contents.len() as u64;
-            let up = tokio::spawn(async move { upload(&mut server, 0x2222, file, size).await });
+            let up = tokio::spawn(async move { upload(&mut server, 0x2222, file, size, &mut |_| {}).await });
 
             // Read the init token.
             let mut init = [0u8; FileTransferInit::LEN];
@@ -302,7 +321,7 @@ mod tests {
             let (mut client, mut server) = tokio::io::duplex(64 * 1024);
 
             let size = contents.len() as u64;
-            let up = tokio::spawn(async move { stream_from_offset(&mut server, file, size).await });
+            let up = tokio::spawn(async move { stream_from_offset(&mut server, file, size, &mut |_| {}).await });
 
             // No init token is read here (unlike `upload`): straight to the offset.
             client.write_all(&FileOffset { offset: 32 }.to_bytes()).await.unwrap();
@@ -324,7 +343,7 @@ mod tests {
 
             let payload = b"the quick brown fox".repeat(4096); // 76 KiB
             let size = payload.len() as u64;
-            let dl = tokio::spawn(async move { download(&mut server, 0, size, sink).await });
+            let dl = tokio::spawn(async move { download(&mut server, 0, size, sink, &mut |_| {}).await });
 
             // We (the peer/uploader side of the duplex) read the offset, then send bytes.
             let mut offset_buf = [0u8; FileOffset::LEN];
@@ -346,7 +365,7 @@ mod tests {
             let sink = File::create(&dest.0).await.unwrap();
             let (mut client, mut server) = tokio::io::duplex(1024);
 
-            let dl = tokio::spawn(async move { download(&mut server, 0, 1000, sink).await });
+            let dl = tokio::spawn(async move { download(&mut server, 0, 1000, sink, &mut |_| {}).await });
             let mut offset_buf = [0u8; FileOffset::LEN];
             client.read_exact(&mut offset_buf).await.unwrap();
             client.write_all(b"only a few bytes").await.unwrap();
@@ -365,7 +384,7 @@ mod tests {
             let file = File::open(&src.0).await.unwrap();
             let (mut client, mut server) = tokio::io::duplex(1024);
 
-            let up = tokio::spawn(async move { upload(&mut server, 1, file, 10).await });
+            let up = tokio::spawn(async move { upload(&mut server, 1, file, 10, &mut |_| {}).await });
             let mut init = [0u8; FileTransferInit::LEN];
             client.read_exact(&mut init).await.unwrap();
             client.write_all(&FileOffset { offset: 10 }.to_bytes()).await.unwrap(); // resume at EOF
@@ -385,7 +404,7 @@ mod tests {
             let file = File::open(&src.0).await.unwrap();
             let (mut client, mut server) = tokio::io::duplex(1024);
 
-            let up = tokio::spawn(async move { upload(&mut server, 1, file, 3).await });
+            let up = tokio::spawn(async move { upload(&mut server, 1, file, 3, &mut |_| {}).await });
             let mut init = [0u8; FileTransferInit::LEN];
             client.read_exact(&mut init).await.unwrap();
             client.write_all(&FileOffset { offset: 9 }.to_bytes()).await.unwrap(); // past size
@@ -403,7 +422,7 @@ mod tests {
             let (mut client, mut server) = tokio::io::duplex(4096);
 
             // Advertise 1000 bytes but the file holds 10.
-            let up = tokio::spawn(async move { upload(&mut server, 1, file, 1000).await });
+            let up = tokio::spawn(async move { upload(&mut server, 1, file, 1000, &mut |_| {}).await });
             let mut init = [0u8; FileTransferInit::LEN];
             client.read_exact(&mut init).await.unwrap();
             client.write_all(&FileOffset { offset: 0 }.to_bytes()).await.unwrap();
@@ -420,7 +439,7 @@ mod tests {
             let dest = TempPath::new("bad-offset");
             let sink = File::create(&dest.0).await.unwrap();
             let (_client, mut server) = tokio::io::duplex(1024);
-            let result = download(&mut server, 100, 50, sink).await;
+            let result = download(&mut server, 100, 50, sink, &mut |_| {}).await;
             assert!(result.is_err());
         });
     }

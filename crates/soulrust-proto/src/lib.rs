@@ -100,6 +100,7 @@ rust_messenger::messenger_id_enum!(
         RelayDistribSearch = 45,
         DistribSpeedLimits = 46,
         UploadStarted = 47,
+        TransferProgress = 48,
     }
 );
 

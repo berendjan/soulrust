@@ -13,8 +13,8 @@ use crate::config::AppContext;
 use crate::messages::{
     CancelDownload, ConfigChanged, DownloadComplete, DownloadFailed, DownloadQueuePosition,
     HandlerId, HttpHtml, HttpRender, Page, PeerActivity, SearchResultReceived, SessionEvent,
-    SessionEventKind, StartDownload, UpdaterStatus, UpdaterStatusChanged, UploadComplete,
-    UploadFailed, UploadStarted,
+    SessionEventKind, StartDownload, TransferProgress, UpdaterStatus, UpdaterStatusChanged,
+    UploadComplete, UploadFailed, UploadStarted,
 };
 
 const MAX_LOG_LINES: usize = 100;
@@ -64,6 +64,12 @@ struct DownloadEntry {
     username: String,
     filename: String,
     state: DownloadState,
+    /// Bytes received so far / total, for the live progress bar. Transient
+    /// (defaulted for history entries written before this field existed).
+    #[serde(default)]
+    bytes: u64,
+    #[serde(default)]
+    size: u64,
 }
 
 #[derive(PartialEq, serde::Serialize, serde::Deserialize)]
@@ -147,6 +153,8 @@ struct UploadEntry {
     username: String,
     filename: String,
     size: u64,
+    /// Bytes sent so far, for the live progress bar.
+    bytes: u64,
     state: UploadState,
 }
 
@@ -221,6 +229,8 @@ impl Ui {
             username: username.to_owned(),
             filename: filename.to_owned(),
             state,
+            bytes: 0,
+            size: 0,
         });
         if self.downloads.len() > MAX_DOWNLOADS {
             let evict = self
@@ -596,6 +606,7 @@ impl Ui {
                         r#"<span class="pill warn">incomplete</span> <span class="muted">partial file on disk — search and Get again to resume</span>"#.to_string()
                     }
                 };
+                let bar = if active { progress_bar(d.bytes, d.size) } else { String::new() };
                 // In-flight rows can be cancelled (removes the row); at-rest ones can't.
                 let action = if active {
                     format!(
@@ -612,11 +623,12 @@ impl Ui {
                     escape(&d.username)
                 };
                 format!(
-                    r##"<tr><td class="col-file" title="{path}">{file}</td><td class="col-user">{user}</td><td>{status}{action}</td></tr>"##,
+                    r##"<tr><td class="col-file" title="{path}">{file}</td><td class="col-user">{user}</td><td>{status}{bar}{action}</td></tr>"##,
                     path = escape(&d.filename),
                     file = escape(basename(&d.filename)),
                     user = user,
                     status = status,
+                    bar = bar,
                     action = action,
                 )
             })
@@ -660,7 +672,10 @@ impl Ui {
             .rev()
             .map(|u| {
                 let status = match &u.state {
-                    UploadState::Active => r#"<span class="pill ok">uploading…</span>"#.to_string(),
+                    UploadState::Active => format!(
+                        r#"<span class="pill ok">uploading…</span>{bar}"#,
+                        bar = progress_bar(u.bytes, u.size)
+                    ),
                     UploadState::Completed => r#"<span class="pill ok">done</span>"#.to_string(),
                     UploadState::Failed(reason) => format!(
                         r#"<span class="pill warn">failed</span> <span class="muted">{}</span>"#,
@@ -876,6 +891,26 @@ impl traits::core::Handle<DownloadQueuePosition> for Ui {
     }
 }
 
+impl traits::core::Handle<TransferProgress> for Ui {
+    fn handle<W: traits::core::Writer>(&mut self, message: &TransferProgress, _writer: &W) {
+        if message.upload {
+            if let Some(u) = self.uploads.iter_mut().find(|u| {
+                u.state.is_active() && u.username == message.username && u.filename == message.filename
+            }) {
+                u.bytes = message.bytes;
+                if message.size > 0 {
+                    u.size = message.size;
+                }
+            }
+        } else if let Some(d) = self.downloads.iter_mut().find(|d| {
+            d.state.is_active() && d.username == message.username && d.filename == message.filename
+        }) {
+            d.bytes = message.bytes;
+            d.size = message.size;
+        }
+    }
+}
+
 impl traits::core::Handle<UploadStarted> for Ui {
     fn handle<W: traits::core::Writer>(&mut self, message: &UploadStarted, _writer: &W) {
         if self.uploads.len() >= MAX_DOWNLOADS {
@@ -885,6 +920,7 @@ impl traits::core::Handle<UploadStarted> for Ui {
             username: message.username.clone(),
             filename: message.filename.clone(),
             size: message.size,
+            bytes: 0,
             state: UploadState::Active,
         });
     }
@@ -906,6 +942,18 @@ impl traits::core::Handle<UploadFailed> for Ui {
         );
         self.log(format!("upload of {} to {} failed: {}", message.filename, message.username, message.reason));
     }
+}
+
+/// A small inline progress bar + percentage for an in-flight transfer. Empty
+/// when the size isn't known yet (no progress event has arrived).
+fn progress_bar(bytes: u64, size: u64) -> String {
+    if size == 0 {
+        return String::new();
+    }
+    let pct = ((bytes as f64 / size as f64) * 100.0).clamp(0.0, 100.0);
+    format!(
+        r#" <div style="background:var(--muted-2,#e5e1e3);border-radius:4px;height:8px;width:120px;display:inline-block;vertical-align:middle;overflow:hidden"><div style="background:var(--text,#2d2729);height:100%;width:{pct:.0}%"></div></div> <span class="muted">{pct:.0}%</span>"#
+    )
 }
 
 fn escape(text: &str) -> String {
@@ -949,6 +997,8 @@ fn scan_disk_downloads(download_dir: &std::path::Path, incomplete_dir: &std::pat
                 username: String::new(),
                 filename: name,
                 state: DownloadState::Completed(entry.path().display().to_string()),
+                bytes: 0,
+                size: 0,
             });
         }
     }
@@ -960,6 +1010,8 @@ fn scan_disk_downloads(download_dir: &std::path::Path, incomplete_dir: &std::pat
                     username: String::new(),
                     filename: basename,
                     state: DownloadState::Incomplete,
+                    bytes: 0,
+                    size: 0,
                 });
             }
         }

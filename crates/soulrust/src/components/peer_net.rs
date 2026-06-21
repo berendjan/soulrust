@@ -46,8 +46,8 @@ use crate::messages::{
     DownloadFailed, DownloadQueuePosition, HandlerId, IncomingSearch, NetTx, PeerActivity, PeerBrowseConnect,
     DistribSpeedLimits, PeerDistribConnect, PeerDownloadConnect, PeerPierce, PeerPierceDistrib,
     PeerPierceFile, PeerUploadConnect, RelayDistribSearch, ResolveUploadPeer,
-    SearchResultFile, SearchResultReceived, SetExcludedPhrases, UploadComplete, UploadFailed,
-    UploadStarted,
+    SearchResultFile, SearchResultReceived, SetExcludedPhrases, TransferProgress, UploadComplete,
+    UploadFailed, UploadStarted,
 };
 use crate::search_response::{self, SearchFilter};
 use crate::shares::ShareIndex;
@@ -163,6 +163,9 @@ enum PeerCommand {
     /// A connection task received a PlaceInQueueResponse for one of our queued
     /// downloads; forward the position to the UI (the task has no bus Writer).
     QueuePosition { username: String, filename: String, place: u32 },
+    /// Throttled byte-progress for an in-flight transfer, forwarded to the UI
+    /// (connection tasks have no bus Writer, so they route through here).
+    TransferProgress { username: String, filename: String, bytes: u64, size: u64, upload: bool },
     /// A connection task received a filter-passing search result; forward it to
     /// the UI (the task has no bus Writer).
     SearchResult {
@@ -173,6 +176,46 @@ enum PeerCommand {
         in_queue: u32,
         files: Vec<SearchResultFile>,
     },
+}
+
+/// Throttles byte-progress for one transfer down to ~2 emissions/second (so the
+/// bus sees a trickle, never per-byte) and forwards it as a `TransferProgress`
+/// command. Held by a connection task and ticked from the `transfer_io` copy
+/// loop; always emits the final byte so a row reaches 100%.
+struct ProgressReporter {
+    cmd_tx: UnboundedSender<PeerCommand>,
+    username: String,
+    filename: String,
+    size: u64,
+    upload: bool,
+    last: std::time::Instant,
+}
+
+impl ProgressReporter {
+    fn new(
+        cmd_tx: UnboundedSender<PeerCommand>,
+        username: String,
+        filename: String,
+        size: u64,
+        upload: bool,
+    ) -> Self {
+        ProgressReporter { cmd_tx, username, filename, size, upload, last: std::time::Instant::now() }
+    }
+
+    fn report(&mut self, bytes: u64) {
+        let now = std::time::Instant::now();
+        if bytes < self.size && now.duration_since(self.last) < Duration::from_millis(500) {
+            return;
+        }
+        self.last = now;
+        let _ = self.cmd_tx.send(PeerCommand::TransferProgress {
+            username: self.username.clone(),
+            filename: self.filename.clone(),
+            bytes,
+            size: self.size,
+            upload: self.upload,
+        });
+    }
 }
 
 /// Downloads in flight, shared across connections (the negotiation and the file
@@ -984,6 +1027,12 @@ async fn command_loop<W: traits::core::Writer>(
                     &writer,
                 );
             }
+            PeerCommand::TransferProgress { username, filename, bytes, size, upload } => {
+                PeerNet::send(
+                    &TransferProgress { username, filename, bytes, size, upload },
+                    &writer,
+                );
+            }
         }
     }
 }
@@ -1258,7 +1307,9 @@ async fn upload_task<W: traits::core::Writer>(
             .await
             .map_err(|e| format!("open {}: {e}", real_path.display()))?;
         let started = std::time::Instant::now();
-        let sent = transfer_io::upload(&mut stream, token, file, size)
+        let mut rep =
+            ProgressReporter::new(ctx.cmd_tx.clone(), peer.clone(), filename.clone(), size, true);
+        let sent = transfer_io::upload(&mut stream, token, file, size, &mut |b| rep.report(b))
             .await
             .map_err(|e| format!("streaming: {e}"))?;
         // Sample throughput from this transfer (ignore trivially short ones,
@@ -1757,7 +1808,14 @@ where
         };
         if let Some(up) = offered {
             ctx.upload_queue.lock().unwrap().dequeue(up.transfer_id);
-            return serve_upload(stream, up, token, on_activity).await;
+            let mut rep = ProgressReporter::new(
+                ctx.cmd_tx.clone(),
+                up.username.clone(),
+                up.filename.clone(),
+                up.size,
+                true,
+            );
+            return serve_upload(stream, up, token, on_activity, &mut |b| rep.report(b)).await;
         }
         // Unknown token, or a different peer than we negotiated with — drop it.
         return Ok(ConnOutcome::Done);
@@ -1773,7 +1831,23 @@ where
         .incomplete_dir()
         .join(incomplete_name(&active.username, &active.filename, &basename));
 
-    match receive_to_disk(stream, &incomplete, &ctx.download_dir(), &basename, active.size).await {
+    let mut rep = ProgressReporter::new(
+        ctx.cmd_tx.clone(),
+        active.username.clone(),
+        active.filename.clone(),
+        active.size,
+        false,
+    );
+    match receive_to_disk(
+        stream,
+        &incomplete,
+        &ctx.download_dir(),
+        &basename,
+        active.size,
+        &mut |b| rep.report(b),
+    )
+    .await
+    {
         Ok(path) => Ok(ConnOutcome::Downloaded {
             username: active.username,
             filename: active.filename,
@@ -1802,6 +1876,7 @@ async fn serve_upload<S, F>(
     upload: PendingUpload,
     token: u32,
     on_activity: &mut F,
+    progress: &mut (dyn FnMut(u64) + Send),
 ) -> std::io::Result<ConnOutcome>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1818,7 +1893,7 @@ where
             });
         }
     };
-    match transfer_io::stream_from_offset(stream, file, upload.size).await {
+    match transfer_io::stream_from_offset(stream, file, upload.size, progress).await {
         Ok(_) => Ok(ConnOutcome::Uploaded { username: upload.username, filename: upload.filename }),
         Err(err) => Ok(ConnOutcome::UploadFailed {
             username: upload.username,
@@ -1910,6 +1985,7 @@ async fn receive_to_disk<S>(
     download_dir: &Path,
     basename: &str,
     size: u64,
+    progress: &mut (dyn FnMut(u64) + Send),
 ) -> Result<String, String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1932,7 +2008,7 @@ where
         .open(incomplete)
         .await
         .map_err(|e| format!("open {}: {e}", incomplete.display()))?;
-    transfer_io::download(stream, offset, size, file)
+    transfer_io::download(stream, offset, size, file, progress)
         .await
         .map_err(|e| format!("receiving: {e}"))?;
     // Resolve the collision-free destination only now the bytes are on disk.
@@ -2505,7 +2581,7 @@ mod tests {
             let dir2 = dir.clone();
             let size = full.len() as u64;
             let recv = tokio::spawn(async move {
-                receive_to_disk(&mut server, &incomplete, &dir2, "song.mp3", size).await
+                receive_to_disk(&mut server, &incomplete, &dir2, "song.mp3", size, &mut |_| {}).await
             });
 
             // Uploader side: read the resume offset, then stream the remainder.
@@ -2535,7 +2611,7 @@ mod tests {
             let dir2 = dir.clone();
             let fresh = vec![0x42u8; 20];
             let recv = tokio::spawn(async move {
-                receive_to_disk(&mut server, &incomplete, &dir2, "x.bin", 20).await
+                receive_to_disk(&mut server, &incomplete, &dir2, "x.bin", 20, &mut |_| {}).await
             });
 
             let mut off = [0u8; 8];

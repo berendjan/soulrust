@@ -490,6 +490,18 @@ pub struct UploadStarted {
     pub size: u64,
 }
 
+/// peer_net → ui: throttled byte-progress for an in-flight transfer (≈2/sec, so
+/// it stays a trickle on the bus — never per byte). `upload` selects the upload
+/// vs download monitor; correlated to a row by (username, filename).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferProgress {
+    pub username: String,
+    pub filename: String,
+    pub bytes: u64,
+    pub size: u64,
+    pub upload: bool,
+}
+
 /// peer_net → ui: a file was fully uploaded to a peer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadComplete {
@@ -588,6 +600,7 @@ impl_bus_message!(
     ResolveUploadPeer => MessageId::ResolveUploadPeer,
     PeerUploadConnect => MessageId::PeerUploadConnect,
     UploadStarted => MessageId::UploadStarted,
+    TransferProgress => MessageId::TransferProgress,
     UploadComplete => MessageId::UploadComplete,
     UploadFailed => MessageId::UploadFailed,
     PeerDistribConnect => MessageId::PeerDistribConnect,
