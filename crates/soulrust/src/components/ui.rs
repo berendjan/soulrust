@@ -744,8 +744,9 @@ impl traits::core::Handler for Ui {
 
 impl traits::core::Handle<HttpRender> for Ui {
     fn handle<W: traits::core::Writer>(&mut self, message: &HttpRender, writer: &W) {
+        let page = crate::messages::page_from_proto(&message.page);
         // Sort/filter pages mutate view state before rendering.
-        match &message.page {
+        match &page {
             Page::SortSearches { key } => {
                 if let Some(k) = SortKey::parse(key) {
                     self.toggle_sort(k);
@@ -754,7 +755,7 @@ impl traits::core::Handle<HttpRender> for Ui {
             Page::FilterBitrate { min } => self.min_bitrate = *min,
             _ => {}
         }
-        let html = self.render(&message.page);
+        let html = self.render(&page);
         Self::send(&HttpHtml { corr: message.corr, html, ..Default::default() }, writer);
     }
 }

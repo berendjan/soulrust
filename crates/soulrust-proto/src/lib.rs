@@ -201,6 +201,7 @@ impl_bus_buffa!(
     bus::UpdaterStatusChanged => MessageId::UpdaterStatusChanged,
     bus::SetConfigResult => MessageId::SetConfigResult,
     bus::ApplyUpdateResult => MessageId::ApplyUpdateResult,
+    bus::HttpRender => MessageId::HttpRender,
 );
 
 #[cfg(test)]

@@ -18,6 +18,8 @@ use crate::extract::{Job, SearchJob};
 pub use soulrust_proto::{EnumValue, HandlerId, MessageField, MessageId};
 
 // Buffa bus message + enum types migrated from this module.
+pub use soulrust_proto::bus::HttpRender;
+
 pub use soulrust_proto::bus::{
     ApplyUpdateResult, NetConn, NetConnKind, SessionEvent, SessionEventKind, SetConfigResult,
     UpdaterStatusChanged, UpdaterStatusKind,
@@ -52,10 +54,41 @@ pub enum Page {
     FilterBitrate { min: u32 },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HttpRender {
-    pub corr: u64,
-    pub page: Page,
+/// Map the rich `Page` to the flat buffa `Page` carried in `HttpRender`.
+pub fn page_to_proto(p: &Page) -> soulrust_proto::bus::Page {
+    use soulrust_proto::bus::PageKind as K;
+    let (kind, sort_key, min_bitrate) = match p {
+        Page::Index => (K::PageIndex, String::new(), 0),
+        Page::StatusFragment => (K::PageStatusFragment, String::new(), 0),
+        Page::SearchesFragment => (K::PageSearchesFragment, String::new(), 0),
+        Page::ConfigForm => (K::PageConfigForm, String::new(), 0),
+        Page::AccountStatus => (K::PageAccountStatus, String::new(), 0),
+        Page::Downloads => (K::PageDownloads, String::new(), 0),
+        Page::DownloadsFragment => (K::PageDownloadsFragment, String::new(), 0),
+        Page::Uploads => (K::PageUploads, String::new(), 0),
+        Page::UploadsFragment => (K::PageUploadsFragment, String::new(), 0),
+        Page::SortSearches { key } => (K::PageSortSearches, key.clone(), 0),
+        Page::FilterBitrate { min } => (K::PageFilterBitrate, String::new(), *min),
+    };
+    soulrust_proto::bus::Page { kind: kind.into(), sort_key, min_bitrate, ..Default::default() }
+}
+
+/// Reverse of [`page_to_proto`].
+pub fn page_from_proto(p: &soulrust_proto::bus::Page) -> Page {
+    use soulrust_proto::bus::PageKind as K;
+    match p.kind {
+        EnumValue::Known(K::PageStatusFragment) => Page::StatusFragment,
+        EnumValue::Known(K::PageSearchesFragment) => Page::SearchesFragment,
+        EnumValue::Known(K::PageConfigForm) => Page::ConfigForm,
+        EnumValue::Known(K::PageAccountStatus) => Page::AccountStatus,
+        EnumValue::Known(K::PageDownloads) => Page::Downloads,
+        EnumValue::Known(K::PageDownloadsFragment) => Page::DownloadsFragment,
+        EnumValue::Known(K::PageUploads) => Page::Uploads,
+        EnumValue::Known(K::PageUploadsFragment) => Page::UploadsFragment,
+        EnumValue::Known(K::PageSortSearches) => Page::SortSearches { key: p.sort_key.clone() },
+        EnumValue::Known(K::PageFilterBitrate) => Page::FilterBitrate { min: p.min_bitrate },
+        _ => Page::Index,
+    }
 }
 // ---------------------------------------------------------------------------
 // web bridge <-> extractor
@@ -145,7 +178,6 @@ macro_rules! impl_bus_message {
 }
 
 impl_bus_message!(
-    HttpRender => MessageId::HttpRender,
     ExtractResult => MessageId::ExtractResult,
     StartSearch => MessageId::StartSearch,
     ConfigSnapshot => MessageId::ConfigSnapshot,

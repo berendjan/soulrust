@@ -178,7 +178,7 @@ impl<W: traits::core::Writer> SharedBridge<W> {
 
     fn render(&self, page: Page) -> Result<String, String> {
         match self.round_trip(|corr| {
-            WebBridge::send(&HttpRender { corr, page: page.clone() }, &self.writer);
+            WebBridge::send(&HttpRender { corr, page: crate::messages::MessageField::some(crate::messages::page_to_proto(&page)), ..Default::default() }, &self.writer);
         })? {
             BridgeReply::Html(html) => Ok(html),
             _ => Err("unexpected reply type".into()),
