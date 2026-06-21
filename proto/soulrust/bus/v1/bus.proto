@@ -348,3 +348,29 @@ message ApplyUpdateResult {
   uint64 corr = 1;
   optional string error = 2;
 }
+
+// --- Batch 6: search jobs (extract) ----------------------------------------
+
+message SearchJob {
+  optional string artist = 1;
+  optional string title = 2;
+  optional string album = 3;
+  optional string raw_query = 4;
+}
+
+message Job {
+  string source_label = 1;
+  repeated SearchJob searches = 2;
+}
+
+message ExtractResult {
+  uint64 corr = 1;
+  Job job = 2;               // present on success
+  optional string error = 3; // present on failure
+}
+
+message StartSearch {
+  uint64 corr = 1;
+  string source_label = 2;
+  repeated SearchJob jobs = 3;
+}

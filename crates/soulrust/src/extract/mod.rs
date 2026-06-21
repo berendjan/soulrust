@@ -51,6 +51,44 @@ pub struct Job {
     pub searches: Vec<SearchJob>,
 }
 
+// Conversions between these rich types and the buffa bus messages (StartSearch /
+// ExtractResult carry the buffa forms; extraction logic stays on the rich ones).
+use soulrust_proto::bus;
+
+pub fn searchjob_to_proto(s: &SearchJob) -> bus::SearchJob {
+    bus::SearchJob {
+        artist: s.artist.clone(),
+        title: s.title.clone(),
+        album: s.album.clone(),
+        raw_query: s.raw_query.clone(),
+        ..Default::default()
+    }
+}
+
+pub fn searchjob_from_proto(s: &bus::SearchJob) -> SearchJob {
+    SearchJob {
+        artist: s.artist.clone(),
+        title: s.title.clone(),
+        album: s.album.clone(),
+        raw_query: s.raw_query.clone(),
+    }
+}
+
+pub fn job_to_proto(j: &Job) -> bus::Job {
+    bus::Job {
+        source_label: j.source_label.clone(),
+        searches: j.searches.iter().map(searchjob_to_proto).collect(),
+        ..Default::default()
+    }
+}
+
+pub fn job_from_proto(j: &bus::Job) -> Job {
+    Job {
+        source_label: j.source_label.clone(),
+        searches: j.searches.iter().map(searchjob_from_proto).collect(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExtractError {
     EmptyInput,
@@ -145,7 +183,11 @@ impl traits::core::Handle<ExtractRequest> for ExtractorComponent {
             .registry
             .extract(&message.input, &self.config)
             .map_err(|e| e.to_string());
-        Self::send(&ExtractResult { corr: message.corr, result }, writer);
+        let (job, error) = match result {
+            Ok(j) => (soulrust_proto::MessageField::some(job_to_proto(&j)), None),
+            Err(e) => (soulrust_proto::MessageField::none(), Some(e)),
+        };
+        Self::send(&ExtractResult { corr: message.corr, job, error, ..Default::default() }, writer);
     }
 }
 

@@ -110,7 +110,11 @@ impl traits::core::Handle<HttpHtml> for WebBridge {
 
 impl traits::core::Handle<ExtractResult> for WebBridge {
     fn handle<W: traits::core::Writer>(&mut self, message: &ExtractResult, _writer: &W) {
-        self.complete(message.corr, BridgeReply::Extract(message.result.clone()));
+        let result = match &message.error {
+            Some(e) => Err(e.clone()),
+            None => Ok(crate::extract::job_from_proto(&message.job)),
+        };
+        self.complete(message.corr, BridgeReply::Extract(result));
     }
 }
 
@@ -298,7 +302,8 @@ impl<W: traits::core::Writer> SharedBridge<W> {
                 &StartSearch {
                     corr,
                     source_label: job.source_label.clone(),
-                    jobs: job.searches.clone(),
+                    jobs: job.searches.iter().map(crate::extract::searchjob_to_proto).collect(),
+                    ..Default::default()
                 },
                 &self.writer,
             );

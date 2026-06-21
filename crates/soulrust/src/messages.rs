@@ -10,7 +10,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::extract::{Job, SearchJob};
 
 // The bus id registries (`HandlerId`/`MessageId`) live in `soulrust-proto` so
 // the buffa bus-type trait impls there satisfy the orphan rule. Re-exported here
@@ -18,7 +17,7 @@ use crate::extract::{Job, SearchJob};
 pub use soulrust_proto::{EnumValue, HandlerId, MessageField, MessageId};
 
 // Buffa bus message + enum types migrated from this module.
-pub use soulrust_proto::bus::HttpRender;
+pub use soulrust_proto::bus::{ExtractResult, HttpRender, StartSearch};
 
 pub use soulrust_proto::bus::{
     ApplyUpdateResult, NetConn, NetConnKind, SessionEvent, SessionEventKind, SetConfigResult,
@@ -91,22 +90,7 @@ pub fn page_from_proto(p: &soulrust_proto::bus::Page) -> Page {
     }
 }
 // ---------------------------------------------------------------------------
-// web bridge <-> extractor
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExtractResult {
-    pub corr: u64,
-    pub result: Result<Job, String>,
-}
-
-// ---------------------------------------------------------------------------
 // web bridge <-> session
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StartSearch {
-    pub corr: u64,
-    pub source_label: String,
-    pub jobs: Vec<SearchJob>,
-}
 // ---------------------------------------------------------------------------
 // web bridge <-> config store
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,8 +162,6 @@ macro_rules! impl_bus_message {
 }
 
 impl_bus_message!(
-    ExtractResult => MessageId::ExtractResult,
-    StartSearch => MessageId::StartSearch,
     ConfigSnapshot => MessageId::ConfigSnapshot,
     SetConfigReq => MessageId::SetConfigReq,
     ConfigChanged => MessageId::ConfigChanged,
@@ -195,13 +177,13 @@ mod tests {
         let msg = StartSearch {
             corr: 7,
             source_label: "spotify: Test Playlist".into(),
-            jobs: vec![SearchJob {
+            jobs: vec![soulrust_proto::bus::SearchJob {
                 artist: Some("Artist".into()),
                 title: Some("Title".into()),
                 album: None,
                 raw_query: None,
-            }],
-        };
+                ..Default::default()
+            }], ..Default::default() };
         let mut buf = vec![0u8; msg.get_size()];
         msg.write_into(&mut buf);
         let back = StartSearch::deserialize_from(&buf);

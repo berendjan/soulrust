@@ -474,7 +474,7 @@ impl traits::core::Handle<StartSearch> for Session {
 
         let mut started = Vec::new();
         for job in &message.jobs {
-            let query = job.to_query();
+            let query = crate::extract::searchjob_from_proto(job).to_query();
             if query.is_empty() {
                 continue;
             }
@@ -804,7 +804,8 @@ mod tests {
             &StartSearch {
                 corr: 5,
                 source_label: "x".into(),
-                jobs: vec![SearchJob { raw_query: Some("q".into()), ..Default::default() }],
+                jobs: vec![soulrust_proto::bus::SearchJob { raw_query: Some("q".into()), ..Default::default() }],
+                ..Default::default()
             },
             &writer,
         );
@@ -828,13 +829,14 @@ mod tests {
                 corr: 9,
                 source_label: "spotify".into(),
                 jobs: vec![
-                    SearchJob {
+                    soulrust_proto::bus::SearchJob {
                         artist: Some("A".into()),
                         title: Some("One".into()),
                         ..Default::default()
                     },
-                    SearchJob { raw_query: Some("B Two".into()), ..Default::default() },
+                    soulrust_proto::bus::SearchJob { raw_query: Some("B Two".into()), ..Default::default() },
                 ],
+                ..Default::default()
             },
             &writer,
         );
@@ -1287,7 +1289,8 @@ mod tests {
             &StartSearch {
                 corr: 1,
                 source_label: "x".into(),
-                jobs: vec![SearchJob { raw_query: Some("q".into()), ..Default::default() }],
+                jobs: vec![soulrust_proto::bus::SearchJob { raw_query: Some("q".into()), ..Default::default() }],
+                ..Default::default()
             },
             &writer,
         );
