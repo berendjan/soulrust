@@ -117,7 +117,7 @@ mod tests {
     use rust_messenger::traits::extended::ExtendedMessage;
 
     #[test]
-    fn messages_round_trip_through_bincode() {
+    fn messages_round_trip_through_buffa() {
         let msg = StartSearch {
             corr: 7,
             source_label: "spotify: Test Playlist".into(),
