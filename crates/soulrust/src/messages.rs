@@ -425,6 +425,16 @@ pub struct CancelDownload {
     pub filename: String,
 }
 
+/// ui / web bridge → ui + peer_net: pause an active download. Like
+/// [`CancelDownload`] it aborts the transfer in peer_net, but the UI keeps the
+/// row in a `Paused` state (the partial on disk stays), so resuming re-requests
+/// and picks up where it left off.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PauseDownload {
+    pub username: String,
+    pub filename: String,
+}
+
 /// session → peer_net: the resolved address to open a peer connection to and
 /// queue a download. A location, not data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -608,6 +618,7 @@ impl_bus_message!(
     DownloadQueuePosition => MessageId::DownloadQueuePosition,
     SearchResultReceived => MessageId::SearchResultReceived,
     CancelDownload => MessageId::CancelDownload,
+    PauseDownload => MessageId::PauseDownload,
     PeerPierceFile => MessageId::PeerPierceFile,
     PeerPierceDistrib => MessageId::PeerPierceDistrib,
     RelayDistribSearch => MessageId::RelayDistribSearch,

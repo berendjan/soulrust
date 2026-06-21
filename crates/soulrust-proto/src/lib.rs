@@ -101,6 +101,7 @@ rust_messenger::messenger_id_enum!(
         DistribSpeedLimits = 46,
         UploadStarted = 47,
         TransferProgress = 48,
+        PauseDownload = 49,
     }
 );
 

@@ -19,7 +19,7 @@ use crate::config::{AppContext, Config, Control};
 use crate::extract::Job;
 use crate::messages::{
     ApplyUpdateReq, ApplyUpdateResult, BrowseAccepted, BrowseHtml, BrowseRenderReq, BrowseUser,
-    CancelDownload, ConfigSnapshot, ExtractRequest, ExtractResult, GetConfigReq, HandlerId,
+    CancelDownload, ConfigSnapshot, ExtractRequest, ExtractResult, GetConfigReq, HandlerId, PauseDownload,
     HttpHtml, HttpRender, Page, SetConfigReq, SetConfigResult, StartDownload, StartSearch,
     StartSearchResult, StartedSearch,
 };
@@ -227,6 +227,7 @@ impl<W: traits::core::Writer> SharedBridge<W> {
                 ("POST", "/account") => self.html_page(self.save_account(&body)),
                 ("POST", "/download") => self.html_page(self.submit_download(&body)),
                 ("POST", "/download/cancel") => self.html_page(self.cancel_download(&body)),
+                ("POST", "/download/pause") => self.html_page(self.pause_download(&body)),
                 ("POST", "/search") => self.html_page(self.submit_search(&body)),
                 ("POST", "/filter") => self.html_page(self.filter_bitrate(&body)),
                 ("GET", p) if p.starts_with("/sort/") => {
@@ -367,6 +368,18 @@ impl<W: traits::core::Writer> SharedBridge<W> {
             path = escape(&filename),
             size = size,
         ))
+    }
+
+    /// POST /download/pause: pause an active download (abort but keep the
+    /// partial; the UI moves the row to a Paused state with a Resume button on
+    /// the next poll). The active row uses hx-swap="delete", so the body is
+    /// ignored.
+    fn pause_download(&self, body: &str) -> Result<String, String> {
+        let form = parse_form(body);
+        let username = form.get("username").cloned().unwrap_or_default();
+        let filename = form.get("filename").cloned().unwrap_or_default();
+        WebBridge::send(&PauseDownload { username, filename }, &self.writer);
+        Ok(String::new())
     }
 
     /// GET /fragments/browse: render the current browse state (owned by the

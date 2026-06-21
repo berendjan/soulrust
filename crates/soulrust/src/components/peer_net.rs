@@ -45,7 +45,7 @@ use crate::messages::{
     BrowseDir, BrowseFailed, BrowseFile, BrowseListing, CancelDownload, ConfigChanged, DownloadComplete,
     DownloadFailed, DownloadQueuePosition, HandlerId, IncomingSearch, NetTx, PeerActivity, PeerBrowseConnect,
     DistribSpeedLimits, PeerDistribConnect, PeerDownloadConnect, PeerPierce, PeerPierceDistrib,
-    PeerPierceFile, PeerUploadConnect, RelayDistribSearch, ResolveUploadPeer,
+    PauseDownload, PeerPierceFile, PeerUploadConnect, RelayDistribSearch, ResolveUploadPeer,
     SearchResultFile, SearchResultReceived, SetExcludedPhrases, TransferProgress, UploadComplete,
     UploadFailed, UploadStarted,
 };
@@ -653,6 +653,17 @@ impl traits::core::Handle<PeerDownloadConnect> for PeerNet {
 
 impl traits::core::Handle<CancelDownload> for PeerNet {
     fn handle<W: traits::core::Writer>(&mut self, message: &CancelDownload, _writer: &W) {
+        let _ = self.cmd_tx.send(PeerCommand::CancelDownload {
+            username: message.username.clone(),
+            filename: message.filename.clone(),
+        });
+    }
+}
+
+impl traits::core::Handle<PauseDownload> for PeerNet {
+    fn handle<W: traits::core::Writer>(&mut self, message: &PauseDownload, _writer: &W) {
+        // Pause is an abort that keeps the partial — same reactor action as
+        // cancel; the UI is what distinguishes them (it keeps a Paused row).
         let _ = self.cmd_tx.send(PeerCommand::CancelDownload {
             username: message.username.clone(),
             filename: message.filename.clone(),

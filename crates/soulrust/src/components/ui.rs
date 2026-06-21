@@ -12,7 +12,7 @@ use rust_messenger::traits::extended::Sender;
 use crate::config::AppContext;
 use crate::messages::{
     CancelDownload, ConfigChanged, DownloadComplete, DownloadFailed, DownloadQueuePosition,
-    HandlerId, HttpHtml, HttpRender, Page, PeerActivity, SearchResultReceived, SessionEvent,
+    HandlerId, HttpHtml, HttpRender, Page, PauseDownload, PeerActivity, SearchResultReceived, SessionEvent,
     SessionEventKind, StartDownload, TransferProgress, UpdaterStatus, UpdaterStatusChanged,
     UploadComplete, UploadFailed, UploadStarted,
 };
@@ -86,6 +86,9 @@ enum DownloadState {
     Failed(String),
     /// A partial file found on disk at startup (resumable by re-requesting).
     Incomplete,
+    /// Paused by the user: the transfer was aborted but the partial is kept, so
+    /// resuming re-requests and picks up where it left off.
+    Paused,
 }
 
 impl DownloadState {
@@ -605,12 +608,19 @@ impl Ui {
                     DownloadState::Incomplete => {
                         r#"<span class="pill warn">incomplete</span> <span class="muted">partial file on disk — search and Get again to resume</span>"#.to_string()
                     }
+                    DownloadState::Paused => format!(
+                        r##"<span class="pill warn">paused</span> <form hx-post="/download" hx-target="closest tr" hx-swap="outerHTML" style="margin:0;display:inline"><input type="hidden" name="username" value="{user}"><input type="hidden" name="filename" value="{path}"><input type="hidden" name="size" value="{size}"><button class="btn xs" type="submit">resume</button></form>"##,
+                        user = escape(&d.username),
+                        path = escape(&d.filename),
+                        size = d.size,
+                    ),
                 };
                 let bar = if active { progress_bar(d.bytes, d.size) } else { String::new() };
-                // In-flight rows can be cancelled (removes the row); at-rest ones can't.
+                // In-flight rows can be paused (keeps a resumable partial) or
+                // cancelled (drops the row); at-rest ones carry their own action.
                 let action = if active {
                     format!(
-                        r##" <form hx-post="/download/cancel" hx-target="closest tr" hx-swap="delete" style="margin:0;display:inline"><input type="hidden" name="username" value="{user}"><input type="hidden" name="filename" value="{path}"><button class="btn xs secondary" type="submit">cancel</button></form>"##,
+                        r##" <form hx-post="/download/pause" hx-target="closest tr" hx-swap="delete" style="margin:0;display:inline"><input type="hidden" name="username" value="{user}"><input type="hidden" name="filename" value="{path}"><button class="btn xs secondary" type="submit">pause</button></form> <form hx-post="/download/cancel" hx-target="closest tr" hx-swap="delete" style="margin:0;display:inline"><input type="hidden" name="username" value="{user}"><input type="hidden" name="filename" value="{path}"><button class="btn xs secondary" type="submit">cancel</button></form>"##,
                         user = escape(&d.username),
                         path = escape(&d.filename),
                     )
@@ -804,6 +814,15 @@ impl traits::core::Handle<CancelDownload> for Ui {
     fn handle<W: traits::core::Writer>(&mut self, message: &CancelDownload, _writer: &W) {
         self.downloads
             .retain(|d| !(d.username == message.username && d.filename == message.filename));
+        self.save_downloads();
+    }
+}
+
+impl traits::core::Handle<PauseDownload> for Ui {
+    fn handle<W: traits::core::Writer>(&mut self, message: &PauseDownload, _writer: &W) {
+        // Keep the row (unlike cancel) but mark it Paused so it shows a Resume
+        // button; the partial on disk lets a resume pick up where it left off.
+        self.set_download_state(&message.username, &message.filename, DownloadState::Paused);
         self.save_downloads();
     }
 }
