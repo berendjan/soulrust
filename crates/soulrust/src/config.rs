@@ -300,7 +300,7 @@ impl traits::core::Handle<SetConfigReq> for ConfigStore {
             self.current = message.config.clone();
             Self::send(&ConfigChanged { config: self.current.clone() }, writer);
         }
-        Self::send(&SetConfigResult { corr: message.corr, result }, writer);
+        Self::send(&SetConfigResult { corr: message.corr, error: result.err(), ..Default::default() }, writer);
     }
 }
 

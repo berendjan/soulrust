@@ -199,6 +199,8 @@ impl_bus_buffa!(
     bus::NetConn => MessageId::NetConn,
     bus::SessionEvent => MessageId::SessionEvent,
     bus::UpdaterStatusChanged => MessageId::UpdaterStatusChanged,
+    bus::SetConfigResult => MessageId::SetConfigResult,
+    bus::ApplyUpdateResult => MessageId::ApplyUpdateResult,
 );
 
 #[cfg(test)]

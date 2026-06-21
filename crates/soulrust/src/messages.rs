@@ -19,7 +19,8 @@ pub use soulrust_proto::{EnumValue, HandlerId, MessageField, MessageId};
 
 // Buffa bus message + enum types migrated from this module.
 pub use soulrust_proto::bus::{
-    NetConn, NetConnKind, SessionEvent, SessionEventKind, UpdaterStatusChanged, UpdaterStatusKind,
+    ApplyUpdateResult, NetConn, NetConnKind, SessionEvent, SessionEventKind, SetConfigResult,
+    UpdaterStatusChanged, UpdaterStatusKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -86,24 +87,11 @@ pub struct SetConfigReq {
     pub corr: u64,
     pub config: Config,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SetConfigResult {
-    pub corr: u64,
-    pub result: Result<(), String>,
-}
-
 /// Broadcast after a successful SetConfig so components refresh their copy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigChanged {
     pub config: Config,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApplyUpdateResult {
-    pub corr: u64,
-    pub result: Result<(), String>,
-}
-
 // ---------------------------------------------------------------------------
 // peer network edge → ui (serving activity, shown in the log)
 
@@ -162,9 +150,7 @@ impl_bus_message!(
     StartSearch => MessageId::StartSearch,
     ConfigSnapshot => MessageId::ConfigSnapshot,
     SetConfigReq => MessageId::SetConfigReq,
-    SetConfigResult => MessageId::SetConfigResult,
     ConfigChanged => MessageId::ConfigChanged,
-    ApplyUpdateResult => MessageId::ApplyUpdateResult,
 );
 
 #[cfg(test)]

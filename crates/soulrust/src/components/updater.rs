@@ -284,7 +284,7 @@ impl traits::core::Handle<ApplyUpdateReq> for Updater {
                 }
             },
         };
-        Self::send(&ApplyUpdateResult { corr: message.corr, result }, writer);
+        Self::send(&ApplyUpdateResult { corr: message.corr, error: result.err(), ..Default::default() }, writer);
     }
 }
 
@@ -491,6 +491,6 @@ mod tests {
             .map(|(_, buf)| ApplyUpdateResult::deserialize_from(buf))
             .collect();
         assert_eq!(results.len(), 1);
-        assert!(results[0].result.is_err());
+        assert!(results[0].error.is_some());
     }
 }

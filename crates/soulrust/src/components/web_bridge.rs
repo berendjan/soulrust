@@ -131,13 +131,13 @@ impl traits::core::Handle<ConfigSnapshot> for WebBridge {
 
 impl traits::core::Handle<SetConfigResult> for WebBridge {
     fn handle<W: traits::core::Writer>(&mut self, message: &SetConfigResult, _writer: &W) {
-        self.complete(message.corr, BridgeReply::SetConfig(message.result.clone()));
+        self.complete(message.corr, BridgeReply::SetConfig(message.error.clone().map_or(Ok(()), Err)));
     }
 }
 
 impl traits::core::Handle<ApplyUpdateResult> for WebBridge {
     fn handle<W: traits::core::Writer>(&mut self, message: &ApplyUpdateResult, _writer: &W) {
-        self.complete(message.corr, BridgeReply::Apply(message.result.clone()));
+        self.complete(message.corr, BridgeReply::Apply(message.error.clone().map_or(Ok(()), Err)));
     }
 }
 

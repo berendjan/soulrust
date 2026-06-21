@@ -336,3 +336,15 @@ message HttpRender {
   uint64 corr = 1;
   Page page = 2;
 }
+
+// --- Batch 5: Result<(), String> responses (error unset = Ok) --------------
+
+message SetConfigResult {
+  uint64 corr = 1;
+  optional string error = 2;
+}
+
+message ApplyUpdateResult {
+  uint64 corr = 1;
+  optional string error = 2;
+}
