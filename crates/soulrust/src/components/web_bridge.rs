@@ -129,7 +129,7 @@ impl traits::core::Handle<StartSearchResult> for WebBridge {
 
 impl traits::core::Handle<ConfigSnapshot> for WebBridge {
     fn handle<W: traits::core::Writer>(&mut self, message: &ConfigSnapshot, _writer: &W) {
-        self.complete(message.corr, BridgeReply::Config(Box::new(message.config.clone())));
+        self.complete(message.corr, BridgeReply::Config(Box::new(crate::config::config_from_proto(&message.config))));
     }
 }
 
@@ -515,7 +515,7 @@ impl<W: traits::core::Writer> SharedBridge<W> {
         }
 
         let result = match self.round_trip(|corr| {
-            WebBridge::send(&SetConfigReq { corr, config: config.clone() }, &self.writer);
+            WebBridge::send(&SetConfigReq { corr, config: soulrust_proto::MessageField::some(crate::config::config_to_proto(&config)), ..Default::default() }, &self.writer);
         })? {
             BridgeReply::SetConfig(result) => result,
             _ => return Err("unexpected reply type".into()),
@@ -570,7 +570,7 @@ impl<W: traits::core::Writer> SharedBridge<W> {
         }
 
         let result = match self.round_trip(|corr| {
-            WebBridge::send(&SetConfigReq { corr, config: config.clone() }, &self.writer);
+            WebBridge::send(&SetConfigReq { corr, config: soulrust_proto::MessageField::some(crate::config::config_to_proto(&config)), ..Default::default() }, &self.writer);
         })? {
             BridgeReply::SetConfig(result) => result,
             _ => return Err("unexpected reply type".into()),
@@ -611,7 +611,7 @@ impl<W: traits::core::Writer> SharedBridge<W> {
         }
 
         let result = match self.round_trip(|corr| {
-            WebBridge::send(&SetConfigReq { corr, config: config.clone() }, &self.writer);
+            WebBridge::send(&SetConfigReq { corr, config: soulrust_proto::MessageField::some(crate::config::config_to_proto(&config)), ..Default::default() }, &self.writer);
         })? {
             BridgeReply::SetConfig(result) => result,
             _ => return Err("unexpected reply type".into()),

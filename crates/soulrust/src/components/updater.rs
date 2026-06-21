@@ -247,8 +247,9 @@ impl traits::core::Handle<ConfigChanged> for Updater {
         // Pick up update-setting changes live: a later auto_apply flip decides
         // whether a found update applies on its own, and repo/enabled changes
         // take effect on the next check — no restart needed.
-        self.auto_apply = message.config.update.auto_apply;
-        self.update_config = message.config.update.clone();
+        let config = crate::config::config_from_proto(&message.config);
+        self.auto_apply = config.update.auto_apply;
+        self.update_config = config.update.clone();
     }
 }
 
@@ -467,7 +468,7 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.update.auto_apply = true;
         config.update.repo = "owner/newrepo".into();
-        traits::core::Handle::<ConfigChanged>::handle(&mut updater, &ConfigChanged { config }, &writer);
+        traits::core::Handle::<ConfigChanged>::handle(&mut updater, &ConfigChanged { config: soulrust_proto::MessageField::some(crate::config::config_to_proto(&config)), ..Default::default() }, &writer);
 
         assert!(updater.auto_apply, "auto_apply flipped live");
         assert_eq!(updater.update_config.repo, "owner/newrepo", "repo updated live");

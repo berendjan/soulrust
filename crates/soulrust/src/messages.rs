@@ -9,7 +9,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
 
 // The bus id registries (`HandlerId`/`MessageId`) live in `soulrust-proto` so
 // the buffa bus-type trait impls there satisfy the orphan rule. Re-exported here
@@ -17,7 +16,9 @@ use crate::config::Config;
 pub use soulrust_proto::{EnumValue, HandlerId, MessageField, MessageId};
 
 // Buffa bus message + enum types migrated from this module.
-pub use soulrust_proto::bus::{ExtractResult, HttpRender, StartSearch};
+pub use soulrust_proto::bus::{
+    ConfigChanged, ConfigSnapshot, ExtractResult, HttpRender, SetConfigReq, StartSearch,
+};
 
 pub use soulrust_proto::bus::{
     ApplyUpdateResult, NetConn, NetConnKind, SessionEvent, SessionEventKind, SetConfigResult,
@@ -90,26 +91,6 @@ pub fn page_from_proto(p: &soulrust_proto::bus::Page) -> Page {
     }
 }
 // ---------------------------------------------------------------------------
-// web bridge <-> session
-// ---------------------------------------------------------------------------
-// web bridge <-> config store
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConfigSnapshot {
-    pub corr: u64,
-    pub config: Config,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SetConfigReq {
-    pub corr: u64,
-    pub config: Config,
-}
-/// Broadcast after a successful SetConfig so components refresh their copy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConfigChanged {
-    pub config: Config,
-}
-// ---------------------------------------------------------------------------
 // peer network edge → ui (serving activity, shown in the log)
 
 // Buffa bus messages (wire types + bus-trait bridge live in soulrust-proto).
@@ -124,48 +105,11 @@ pub use soulrust_proto::bus::{
     StartSearchResult, StartedSearch, TransferProgress, UpdateDownloaded, UploadComplete, UploadFailed,
     UploadStarted,
 };
-// ---------------------------------------------------------------------------
-// distributed search network
-// ---------------------------------------------------------------------------
-// bus plumbing: Message + ExtendedMessage + deserialize_from for every type
-
-macro_rules! impl_bus_message {
-    ($($type:ty => $id:expr),+ $(,)?) => {
-        $(
-            impl rust_messenger::traits::core::Message for $type {
-                type Id = MessageId;
-                const ID: MessageId = $id;
-            }
-
-            impl $type {
-                pub fn deserialize_from(buffer: &[u8]) -> Self {
-                    bincode::serde::borrow_decode_from_slice(buffer, bincode::config::standard())
-                        .expect("bus message failed to decode; sender/receiver out of sync")
-                        .0
-                }
-            }
-
-            impl rust_messenger::traits::extended::ExtendedMessage for $type {
-                fn get_size(&self) -> usize {
-                    bincode::serde::encode_to_vec(self, bincode::config::standard())
-                        .expect("bus message failed to encode")
-                        .len()
-                }
-
-                fn write_into(&self, buffer: &mut [u8]) {
-                    bincode::serde::encode_into_slice(self, buffer, bincode::config::standard())
-                        .expect("bus message failed to encode");
-                }
-            }
-        )+
-    };
-}
-
-impl_bus_message!(
-    ConfigSnapshot => MessageId::ConfigSnapshot,
-    SetConfigReq => MessageId::SetConfigReq,
-    ConfigChanged => MessageId::ConfigChanged,
-);
+// The whole bus is now buffa-encoded: every message type is generated in
+// soulrust-proto and bridged there via `impl_bus_buffa!`. Nothing in this module
+// is bincode-serialized anymore — `messages.rs` is just re-exports plus the
+// `Page`/`Job`/`Config` <-> proto converters for the few rich types kept on the
+// Rust side.
 
 #[cfg(test)]
 mod tests {

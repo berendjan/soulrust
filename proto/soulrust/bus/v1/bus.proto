@@ -374,3 +374,66 @@ message StartSearch {
   string source_label = 2;
   repeated SearchJob jobs = 3;
 }
+
+// --- Batch 7: the Config trio (mirror of the serde Config; converted at the
+// bus boundary, the Rust Config stays for YAML + field reads). ---------------
+
+message ServerConfig {
+  string host = 1;
+  uint32 port = 2; // u16 in Rust
+  string username = 3;
+  string password = 4;
+  uint32 listen_port = 5;
+}
+
+message SpotifyConfig {
+  optional string client_id = 1;
+  optional string client_secret = 2;
+}
+
+message UpdateConfig {
+  bool enabled = 1;
+  bool auto_apply = 2;
+  string repo = 3;
+}
+
+message UiConfig {
+  string bind_addr = 1;
+}
+
+message SharingConfig {
+  repeated string folders = 1;
+  string download_dir = 2;
+  string incomplete_dir = 3;
+  uint32 upload_slots = 4;
+  bool fifo_queue = 5;
+  bool respond_to_searches = 6;
+  uint32 max_search_results = 7;
+  uint32 min_result_files = 8;
+  uint32 min_peer_upload_speed = 9;
+  uint32 max_peer_queue_length = 10;
+  uint32 max_download_speed = 11;
+  uint32 max_upload_speed = 12;
+}
+
+message Config {
+  ServerConfig server = 1;
+  SpotifyConfig spotify = 2;
+  UpdateConfig update = 3;
+  UiConfig ui = 4;
+  SharingConfig sharing = 5;
+}
+
+message ConfigSnapshot {
+  uint64 corr = 1;
+  Config config = 2;
+}
+
+message SetConfigReq {
+  uint64 corr = 1;
+  Config config = 2;
+}
+
+message ConfigChanged {
+  Config config = 1;
+}

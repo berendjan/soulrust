@@ -204,6 +204,9 @@ impl_bus_buffa!(
     bus::HttpRender => MessageId::HttpRender,
     bus::ExtractResult => MessageId::ExtractResult,
     bus::StartSearch => MessageId::StartSearch,
+    bus::ConfigSnapshot => MessageId::ConfigSnapshot,
+    bus::SetConfigReq => MessageId::SetConfigReq,
+    bus::ConfigChanged => MessageId::ConfigChanged,
 );
 
 #[cfg(test)]

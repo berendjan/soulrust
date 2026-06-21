@@ -618,7 +618,8 @@ impl traits::core::Handle<ConfigChanged> for PeerNet {
         // Apply the search filter / result cap, re-scan shared folders, and
         // update the download dirs live; only listen port + server credentials
         // still need a restart.
-        let s = &message.config.sharing;
+        let cfg = crate::config::config_from_proto(&message.config);
+        let s = &cfg.sharing;
         // Bandwidth caps live in process-global token buckets the transfer tasks
         // read, so apply them directly (a relaxed atomic store) rather than
         // routing through the reactor.
@@ -3345,7 +3346,7 @@ mod tests {
         changed.sharing.download_dir = std::env::temp_dir().join("sr-dl").display().to_string();
         traits::core::Handle::<ConfigChanged>::handle(
             &mut pn,
-            &ConfigChanged { config: changed.clone() },
+            &ConfigChanged { config: soulrust_proto::MessageField::some(crate::config::config_to_proto(&changed)), ..Default::default() },
             &W,
         );
 

@@ -193,7 +193,7 @@ impl traits::core::Handle<ExtractRequest> for ExtractorComponent {
 
 impl traits::core::Handle<ConfigChanged> for ExtractorComponent {
     fn handle<W: traits::core::Writer>(&mut self, message: &ConfigChanged, _writer: &W) {
-        self.config = message.config.clone();
+        self.config = crate::config::config_from_proto(&message.config);
     }
 }
 

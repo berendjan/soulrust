@@ -83,7 +83,8 @@ impl traits::core::Handle<ConfigChanged> for NetEdge {
         // Apply server credential/address changes live: drop any existing
         // connection and reconnect with the new settings (the session updates
         // its login from the same ConfigChanged and re-logs in on Connected).
-        let new_addr = server_addr(&message.config.server);
+        let cfg = crate::config::config_from_proto(&message.config);
+        let new_addr = server_addr(&cfg.server);
         self.disconnect();
         self.server_addr = new_addr.clone();
         match new_addr {

@@ -202,9 +202,10 @@ impl traits::core::Handle<ConfigChanged> for Session {
     fn handle<W: traits::core::Writer>(&mut self, message: &ConfigChanged, _writer: &W) {
         // net_edge reconnects on a config change; refresh the credentials we
         // send on the next login so they take effect without a restart.
-        self.username = message.config.server.username.clone();
-        self.password = message.config.server.password.clone();
-        self.listen_port = message.config.server.listen_port;
+        let config = crate::config::config_from_proto(&message.config);
+        self.username = config.server.username.clone();
+        self.password = config.server.password.clone();
+        self.listen_port = config.server.listen_port;
     }
 }
 

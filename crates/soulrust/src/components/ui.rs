@@ -807,7 +807,7 @@ impl traits::core::Handle<UpdaterStatusChanged> for Ui {
 
 impl traits::core::Handle<ConfigChanged> for Ui {
     fn handle<W: traits::core::Writer>(&mut self, message: &ConfigChanged, _writer: &W) {
-        self.username = message.config.server.username.clone();
+        self.username = crate::config::config_from_proto(&message.config).server.username.clone();
         self.log("configuration updated".into());
     }
 }

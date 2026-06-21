@@ -170,6 +170,91 @@ pub struct Config {
     pub sharing: SharingConfig,
 }
 
+// Conversions between the serde `Config` (used for YAML + field reads) and the
+// buffa `Config` carried by ConfigSnapshot / SetConfigReq / ConfigChanged.
+use soulrust_proto::bus;
+use soulrust_proto::MessageField;
+
+pub fn config_to_proto(c: &Config) -> bus::Config {
+    bus::Config {
+        server: MessageField::some(bus::ServerConfig {
+            host: c.server.host.clone(),
+            port: u32::from(c.server.port),
+            username: c.server.username.clone(),
+            password: c.server.password.clone(),
+            listen_port: c.server.listen_port,
+            ..Default::default()
+        }),
+        spotify: MessageField::some(bus::SpotifyConfig {
+            client_id: c.spotify.client_id.clone(),
+            client_secret: c.spotify.client_secret.clone(),
+            ..Default::default()
+        }),
+        update: MessageField::some(bus::UpdateConfig {
+            enabled: c.update.enabled,
+            auto_apply: c.update.auto_apply,
+            repo: c.update.repo.clone(),
+            ..Default::default()
+        }),
+        ui: MessageField::some(bus::UiConfig {
+            bind_addr: c.ui.bind_addr.clone(),
+            ..Default::default()
+        }),
+        sharing: MessageField::some(bus::SharingConfig {
+            folders: c.sharing.folders.clone(),
+            download_dir: c.sharing.download_dir.clone(),
+            incomplete_dir: c.sharing.incomplete_dir.clone(),
+            upload_slots: c.sharing.upload_slots,
+            fifo_queue: c.sharing.fifo_queue,
+            respond_to_searches: c.sharing.respond_to_searches,
+            max_search_results: c.sharing.max_search_results,
+            min_result_files: c.sharing.min_result_files,
+            min_peer_upload_speed: c.sharing.min_peer_upload_speed,
+            max_peer_queue_length: c.sharing.max_peer_queue_length,
+            max_download_speed: c.sharing.max_download_speed,
+            max_upload_speed: c.sharing.max_upload_speed,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+pub fn config_from_proto(c: &bus::Config) -> Config {
+    Config {
+        server: ServerConfig {
+            host: c.server.host.clone(),
+            port: c.server.port as u16,
+            username: c.server.username.clone(),
+            password: c.server.password.clone(),
+            listen_port: c.server.listen_port,
+        },
+        spotify: SpotifyConfig {
+            client_id: c.spotify.client_id.clone(),
+            client_secret: c.spotify.client_secret.clone(),
+        },
+        update: UpdateConfig {
+            enabled: c.update.enabled,
+            auto_apply: c.update.auto_apply,
+            repo: c.update.repo.clone(),
+        },
+        ui: UiConfig { bind_addr: c.ui.bind_addr.clone() },
+        sharing: SharingConfig {
+            folders: c.sharing.folders.clone(),
+            download_dir: c.sharing.download_dir.clone(),
+            incomplete_dir: c.sharing.incomplete_dir.clone(),
+            upload_slots: c.sharing.upload_slots,
+            fifo_queue: c.sharing.fifo_queue,
+            respond_to_searches: c.sharing.respond_to_searches,
+            max_search_results: c.sharing.max_search_results,
+            min_result_files: c.sharing.min_result_files,
+            min_peer_upload_speed: c.sharing.min_peer_upload_speed,
+            max_peer_queue_length: c.sharing.max_peer_queue_length,
+            max_download_speed: c.sharing.max_download_speed,
+            max_upload_speed: c.sharing.max_upload_speed,
+        },
+    }
+}
+
 /// `$XDG_CONFIG_HOME/soulrust.yaml`, falling back to `~/.config/soulrust.yaml`.
 pub fn default_config_path() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
@@ -286,7 +371,7 @@ impl traits::core::Handler for ConfigStore {
 impl traits::core::Handle<GetConfigReq> for ConfigStore {
     fn handle<W: traits::core::Writer>(&mut self, message: &GetConfigReq, writer: &W) {
         Self::send(
-            &ConfigSnapshot { corr: message.corr, config: self.current.clone() },
+            &ConfigSnapshot { corr: message.corr, config: MessageField::some(config_to_proto(&self.current)), ..Default::default() },
             writer,
         );
     }
@@ -294,11 +379,11 @@ impl traits::core::Handle<GetConfigReq> for ConfigStore {
 
 impl traits::core::Handle<SetConfigReq> for ConfigStore {
     fn handle<W: traits::core::Writer>(&mut self, message: &SetConfigReq, writer: &W) {
-        let result = Self::validate(&message.config)
-            .and_then(|()| save_config(&self.path, &message.config));
+        let config = config_from_proto(&message.config);
+        let result = Self::validate(&config).and_then(|()| save_config(&self.path, &config));
         if result.is_ok() {
-            self.current = message.config.clone();
-            Self::send(&ConfigChanged { config: self.current.clone() }, writer);
+            self.current = config;
+            Self::send(&ConfigChanged { config: MessageField::some(config_to_proto(&self.current)), ..Default::default() }, writer);
         }
         Self::send(&SetConfigResult { corr: message.corr, error: result.err(), ..Default::default() }, writer);
     }
