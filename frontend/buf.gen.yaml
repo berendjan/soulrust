@@ -1,0 +1,9 @@
+# Generates the TypeScript client (messages + service descriptors) from the
+# shared proto schema using protobuf-es v2. Connect-ES v2 reads the service
+# descriptor directly — no separate connect plugin needed.
+version: v2
+plugins:
+  - local: protoc-gen-es
+    out: src/gen
+    opt:
+      - target=ts

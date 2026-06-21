@@ -1,0 +1,12 @@
+# buf module so `buf generate` (TypeScript client codegen) can treat proto/ as
+# the schema root. The Bazel codegen path doesn't use buf; this is for the
+# frontend's connect-es generation.
+version: v2
+modules:
+  - path: .
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - FILE
