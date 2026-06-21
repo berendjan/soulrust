@@ -11,7 +11,7 @@ use rust_messenger::traits::extended::Sender;
 
 use crate::config::AppContext;
 use crate::messages::{
-    CancelDownload, ConfigChanged, DownloadComplete, DownloadFailed, DownloadQueuePosition,
+    CancelDownload, EnumValue, ConfigChanged, DownloadComplete, DownloadFailed, DownloadQueuePosition,
     HandlerId, HttpHtml, HttpRender, Page, PauseDownload, PeerActivity, SearchResultReceived, SessionEvent,
     SessionEventKind, StartDownload, TransferProgress, UpdaterStatus, UpdaterStatusChanged,
     UploadComplete, UploadFailed, UploadStarted,
@@ -756,31 +756,39 @@ impl traits::core::Handle<HttpRender> for Ui {
 
 impl traits::core::Handle<SessionEvent> for Ui {
     fn handle<W: traits::core::Writer>(&mut self, message: &SessionEvent, _writer: &W) {
-        match &message.kind {
-            SessionEventKind::Connecting => self.session = SessionStatus::Connecting,
-            SessionEventKind::LoggedIn { greeting, own_ip } => {
+        match message.kind {
+            EnumValue::Known(SessionEventKind::SessionConnecting) => {
+                self.session = SessionStatus::Connecting
+            }
+            EnumValue::Known(SessionEventKind::SessionLoggedIn) => {
                 self.session = SessionStatus::LoggedIn {
-                    greeting: greeting.clone(),
-                    own_ip: own_ip.clone(),
+                    greeting: message.greeting.clone(),
+                    own_ip: message.own_ip.clone(),
                 };
             }
-            SessionEventKind::LoginFailed { reason } => {
-                self.session = SessionStatus::LoginFailed(reason.clone());
+            EnumValue::Known(SessionEventKind::SessionLoginFailed) => {
+                self.session = SessionStatus::LoginFailed(message.reason.clone());
             }
-            SessionEventKind::Disconnected { reason } => {
-                self.session = SessionStatus::Disconnected(reason.clone());
+            EnumValue::Known(SessionEventKind::SessionDisconnected) => {
+                self.session = SessionStatus::Disconnected(message.reason.clone());
             }
-            SessionEventKind::SearchStarted { token, query } => {
+            EnumValue::Known(SessionEventKind::SessionSearchStarted) => {
                 self.searches.push(SearchRow {
-                    token: *token,
-                    query: query.clone(),
+                    token: message.token,
+                    query: message.query.clone(),
                     results: Vec::new(),
                 });
             }
-            SessionEventKind::SearchBroadcastSeen { username, query } => {
-                self.log(format!("search on the network: {username}: {query}"));
+            EnumValue::Known(SessionEventKind::SessionSearchBroadcastSeen) => {
+                self.log(format!(
+                    "search on the network: {}: {}",
+                    message.username, message.query
+                ));
             }
-            SessionEventKind::ProtocolNote { note } => self.log(note.clone()),
+            EnumValue::Known(SessionEventKind::SessionProtocolNote) => {
+                self.log(message.note.clone())
+            }
+            _ => {}
         }
     }
 }
@@ -1214,7 +1222,53 @@ mod tests {
         Ui::new(&ctx, &NullWriter)
     }
 
+    /// A local rich enum for tests (shadows the flat buffa `SessionEventKind`
+    /// brought in by the glob import) so the assertions below read naturally;
+    /// `apply` maps it to the flat buffa `SessionEvent`.
+    enum SessionEventKind {
+        Connecting,
+        LoggedIn { greeting: String, own_ip: String },
+        LoginFailed { reason: String },
+        SearchStarted { token: u32, query: String },
+        SearchBroadcastSeen { username: String, query: String },
+        Disconnected { reason: String },
+        ProtocolNote { note: String },
+    }
+
     fn apply(ui: &mut Ui, kind: SessionEventKind) {
+        use soulrust_proto::bus::SessionEventKind as K;
+        let ev = match kind {
+            SessionEventKind::Connecting => {
+                SessionEvent { kind: K::SessionConnecting.into(), ..Default::default() }
+            }
+            SessionEventKind::LoggedIn { greeting, own_ip } => SessionEvent {
+                kind: K::SessionLoggedIn.into(),
+                greeting,
+                own_ip,
+                ..Default::default()
+            },
+            SessionEventKind::LoginFailed { reason } => {
+                SessionEvent { kind: K::SessionLoginFailed.into(), reason, ..Default::default() }
+            }
+            SessionEventKind::SearchStarted { token, query } => SessionEvent {
+                kind: K::SessionSearchStarted.into(),
+                token,
+                query,
+                ..Default::default()
+            },
+            SessionEventKind::SearchBroadcastSeen { username, query } => SessionEvent {
+                kind: K::SessionSearchBroadcastSeen.into(),
+                username,
+                query,
+                ..Default::default()
+            },
+            SessionEventKind::Disconnected { reason } => {
+                SessionEvent { kind: K::SessionDisconnected.into(), reason, ..Default::default() }
+            }
+            SessionEventKind::ProtocolNote { note } => {
+                SessionEvent { kind: K::SessionProtocolNote.into(), note, ..Default::default() }
+            }
+        };
         struct NullWriter;
         impl Clone for NullWriter {
             fn clone(&self) -> Self {
@@ -1233,7 +1287,7 @@ mod tests {
             ) {
             }
         }
-        traits::core::Handle::<SessionEvent>::handle(ui, &SessionEvent { kind }, &NullWriter);
+        traits::core::Handle::<SessionEvent>::handle(ui, &ev, &NullWriter);
     }
 
     #[test]

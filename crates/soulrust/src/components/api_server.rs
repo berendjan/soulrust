@@ -21,7 +21,7 @@ use soulrust_proto::api::soulrust::api::v1::{GetStatusRequest, GetStatusResponse
 use soulrust_proto::api_connect::soulrust::api::v1::{StatusService, StatusServiceExt};
 
 use crate::config::AppContext;
-use crate::messages::{HandlerId, SessionEvent, SessionEventKind};
+use crate::messages::{EnumValue, HandlerId, SessionEvent, SessionEventKind};
 
 /// Default address for the Connect API. Distinct from the htmx UI's port so the
 /// two edges can run side by side during the migration.
@@ -73,22 +73,19 @@ impl traits::core::Handler for ApiServer {
 impl traits::core::Handle<SessionEvent> for ApiServer {
     fn handle<W: traits::core::Writer>(&mut self, message: &SessionEvent, _writer: &W) {
         let mut snap = self.snapshot.lock().unwrap();
-        match &message.kind {
-            SessionEventKind::Connecting => {
-                snap.logged_in = false;
-            }
-            SessionEventKind::LoggedIn { greeting, own_ip } => {
+        match message.kind {
+            EnumValue::Known(SessionEventKind::SessionLoggedIn) => {
                 snap.logged_in = true;
-                snap.greeting = greeting.clone();
-                snap.own_ip = own_ip.clone();
+                snap.greeting = message.greeting.clone();
+                snap.own_ip = message.own_ip.clone();
             }
-            SessionEventKind::LoginFailed { .. } | SessionEventKind::Disconnected { .. } => {
+            EnumValue::Known(SessionEventKind::SessionConnecting)
+            | EnumValue::Known(SessionEventKind::SessionLoginFailed)
+            | EnumValue::Known(SessionEventKind::SessionDisconnected) => {
                 snap.logged_in = false;
             }
             // Search/protocol notes don't affect the status view.
-            SessionEventKind::SearchStarted { .. }
-            | SessionEventKind::SearchBroadcastSeen { .. }
-            | SessionEventKind::ProtocolNote { .. } => {}
+            _ => {}
         }
     }
 }

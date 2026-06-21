@@ -20,9 +20,51 @@ use crate::messages::{
     BrowseAccepted, BrowseFailed, BrowseUser, ConfigChanged, DistribSpeedLimits, DownloadFailed,
     EnumValue, HandlerId, IncomingSearch, NetConn, NetConnKind, NetRx, NetTx, PeerBrowseConnect, PeerDistribConnect, PeerDownloadConnect,
     PeerPierce, PeerPierceDistrib, PeerPierceFile, PeerUploadConnect, RelayDistribSearch,
-    ResolveUploadPeer, SessionEvent, SessionEventKind,
+    ResolveUploadPeer, SessionEvent,
     SetExcludedPhrases, StartDownload, StartSearch, StartSearchResult, StartedSearch,
 };
+
+/// Session lifecycle events, kept as a local rich enum for ergonomic emit calls;
+/// `emit` maps each to the flat buffa `SessionEvent` (kind + payload fields).
+#[derive(Debug, PartialEq)]
+enum SessionEventKind {
+    Connecting,
+    LoggedIn { greeting: String, own_ip: String },
+    LoginFailed { reason: String },
+    SearchStarted { token: u32, query: String },
+    SearchBroadcastSeen { username: String, query: String },
+    Disconnected { reason: String },
+    ProtocolNote { note: String },
+}
+
+/// Reverse of [`Session::emit`]'s mapping (buffa `SessionEvent` → the local rich
+/// kind), for tests that assert on event payloads.
+#[cfg(test)]
+fn local_session_kind(ev: &SessionEvent) -> SessionEventKind {
+    use soulrust_proto::bus::SessionEventKind as K;
+    match ev.kind {
+        EnumValue::Known(K::SessionLoggedIn) => {
+            SessionEventKind::LoggedIn { greeting: ev.greeting.clone(), own_ip: ev.own_ip.clone() }
+        }
+        EnumValue::Known(K::SessionLoginFailed) => {
+            SessionEventKind::LoginFailed { reason: ev.reason.clone() }
+        }
+        EnumValue::Known(K::SessionSearchStarted) => {
+            SessionEventKind::SearchStarted { token: ev.token, query: ev.query.clone() }
+        }
+        EnumValue::Known(K::SessionSearchBroadcastSeen) => SessionEventKind::SearchBroadcastSeen {
+            username: ev.username.clone(),
+            query: ev.query.clone(),
+        },
+        EnumValue::Known(K::SessionDisconnected) => {
+            SessionEventKind::Disconnected { reason: ev.reason.clone() }
+        }
+        EnumValue::Known(K::SessionProtocolNote) => {
+            SessionEventKind::ProtocolNote { note: ev.note.clone() }
+        }
+        _ => SessionEventKind::Connecting,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionState {
@@ -85,7 +127,40 @@ impl Session {
     }
 
     fn emit<W: traits::core::Writer>(kind: SessionEventKind, writer: &W) {
-        Self::send(&SessionEvent { kind }, writer);
+        use soulrust_proto::bus::SessionEventKind as K;
+        let ev = match kind {
+            SessionEventKind::Connecting => {
+                SessionEvent { kind: K::SessionConnecting.into(), ..Default::default() }
+            }
+            SessionEventKind::LoggedIn { greeting, own_ip } => SessionEvent {
+                kind: K::SessionLoggedIn.into(),
+                greeting,
+                own_ip,
+                ..Default::default()
+            },
+            SessionEventKind::LoginFailed { reason } => {
+                SessionEvent { kind: K::SessionLoginFailed.into(), reason, ..Default::default() }
+            }
+            SessionEventKind::SearchStarted { token, query } => SessionEvent {
+                kind: K::SessionSearchStarted.into(),
+                token,
+                query,
+                ..Default::default()
+            },
+            SessionEventKind::SearchBroadcastSeen { username, query } => SessionEvent {
+                kind: K::SessionSearchBroadcastSeen.into(),
+                username,
+                query,
+                ..Default::default()
+            },
+            SessionEventKind::Disconnected { reason } => {
+                SessionEvent { kind: K::SessionDisconnected.into(), reason, ..Default::default() }
+            }
+            SessionEventKind::ProtocolNote { note } => {
+                SessionEvent { kind: K::SessionProtocolNote.into(), note, ..Default::default() }
+            }
+        };
+        Self::send(&ev, writer);
     }
 }
 
@@ -548,7 +623,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter(|(id, _)| *id == u16::from(MessageId::SessionEvent))
-                .map(|(_, buf)| SessionEvent::deserialize_from(buf).kind)
+                .map(|(_, buf)| local_session_kind(&SessionEvent::deserialize_from(buf)))
                 .collect()
         }
 

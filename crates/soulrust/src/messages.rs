@@ -18,7 +18,7 @@ use crate::extract::{Job, SearchJob};
 pub use soulrust_proto::{EnumValue, HandlerId, MessageField, MessageId};
 
 // Buffa bus message + enum types migrated from this module.
-pub use soulrust_proto::bus::{NetConn, NetConnKind};
+pub use soulrust_proto::bus::{NetConn, NetConnKind, SessionEvent, SessionEventKind};
 
 // ---------------------------------------------------------------------------
 // web bridge <-> ui
@@ -124,24 +124,6 @@ pub struct ApplyUpdateResult {
 }
 
 // ---------------------------------------------------------------------------
-// session events (broadcast to the UI)
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum SessionEventKind {
-    Connecting,
-    LoggedIn { greeting: String, own_ip: String },
-    LoginFailed { reason: String },
-    SearchStarted { token: u32, query: String },
-    SearchBroadcastSeen { username: String, query: String },
-    Disconnected { reason: String },
-    ProtocolNote { note: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SessionEvent {
-    pub kind: SessionEventKind,
-}
-// ---------------------------------------------------------------------------
 // peer network edge → ui (serving activity, shown in the log)
 
 // Buffa bus messages (wire types + bus-trait bridge live in soulrust-proto).
@@ -203,7 +185,6 @@ impl_bus_message!(
     ConfigChanged => MessageId::ConfigChanged,
     UpdaterStatusChanged => MessageId::UpdaterStatusChanged,
     ApplyUpdateResult => MessageId::ApplyUpdateResult,
-    SessionEvent => MessageId::SessionEvent,
 );
 
 #[cfg(test)]
