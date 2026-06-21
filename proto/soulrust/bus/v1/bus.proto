@@ -253,3 +253,86 @@ message UpdateDownloaded {
   string latest = 1;
   string artifact = 2;
 }
+
+// --- Batch 4: data-carrying enums, flattened to (kind enum + payload fields).
+// Modelled flat rather than as oneof so match/construct sites stay simple. ---
+
+enum NetConnKind {
+  NET_CONN_KIND_UNSPECIFIED = 0;
+  NET_CONN_CONNECTED = 1;
+  NET_CONN_FAILED = 2;
+  NET_CONN_CLOSED = 3;
+}
+
+message NetConn {
+  NetConnKind kind = 1;
+  string reason = 2; // FAILED / CLOSED
+}
+
+enum SessionEventKind {
+  SESSION_EVENT_KIND_UNSPECIFIED = 0;
+  SESSION_CONNECTING = 1;
+  SESSION_LOGGED_IN = 2;
+  SESSION_LOGIN_FAILED = 3;
+  SESSION_SEARCH_STARTED = 4;
+  SESSION_SEARCH_BROADCAST_SEEN = 5;
+  SESSION_DISCONNECTED = 6;
+  SESSION_PROTOCOL_NOTE = 7;
+}
+
+message SessionEvent {
+  SessionEventKind kind = 1;
+  string greeting = 2;   // LOGGED_IN
+  string own_ip = 3;     // LOGGED_IN
+  string reason = 4;     // LOGIN_FAILED / DISCONNECTED
+  uint32 token = 5;      // SEARCH_STARTED
+  string query = 6;      // SEARCH_STARTED / SEARCH_BROADCAST_SEEN
+  string username = 7;   // SEARCH_BROADCAST_SEEN
+  string note = 8;       // PROTOCOL_NOTE
+}
+
+enum UpdaterStatusKind {
+  UPDATER_STATUS_KIND_UNSPECIFIED = 0;
+  UPDATER_CHECKING = 1;
+  UPDATER_UP_TO_DATE = 2;
+  UPDATER_AVAILABLE = 3;
+  UPDATER_DOWNLOADING = 4;
+  UPDATER_READY_TO_APPLY = 5;
+  UPDATER_RESTART_REQUIRED = 6;
+  UPDATER_FAILED = 7;
+  UPDATER_SKIPPED = 8;
+}
+
+message UpdaterStatusChanged {
+  UpdaterStatusKind kind = 1;
+  string current = 2;  // UP_TO_DATE
+  string latest = 3;   // AVAILABLE / DOWNLOADING / READY_TO_APPLY / RESTART_REQUIRED
+  string error = 4;    // FAILED
+  string reason = 5;   // SKIPPED
+}
+
+enum PageKind {
+  PAGE_KIND_UNSPECIFIED = 0;
+  PAGE_INDEX = 1;
+  PAGE_STATUS_FRAGMENT = 2;
+  PAGE_SEARCHES_FRAGMENT = 3;
+  PAGE_CONFIG_FORM = 4;
+  PAGE_ACCOUNT_STATUS = 5;
+  PAGE_DOWNLOADS = 6;
+  PAGE_DOWNLOADS_FRAGMENT = 7;
+  PAGE_UPLOADS = 8;
+  PAGE_UPLOADS_FRAGMENT = 9;
+  PAGE_SORT_SEARCHES = 10;
+  PAGE_FILTER_BITRATE = 11;
+}
+
+message Page {
+  PageKind kind = 1;
+  string sort_key = 2;  // SORT_SEARCHES
+  uint32 min_bitrate = 3; // FILTER_BITRATE
+}
+
+message HttpRender {
+  uint64 corr = 1;
+  Page page = 2;
+}

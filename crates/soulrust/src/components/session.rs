@@ -18,8 +18,7 @@ use soulseek_proto::Reader;
 use crate::config::AppContext;
 use crate::messages::{
     BrowseAccepted, BrowseFailed, BrowseUser, ConfigChanged, DistribSpeedLimits, DownloadFailed,
-    HandlerId, IncomingSearch, NetConn,
-    NetConnEvent, NetRx, NetTx, PeerBrowseConnect, PeerDistribConnect, PeerDownloadConnect,
+    EnumValue, HandlerId, IncomingSearch, NetConn, NetConnKind, NetRx, NetTx, PeerBrowseConnect, PeerDistribConnect, PeerDownloadConnect,
     PeerPierce, PeerPierceDistrib, PeerPierceFile, PeerUploadConnect, RelayDistribSearch,
     ResolveUploadPeer, SessionEvent, SessionEventKind,
     SetExcludedPhrases, StartDownload, StartSearch, StartSearchResult, StartedSearch,
@@ -97,8 +96,8 @@ impl traits::core::Handler for Session {
 
 impl traits::core::Handle<NetConn> for Session {
     fn handle<W: traits::core::Writer>(&mut self, message: &NetConn, writer: &W) {
-        match &message.event {
-            NetConnEvent::Connected => {
+        match message.kind {
+            EnumValue::Known(NetConnKind::NetConnConnected) => {
                 let login = LoginRequest {
                     username: self.username.clone(),
                     password: self.password.clone(),
@@ -109,12 +108,17 @@ impl traits::core::Handle<NetConn> for Session {
                 self.state = SessionState::AwaitingLogin;
                 Self::emit(SessionEventKind::Connecting, writer);
             }
-            NetConnEvent::Failed { reason } | NetConnEvent::Closed { reason } => {
+            EnumValue::Known(NetConnKind::NetConnFailed)
+            | EnumValue::Known(NetConnKind::NetConnClosed) => {
                 self.state = SessionState::Disconnected;
                 // Forget the distributed parent so a reconnect re-adopts one.
                 self.distrib_parent = None;
-                Self::emit(SessionEventKind::Disconnected { reason: reason.clone() }, writer);
+                Self::emit(
+                    SessionEventKind::Disconnected { reason: message.reason.clone() },
+                    writer,
+                );
             }
+            _ => {}
         }
     }
 }
@@ -635,7 +639,7 @@ mod tests {
 
     fn logged_in_session(writer: &CapturingWriter) -> Session {
         let mut session = test_session();
-        session.handle(&NetConn { event: NetConnEvent::Connected }, writer);
+        session.handle(&NetConn { kind: NetConnKind::NetConnConnected.into(), ..Default::default() }, writer);
         session.handle(&NetRx { payload: login_success_payload(), ..Default::default() }, writer);
         session
     }
@@ -664,7 +668,7 @@ mod tests {
     fn connect_sends_byte_exact_login_frame() {
         let writer = CapturingWriter::default();
         let mut session = test_session();
-        session.handle(&NetConn { event: NetConnEvent::Connected }, &writer);
+        session.handle(&NetConn { kind: NetConnKind::NetConnConnected.into(), ..Default::default() }, &writer);
 
         let expected = LoginRequest {
             username: "testuser".into(),
@@ -681,7 +685,7 @@ mod tests {
     fn login_success_sets_wait_port_and_emits_logged_in() {
         let writer = CapturingWriter::default();
         let mut session = test_session();
-        session.handle(&NetConn { event: NetConnEvent::Connected }, &writer);
+        session.handle(&NetConn { kind: NetConnKind::NetConnConnected.into(), ..Default::default() }, &writer);
         session.handle(&NetRx { payload: login_success_payload(), ..Default::default() }, &writer);
 
         let frames = writer.frames();
@@ -703,7 +707,7 @@ mod tests {
         use soulseek_proto::wire::{put_bool, put_string, put_u32};
         let writer = CapturingWriter::default();
         let mut session = test_session();
-        session.handle(&NetConn { event: NetConnEvent::Connected }, &writer);
+        session.handle(&NetConn { kind: NetConnKind::NetConnConnected.into(), ..Default::default() }, &writer);
 
         let mut body = Vec::new();
         put_u32(&mut body, 1);
@@ -741,7 +745,7 @@ mod tests {
     fn search_when_logged_in_sends_one_frame_per_job_with_fresh_tokens() {
         let writer = CapturingWriter::default();
         let mut session = test_session();
-        session.handle(&NetConn { event: NetConnEvent::Connected }, &writer);
+        session.handle(&NetConn { kind: NetConnKind::NetConnConnected.into(), ..Default::default() }, &writer);
         session.handle(&NetRx { payload: login_success_payload(), ..Default::default() }, &writer);
 
         session.handle(
@@ -1197,10 +1201,10 @@ mod tests {
     fn disconnect_resets_state_so_searches_fail_again() {
         let writer = CapturingWriter::default();
         let mut session = test_session();
-        session.handle(&NetConn { event: NetConnEvent::Connected }, &writer);
+        session.handle(&NetConn { kind: NetConnKind::NetConnConnected.into(), ..Default::default() }, &writer);
         session.handle(&NetRx { payload: login_success_payload(), ..Default::default() }, &writer);
         session.handle(
-            &NetConn { event: NetConnEvent::Closed { reason: "eof".into() } },
+            &NetConn { kind: NetConnKind::NetConnClosed.into(), reason: "eof".into(), ..Default::default() },
             &writer,
         );
 

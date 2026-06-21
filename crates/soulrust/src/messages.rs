@@ -15,7 +15,10 @@ use crate::extract::{Job, SearchJob};
 // The bus id registries (`HandlerId`/`MessageId`) live in `soulrust-proto` so
 // the buffa bus-type trait impls there satisfy the orphan rule. Re-exported here
 // to preserve the original `crate::messages::{HandlerId, MessageId}` paths.
-pub use soulrust_proto::{HandlerId, MessageId};
+pub use soulrust_proto::{EnumValue, HandlerId, MessageField, MessageId};
+
+// Buffa bus message + enum types migrated from this module.
+pub use soulrust_proto::bus::{NetConn, NetConnKind};
 
 // ---------------------------------------------------------------------------
 // web bridge <-> ui
@@ -138,17 +141,6 @@ pub enum SessionEventKind {
 pub struct SessionEvent {
     pub kind: SessionEventKind,
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum NetConnEvent {
-    Connected,
-    Failed { reason: String },
-    Closed { reason: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct NetConn {
-    pub event: NetConnEvent,
-}
 // ---------------------------------------------------------------------------
 // peer network edge → ui (serving activity, shown in the log)
 
@@ -212,7 +204,6 @@ impl_bus_message!(
     UpdaterStatusChanged => MessageId::UpdaterStatusChanged,
     ApplyUpdateResult => MessageId::ApplyUpdateResult,
     SessionEvent => MessageId::SessionEvent,
-    NetConn => MessageId::NetConn,
 );
 
 #[cfg(test)]
@@ -244,7 +235,11 @@ mod tests {
     fn decode_tolerates_aligned_tail_padding() {
         // The bus hands deserialize_from a payload padded to usize alignment;
         // trailing zeroes must not break decoding.
-        let msg = NetConn { event: NetConnEvent::Connected };
+        let msg = NetConn {
+            kind: NetConnKind::NetConnFailed.into(),
+            reason: "boom".into(),
+            ..Default::default()
+        };
         let size = msg.get_size();
         let mut buf = vec![0u8; size + 7];
         msg.write_into(&mut buf[..size]);

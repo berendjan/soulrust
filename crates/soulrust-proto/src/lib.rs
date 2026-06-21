@@ -25,6 +25,11 @@ mod bus_gen;
 /// The bus message payloads (package `soulrust.bus.v1`).
 pub use bus_gen::soulrust::bus::v1 as bus;
 
+/// Buffa value wrappers, re-exported so `soulrust` can match generated enum
+/// fields (`EnumValue<Kind>`) and optional sub-messages without depending on
+/// buffa directly.
+pub use buffa::{EnumValue, MessageField};
+
 // --- Public Connect API (soulrust.api.v1) -----------------------------------
 // `api` holds the buffa message types; the connectrpc service stubs in
 // `api_connect` reference them as `crate::api::...` (buffa_module=crate::api).
@@ -191,6 +196,7 @@ impl_bus_buffa!(
     bus::NetRx => MessageId::NetRx,
     bus::NetTx => MessageId::NetTx,
     bus::UpdateDownloaded => MessageId::UpdateDownloaded,
+    bus::NetConn => MessageId::NetConn,
 );
 
 #[cfg(test)]

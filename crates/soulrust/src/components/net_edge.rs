@@ -14,7 +14,7 @@ use socket2::{SockRef, TcpKeepalive};
 use soulseek_proto::frame::split_frame;
 
 use crate::config::AppContext;
-use crate::messages::{ConfigChanged, HandlerId, NetConn, NetConnEvent, NetRx, NetTx};
+use crate::messages::{ConfigChanged, HandlerId, NetConn, NetConnKind, NetRx, NetTx};
 
 fn server_addr(server: &crate::config::ServerConfig) -> Option<String> {
     if server.username.trim().is_empty() {
@@ -69,11 +69,9 @@ impl traits::core::Handler for NetEdge {
         match self.server_addr.clone() {
             Some(addr) => self.start_connector(addr, writer),
             None => Self::send(
-                &NetConn {
-                    event: NetConnEvent::Failed {
+                &net_conn(NetConnEvent::Failed {
                         reason: "no soulseek username configured — set one in Settings".into(),
-                    },
-                },
+                    }),
                 writer,
             ),
         }
@@ -91,11 +89,9 @@ impl traits::core::Handle<ConfigChanged> for NetEdge {
         match new_addr {
             Some(addr) => self.start_connector(addr, writer),
             None => Self::send(
-                &NetConn {
-                    event: NetConnEvent::Failed {
+                &net_conn(NetConnEvent::Failed {
                         reason: "no soulseek username configured — set one in Settings".into(),
-                    },
-                },
+                    }),
                 writer,
             ),
         }
@@ -176,9 +172,31 @@ fn connect_and_read<W: traits::core::Writer>(
     }
 }
 
+/// Connection lifecycle, kept as a local enum for ergonomic construction and
+/// mapped to the flat buffa `NetConn` (kind + reason) at the send boundary.
+enum NetConnEvent {
+    Connected,
+    Failed { reason: String },
+    Closed { reason: String },
+}
+
+fn net_conn(event: NetConnEvent) -> NetConn {
+    match event {
+        NetConnEvent::Connected => {
+            NetConn { kind: NetConnKind::NetConnConnected.into(), ..Default::default() }
+        }
+        NetConnEvent::Failed { reason } => {
+            NetConn { kind: NetConnKind::NetConnFailed.into(), reason, ..Default::default() }
+        }
+        NetConnEvent::Closed { reason } => {
+            NetConn { kind: NetConnKind::NetConnClosed.into(), reason, ..Default::default() }
+        }
+    }
+}
+
 /// Connection-event helper for the reader thread (which has no &self).
 fn send_conn<W: traits::core::Writer>(event: NetConnEvent, writer: &W) {
-    NetEdge::send(&NetConn { event }, writer);
+    NetEdge::send(&net_conn(event), writer);
 }
 
 /// Apply the server-connection socket options (TCP_NODELAY + keepalive),
