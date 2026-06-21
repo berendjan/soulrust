@@ -47,6 +47,7 @@ rust_messenger::messenger_id_enum!(
         PeerEdge = 8,
         Browse = 9,
         PeerNet = 10,
+        ApiServer = 11,
     }
 );
 

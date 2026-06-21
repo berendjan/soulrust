@@ -1,3 +1,4 @@
+pub mod api_server;
 pub mod browse;
 pub mod github;
 pub mod net_edge;

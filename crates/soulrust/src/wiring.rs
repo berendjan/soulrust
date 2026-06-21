@@ -7,6 +7,7 @@
 //! - `ExtractWorker` hosts only the extractor, whose Spotify calls can block
 //!   for seconds — on its own worker they never stall the core handlers.
 
+use crate::components::api_server::ApiServer;
 use crate::components::browse::Browse;
 use crate::components::net_edge::NetEdge;
 use crate::components::peer_net::PeerNet;
@@ -44,6 +45,7 @@ rust_messenger::Messenger! {
             peer_net: PeerNet,
             browse: Browse,
             web_bridge: WebBridge,
+            api_server: ApiServer,
         ]
         routes: [
             // http request -> render / act
@@ -103,7 +105,7 @@ rust_messenger::Messenger! {
             // peer network edge: serving activity -> ui log
             PeerNet, PeerActivity: [ ui ],
             // broadcasts
-            Session, SessionEvent: [ ui ],
+            Session, SessionEvent: [ ui, api_server ],
             ConfigStore, ConfigChanged: [ ui, peer_net, updater, session, net_edge ],
             Updater, UpdaterStatusChanged: [ ui ],
             // updater background thread -> updater (apply decision)

@@ -8,6 +8,12 @@ rust_library(
     ),
     compile_data = glob(["assets/*"]),
     visibility = ["//visibility:public"],
+    # `@proto_deps//:tokio` (the copy axum is built against) is aliased to
+    # `tokio_api` so it coexists with the peer reactor's `@crates//:tokio`
+    # without an extern-name collision. The Connect API edge uses `tokio_api`.
+    aliases = {
+        "@proto_deps//:tokio": "tokio_api",
+    },
     deps = [
         "//crates/soulrust-proto:soulrust_proto",
         "//crates/soulseek-proto:soulseek_proto",
@@ -23,6 +29,10 @@ rust_library(
         "@crates//:tiny_http",
         "@crates//:tokio",
         "@crates//:ureq",
+        "@proto_deps//:axum",
+        "@proto_deps//:connectrpc",
+        "@proto_deps//:tokio",
+        "@proto_deps//:tower-http",
     ],
 )
 

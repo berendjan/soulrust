@@ -52,10 +52,35 @@ crate.spec(
     features = [
         "server",
         "client",
+        "axum",
     ],
 )
 crate.spec(package = "futures", version = "0.3")
+crate.spec(package = "http", version = "1")
 crate.spec(package = "http-body", version = "1")
+crate.spec(
+    package = "axum",
+    version = "0.8",
+    features = [
+        "tokio",
+        "http1",
+    ],
+)
+crate.spec(
+    package = "tower-http",
+    version = "0.6",
+    features = ["cors"],
+)
+crate.spec(
+    package = "tokio",
+    version = "1",
+    features = [
+        "rt-multi-thread",
+        "net",
+        "macros",
+        "sync",
+    ],
+)
 crate.spec(package = "serde", version = "1", features = ["derive"])
 crate.spec(package = "serde_json", version = "1")
 crate.from_specs(
