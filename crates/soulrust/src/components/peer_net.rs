@@ -870,9 +870,9 @@ async fn command_loop<W: traits::core::Writer>(
                 let branch = ctx.branch_snapshot();
                 let accept = ctx.distrib.attached.load(Ordering::Relaxed)
                     && ctx.child_count() < ctx.max_children();
-                PeerNet::send(&NetTx { frame: BranchLevel { level: branch.level }.to_frame() }, &writer);
-                PeerNet::send(&NetTx { frame: BranchRoot { root: branch.root }.to_frame() }, &writer);
-                PeerNet::send(&NetTx { frame: AcceptChildren { accept }.to_frame() }, &writer);
+                PeerNet::send(&NetTx { frame: BranchLevel { level: branch.level }.to_frame(), ..Default::default() }, &writer);
+                PeerNet::send(&NetTx { frame: BranchRoot { root: branch.root }.to_frame(), ..Default::default() }, &writer);
+                PeerNet::send(&NetTx { frame: AcceptChildren { accept }.to_frame(), ..Default::default() }, &writer);
             }
             PeerCommand::StartUpload { username: peer } => {
                 // A downloader approved an upload; ask session to resolve their
@@ -993,7 +993,7 @@ async fn command_loop<W: traits::core::Writer>(
                         username: searcher,
                         connection_type: ConnectionType::Peer,
                     };
-                    PeerNet::send(&NetTx { frame: request.to_frame() }, &writer);
+                    PeerNet::send(&NetTx { frame: request.to_frame(), ..Default::default() }, &writer);
                 });
             }
             PeerCommand::CancelDownload { username, filename } => {

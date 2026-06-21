@@ -105,7 +105,7 @@ impl traits::core::Handle<NetConn> for Session {
                     major_version: MAJOR_VERSION,
                     minor_version: MINOR_VERSION,
                 };
-                Self::send(&NetTx { frame: login.to_frame() }, writer);
+                Self::send(&NetTx { frame: login.to_frame(), ..Default::default() }, writer);
                 self.state = SessionState::AwaitingLogin;
                 Self::emit(SessionEventKind::Connecting, writer);
             }
@@ -154,20 +154,20 @@ impl traits::core::Handle<NetRx> for Session {
                     obfuscation_type: 0,
                     obfuscated_port: 0,
                 };
-                Self::send(&NetTx { frame: wait_port.to_frame() }, writer);
+                Self::send(&NetTx { frame: wait_port.to_frame(), ..Default::default() }, writer);
                 // Join the distributed search tree, in Nicotine+'s order: ask for
                 // a parent (so the server sends PossibleParents and routes
                 // searches to us), declare we're our own root at level 0, and
                 // decline children until we attach to a parent — once peer_net
                 // adopts one it re-advertises AcceptChildren(true) and forwards
                 // searches down to any children that join.
-                Self::send(&NetTx { frame: HaveNoParent { no_parent: true }.to_frame() }, writer);
+                Self::send(&NetTx { frame: HaveNoParent { no_parent: true }.to_frame(), ..Default::default() }, writer);
                 Self::send(
-                    &NetTx { frame: BranchRoot { root: self.username.clone() }.to_frame() },
+                    &NetTx { frame: BranchRoot { root: self.username.clone() }.to_frame(), ..Default::default() },
                     writer,
                 );
-                Self::send(&NetTx { frame: BranchLevel { level: 0 }.to_frame() }, writer);
-                Self::send(&NetTx { frame: AcceptChildren { accept: false }.to_frame() }, writer);
+                Self::send(&NetTx { frame: BranchLevel { level: 0 }.to_frame(), ..Default::default() }, writer);
+                Self::send(&NetTx { frame: AcceptChildren { accept: false }.to_frame(), ..Default::default() }, writer);
                 Self::emit(
                     SessionEventKind::LoggedIn { greeting, own_ip: own_ip.to_string() },
                     writer,
@@ -402,7 +402,7 @@ impl traits::core::Handle<StartSearch> for Session {
             let token = self.next_token;
             self.next_token += 1;
             let request = FileSearchRequest { token, query: query.clone() };
-            Self::send(&NetTx { frame: request.to_frame() }, writer);
+            Self::send(&NetTx { frame: request.to_frame(), ..Default::default() }, writer);
             Self::emit(
                 SessionEventKind::SearchStarted { token, query: query.clone() },
                 writer,
@@ -442,7 +442,7 @@ impl traits::core::Handle<BrowseUser> for Session {
         // Ask the server where this peer lives; the GetPeerAddress response
         // (handled above) opens the peer connection.
         let request = GetPeerAddressRequest { username: username.to_owned() };
-        Self::send(&NetTx { frame: request.to_frame() }, writer);
+        Self::send(&NetTx { frame: request.to_frame(), ..Default::default() }, writer);
         self.pending_browses.insert(username.to_owned());
         Self::send(&BrowseAccepted { corr: message.corr, error: None, ..Default::default() }, writer);
     }
@@ -475,7 +475,7 @@ impl traits::core::Handle<StartDownload> for Session {
         // Resolve the peer's address; the GetPeerAddress response drains the
         // pending download into a PeerDownloadConnect.
         let request = GetPeerAddressRequest { username: username.to_owned() };
-        Self::send(&NetTx { frame: request.to_frame() }, writer);
+        Self::send(&NetTx { frame: request.to_frame(), ..Default::default() }, writer);
         self.pending_downloads.entry(username.to_owned()).or_default().push(PendingDownload {
             filename: message.filename.clone(),
             size: message.size,
@@ -490,7 +490,7 @@ impl traits::core::Handle<ResolveUploadPeer> for Session {
         }
         // Resolve the address; the GetPeerAddress response emits PeerUploadConnect.
         let request = GetPeerAddressRequest { username: message.username.clone() };
-        Self::send(&NetTx { frame: request.to_frame() }, writer);
+        Self::send(&NetTx { frame: request.to_frame(), ..Default::default() }, writer);
         self.pending_upload_resolves.insert(message.username.clone());
     }
 }
@@ -636,7 +636,7 @@ mod tests {
     fn logged_in_session(writer: &CapturingWriter) -> Session {
         let mut session = test_session();
         session.handle(&NetConn { event: NetConnEvent::Connected }, writer);
-        session.handle(&NetRx { payload: login_success_payload() }, writer);
+        session.handle(&NetRx { payload: login_success_payload(), ..Default::default() }, writer);
         session
     }
 
@@ -682,7 +682,7 @@ mod tests {
         let writer = CapturingWriter::default();
         let mut session = test_session();
         session.handle(&NetConn { event: NetConnEvent::Connected }, &writer);
-        session.handle(&NetRx { payload: login_success_payload() }, &writer);
+        session.handle(&NetRx { payload: login_success_payload(), ..Default::default() }, &writer);
 
         let frames = writer.frames();
         // login + wait port + the 4 distributed-tree join messages.
@@ -709,7 +709,7 @@ mod tests {
         put_u32(&mut body, 1);
         put_bool(&mut body, false);
         put_string(&mut body, "INVALIDPASS");
-        session.handle(&NetRx { payload: body }, &writer);
+        session.handle(&NetRx { payload: body, ..Default::default() }, &writer);
 
         assert!(matches!(
             writer.events().last(),
@@ -742,7 +742,7 @@ mod tests {
         let writer = CapturingWriter::default();
         let mut session = test_session();
         session.handle(&NetConn { event: NetConnEvent::Connected }, &writer);
-        session.handle(&NetRx { payload: login_success_payload() }, &writer);
+        session.handle(&NetRx { payload: login_success_payload(), ..Default::default() }, &writer);
 
         session.handle(
             &StartSearch {
@@ -789,7 +789,7 @@ mod tests {
         put_u32(&mut body, 2); // phrase count
         put_string(&mut body, "forbidden");
         put_string(&mut body, "blocked phrase");
-        session.handle(&NetRx { payload: body }, &writer);
+        session.handle(&NetRx { payload: body, ..Default::default() }, &writer);
 
         let forwarded = writer.excluded_phrases();
         assert_eq!(forwarded.len(), 1, "exactly one SetExcludedPhrases is emitted");
@@ -811,11 +811,11 @@ mod tests {
         put_string(&mut body, "bob");
         put_u32(&mut body, 99);
         put_string(&mut body, "some query");
-        session.handle(&NetRx { payload: body }, &writer);
+        session.handle(&NetRx { payload: body, ..Default::default() }, &writer);
 
         let mut unknown = Vec::new();
         put_u32(&mut unknown, 9999);
-        session.handle(&NetRx { payload: unknown }, &writer);
+        session.handle(&NetRx { payload: unknown, ..Default::default() }, &writer);
 
         let events = writer.events();
         assert!(matches!(
@@ -865,7 +865,7 @@ mod tests {
         let mut session = logged_in_session(&writer);
         session.handle(&BrowseUser { corr: 1, username: "alice".into(), ..Default::default() }, &writer);
         session.handle(
-            &NetRx { payload: get_peer_address_payload("alice", Ipv4Addr::new(198, 51, 100, 7), 2234) },
+            &NetRx { payload: get_peer_address_payload("alice", Ipv4Addr::new(198, 51, 100, 7), 2234), ..Default::default() },
             &writer,
         );
 
@@ -883,7 +883,7 @@ mod tests {
         let mut session = logged_in_session(&writer);
         session.handle(&BrowseUser { corr: 1, username: "ghost".into(), ..Default::default() }, &writer);
         session.handle(
-            &NetRx { payload: get_peer_address_payload("ghost", Ipv4Addr::UNSPECIFIED, 0) },
+            &NetRx { payload: get_peer_address_payload("ghost", Ipv4Addr::UNSPECIFIED, 0), ..Default::default() },
             &writer,
         );
 
@@ -899,7 +899,7 @@ mod tests {
         let mut session = logged_in_session(&writer);
         // No pending browse for this user → it should just be a protocol note.
         session.handle(
-            &NetRx { payload: get_peer_address_payload("stranger", Ipv4Addr::new(1, 2, 3, 4), 99) },
+            &NetRx { payload: get_peer_address_payload("stranger", Ipv4Addr::new(1, 2, 3, 4), 99), ..Default::default() },
             &writer,
         );
         assert!(writer.peer_browse_connects().is_empty());
@@ -950,17 +950,17 @@ mod tests {
         };
 
         // Empty list -> no connect.
-        session.handle(&NetRx { payload: parents_payload(&[]) }, &writer);
+        session.handle(&NetRx { payload: parents_payload(&[]), ..Default::default() }, &writer);
         assert!(writer.distrib_connects().is_empty(), "empty PossibleParents adopts nothing");
 
         // First non-empty list -> one connect.
         session.handle(
-            &NetRx { payload: parents_payload(&[("p1", Ipv4Addr::new(10, 0, 0, 1), 1)]) },
+            &NetRx { payload: parents_payload(&[("p1", Ipv4Addr::new(10, 0, 0, 1), 1)]), ..Default::default() },
             &writer,
         );
         // A second message (server resends) -> still only one parent adopted.
         session.handle(
-            &NetRx { payload: parents_payload(&[("p2", Ipv4Addr::new(10, 0, 0, 2), 2)]) },
+            &NetRx { payload: parents_payload(&[("p2", Ipv4Addr::new(10, 0, 0, 2), 2)]), ..Default::default() },
             &writer,
         );
         let connects = writer.distrib_connects();
@@ -983,7 +983,7 @@ mod tests {
         put_string(&mut body, "searcher");
         put_u32(&mut body, 0x4242);
         put_string(&mut body, "distributed query");
-        session.handle(&NetRx { payload: body }, &writer);
+        session.handle(&NetRx { payload: body, ..Default::default() }, &writer);
 
         let searches = writer.relay_distrib_searches();
         assert_eq!(searches.len(), 1, "the embedded distributed search is relayed to peer_net");
@@ -1001,12 +1001,12 @@ mod tests {
         let mut min = Vec::new();
         put_u32(&mut min, 83); // ParentMinSpeed
         put_u32(&mut min, 1000);
-        session.handle(&NetRx { payload: min }, &writer);
+        session.handle(&NetRx { payload: min, ..Default::default() }, &writer);
 
         let mut ratio = Vec::new();
         put_u32(&mut ratio, 84); // ParentSpeedRatio
         put_u32(&mut ratio, 50);
-        session.handle(&NetRx { payload: ratio }, &writer);
+        session.handle(&NetRx { payload: ratio, ..Default::default() }, &writer);
 
         let limits = writer.distrib_speed_limits();
         // Latest carries both values (min arrived first with ratio still 0).
@@ -1026,7 +1026,7 @@ mod tests {
         put_string(&mut body, "parent1");
         put_ipv4(&mut body, Ipv4Addr::new(10, 0, 0, 1));
         put_u32(&mut body, 2234);
-        session.handle(&NetRx { payload: body }, &writer);
+        session.handle(&NetRx { payload: body, ..Default::default() }, &writer);
 
         let connects = writer.distrib_connects();
         assert_eq!(connects.len(), 1);
@@ -1045,7 +1045,7 @@ mod tests {
         put_string(&mut body, "bob");
         put_u32(&mut body, 99);
         put_string(&mut body, "rust album");
-        session.handle(&NetRx { payload: body }, &writer);
+        session.handle(&NetRx { payload: body, ..Default::default() }, &writer);
 
         let searches = writer.incoming_searches();
         assert_eq!(searches.len(), 1);
@@ -1073,7 +1073,7 @@ mod tests {
 
         // The address response drains the pending download into a connect.
         session.handle(
-            &NetRx { payload: get_peer_address_payload("alice", Ipv4Addr::new(198, 51, 100, 7), 2234) },
+            &NetRx { payload: get_peer_address_payload("alice", Ipv4Addr::new(198, 51, 100, 7), 2234), ..Default::default() },
             &writer,
         );
         let connects = writer.download_connects();
@@ -1094,7 +1094,7 @@ mod tests {
             &writer,
         );
         session.handle(
-            &NetRx { payload: get_peer_address_payload("ghost", Ipv4Addr::UNSPECIFIED, 0) },
+            &NetRx { payload: get_peer_address_payload("ghost", Ipv4Addr::UNSPECIFIED, 0), ..Default::default() },
             &writer,
         );
         let failures = writer.download_failures();
@@ -1131,7 +1131,7 @@ mod tests {
         put_bool(&mut body, false); // privileged
         put_u32(&mut body, 0); // obfuscation type
         put_u32(&mut body, 0); // obfuscated port
-        session.handle(&NetRx { payload: body }, &writer);
+        session.handle(&NetRx { payload: body, ..Default::default() }, &writer);
 
         let pierces = writer.pierces();
         assert_eq!(pierces.len(), 1);
@@ -1165,7 +1165,7 @@ mod tests {
         // "not yet handled" — otherwise every firewalled transfer stalls.
         let writer = CapturingWriter::default();
         let mut session = test_session();
-        session.handle(&NetRx { payload: connect_to_peer_payload("dave", "F", 909) }, &writer);
+        session.handle(&NetRx { payload: connect_to_peer_payload("dave", "F", 909), ..Default::default() }, &writer);
 
         let file_pierces = writer.file_pierces();
         assert_eq!(file_pierces.len(), 1, "an F connect-to-peer yields one file pierce");
@@ -1182,7 +1182,7 @@ mod tests {
         // tree with us, so we dial back + pierce, then relay its searches.
         let writer = CapturingWriter::default();
         let mut session = test_session();
-        session.handle(&NetRx { payload: connect_to_peer_payload("eve", "D", 7) }, &writer);
+        session.handle(&NetRx { payload: connect_to_peer_payload("eve", "D", 7), ..Default::default() }, &writer);
 
         let distrib_pierces = writer.distrib_pierces();
         assert_eq!(distrib_pierces.len(), 1, "a D connect-to-peer yields one distrib pierce");
@@ -1198,7 +1198,7 @@ mod tests {
         let writer = CapturingWriter::default();
         let mut session = test_session();
         session.handle(&NetConn { event: NetConnEvent::Connected }, &writer);
-        session.handle(&NetRx { payload: login_success_payload() }, &writer);
+        session.handle(&NetRx { payload: login_success_payload(), ..Default::default() }, &writer);
         session.handle(
             &NetConn { event: NetConnEvent::Closed { reason: "eof".into() } },
             &writer,

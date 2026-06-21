@@ -236,3 +236,20 @@ message PeerDistribConnect {
   string ip = 2;
   uint32 port = 3;
 }
+
+// --- Batch 3: raw frame bytes + the updater artifact path ------------------
+
+message NetRx {
+  bytes payload = 1;
+}
+
+message NetTx {
+  bytes frame = 1;
+}
+
+// `artifact` is a filesystem path (was PathBuf); call sites convert to/from
+// PathBuf via to_string_lossy / PathBuf::from.
+message UpdateDownloaded {
+  string latest = 1;
+  string artifact = 2;
+}

@@ -188,6 +188,9 @@ impl_bus_buffa!(
     bus::PeerDownloadConnect => MessageId::PeerDownloadConnect,
     bus::PeerUploadConnect => MessageId::PeerUploadConnect,
     bus::PeerDistribConnect => MessageId::PeerDistribConnect,
+    bus::NetRx => MessageId::NetRx,
+    bus::NetTx => MessageId::NetTx,
+    bus::UpdateDownloaded => MessageId::UpdateDownloaded,
 );
 
 #[cfg(test)]

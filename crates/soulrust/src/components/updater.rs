@@ -143,7 +143,7 @@ fn run_check<W: traits::core::Writer>(repo: &str, api: &dyn GithubReleases, writ
         return;
     }
 
-    Updater::send(&UpdateDownloaded { latest, artifact }, writer);
+    Updater::send(&UpdateDownloaded { latest, artifact: artifact.to_string_lossy().into_owned(), ..Default::default() }, writer);
 }
 
 fn writable_exe_dir() -> Result<PathBuf, String> {
@@ -178,11 +178,11 @@ impl traits::core::Handle<ConfigChanged> for Updater {
 impl traits::core::Handle<UpdateDownloaded> for Updater {
     fn handle<W: traits::core::Writer>(&mut self, message: &UpdateDownloaded, writer: &W) {
         if !self.auto_apply {
-            self.pending = Some((message.latest.clone(), message.artifact.clone()));
+            self.pending = Some((message.latest.clone(), PathBuf::from(&message.artifact)));
             send_status(UpdaterStatus::ReadyToApply { latest: message.latest.clone() }, writer);
             return;
         }
-        match Self::apply(&message.artifact) {
+        match Self::apply(Path::new(&message.artifact)) {
             Ok(()) => send_status(
                 UpdaterStatus::RestartRequired { latest: message.latest.clone() },
                 writer,
@@ -322,7 +322,7 @@ mod tests {
         let downloaded = writer.downloaded();
         assert_eq!(downloaded.len(), 1);
         assert_eq!(downloaded[0].latest, "9.9.9");
-        assert!(downloaded[0].artifact.exists());
+        assert!(std::path::Path::new(&downloaded[0].artifact).exists());
         std::fs::remove_file(&downloaded[0].artifact).ok();
     }
 
@@ -369,7 +369,7 @@ mod tests {
 
         traits::core::Handle::<UpdateDownloaded>::handle(
             &mut updater,
-            &UpdateDownloaded { latest: "9.9.9".into(), artifact: artifact.clone() },
+            &UpdateDownloaded { latest: "9.9.9".into(), artifact: artifact.to_string_lossy().into_owned(), ..Default::default() },
             &writer,
         );
         assert!(matches!(

@@ -6,7 +6,6 @@
 //! bridge, which holds the reply channel for it (see
 //! [`crate::components::web_bridge`]).
 
-use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -115,14 +114,6 @@ pub enum UpdaterStatus {
 pub struct UpdaterStatusChanged {
     pub status: UpdaterStatus,
 }
-
-/// Sent by the updater's background check thread to itself once a release
-/// asset is fully downloaded; the handler decides whether to apply it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateDownloaded {
-    pub latest: String,
-    pub artifact: PathBuf,
-}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplyUpdateResult {
     pub corr: u64,
@@ -147,24 +138,6 @@ pub enum SessionEventKind {
 pub struct SessionEvent {
     pub kind: SessionEventKind,
 }
-
-// ---------------------------------------------------------------------------
-// network edge <-> session
-
-/// One decoded-frame payload (message code + contents, no length prefix) as
-/// produced by `soulseek_proto::frame::split_frame`. The session decodes it;
-/// the edge only does framing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NetRx {
-    pub payload: Vec<u8>,
-}
-
-/// A complete outgoing wire frame for the server socket.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NetTx {
-    pub frame: Vec<u8>,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum NetConnEvent {
     Connected,
@@ -185,10 +158,11 @@ pub use soulrust_proto::bus::{
     ApplyUpdateReq, BrowseAccepted, BrowseDir, BrowseFailed, BrowseFile, BrowseHtml, BrowseListing,
     BrowseRenderReq, BrowseUser, CancelDownload, DistribSpeedLimits, DownloadComplete,
     DownloadFailed, DownloadQueuePosition, ExtractRequest, GetConfigReq, HttpHtml, IncomingSearch,
-    PauseDownload, PeerActivity, PeerBrowseConnect, PeerDistribConnect, PeerDownloadConnect,
+    NetRx, NetTx, PauseDownload, PeerActivity, PeerBrowseConnect, PeerDistribConnect, PeerDownloadConnect,
     PeerPierce, PeerPierceDistrib, PeerPierceFile, PeerUploadConnect, RelayDistribSearch,
     ResolveUploadPeer, SearchResultFile, SearchResultReceived, SetExcludedPhrases, StartDownload,
-    StartSearchResult, StartedSearch, TransferProgress, UploadComplete, UploadFailed, UploadStarted,
+    StartSearchResult, StartedSearch, TransferProgress, UpdateDownloaded, UploadComplete, UploadFailed,
+    UploadStarted,
 };
 // ---------------------------------------------------------------------------
 // distributed search network
@@ -236,11 +210,8 @@ impl_bus_message!(
     SetConfigResult => MessageId::SetConfigResult,
     ConfigChanged => MessageId::ConfigChanged,
     UpdaterStatusChanged => MessageId::UpdaterStatusChanged,
-    UpdateDownloaded => MessageId::UpdateDownloaded,
     ApplyUpdateResult => MessageId::ApplyUpdateResult,
     SessionEvent => MessageId::SessionEvent,
-    NetRx => MessageId::NetRx,
-    NetTx => MessageId::NetTx,
     NetConn => MessageId::NetConn,
 );
 

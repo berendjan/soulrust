@@ -154,7 +154,7 @@ fn connect_and_read<W: traits::core::Writer>(
                 loop {
                     match split_frame(&pending) {
                         Ok(Some((payload, rest))) => {
-                            NetEdge::send(&NetRx { payload: payload.to_vec() }, writer);
+                            NetEdge::send(&NetRx { payload: payload.to_vec(), ..Default::default() }, writer);
                             pending = rest.to_vec();
                         }
                         Ok(None) => break,
