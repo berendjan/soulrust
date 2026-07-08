@@ -242,6 +242,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # This job has no checkout, so gh can't infer the repo from a local git
+      # remote (it errors "not a git repository"). Point gh at the repo via the
+      # API instead.
+      GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/download-artifact@v4
         with:
