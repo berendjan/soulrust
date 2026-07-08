@@ -788,7 +788,7 @@ impl<W: traits::core::Writer> SharedBridge<W> {
     /// credential form. `banner` is shown after a save.
     fn spotify_page(&self, banner: Option<String>) -> Result<String, String> {
         let config = self.current_config()?;
-        Ok(render_spotify_page(&config, banner))
+        Ok(render_spotify_page(&config, banner, None))
     }
 
     /// POST /spotify: save just the Spotify credentials, then re-render the page.
@@ -811,13 +811,40 @@ impl<W: traits::core::Writer> SharedBridge<W> {
             _ => return Err("unexpected reply type".into()),
         };
 
-        let banner = match &result {
-            Ok(()) => {
-                r#"<div class="banner">Spotify credentials saved — now click <strong>Log in with Spotify</strong> below.</div>"#.to_string()
+        // Save failed at the config layer: nothing to verify, surface the error.
+        if let Err(err) = &result {
+            let banner = format!(r#"<div class="banner error">{}</div>"#, escape(err));
+            return Ok(render_spotify_page(&config, Some(banner), None));
+        }
+
+        // Saved. Immediately exercise the client-credentials flow so the status
+        // reflects whether Spotify actually accepts the keys, not just that
+        // they're non-empty. If either field is blank we skip the network call.
+        let (banner, verified) = match (
+            config.spotify.client_id.as_deref(),
+            config.spotify.client_secret.as_deref(),
+        ) {
+            (Some(id), Some(secret)) if !id.is_empty() && !secret.is_empty() => {
+                match verify_spotify_credentials(id, secret) {
+                    Ok(()) => (
+                        r#"<div class="banner">Spotify credentials saved and verified — now click <strong>Log in with Spotify</strong> below.</div>"#.to_string(),
+                        Some(true),
+                    ),
+                    Err(err) => (
+                        format!(
+                            r#"<div class="banner error">Credentials saved, but Spotify rejected them: {}</div>"#,
+                            escape(&err)
+                        ),
+                        Some(false),
+                    ),
+                }
             }
-            Err(err) => format!(r#"<div class="banner error">{}</div>"#, escape(err)),
+            _ => (
+                r#"<div class="banner">Spotify credentials saved.</div>"#.to_string(),
+                None,
+            ),
         };
-        Ok(render_spotify_page(&config, Some(banner)))
+        Ok(render_spotify_page(&config, Some(banner), verified))
     }
 
     /// The redirect URI registered with Spotify — derived from the UI bind
@@ -964,6 +991,31 @@ impl<W: traits::core::Writer> SharedBridge<W> {
     }
 }
 
+/// Exercise the Spotify client-credentials flow to confirm the keys work.
+/// Returns `Ok(())` when Spotify issues a token, `Err` with the reason
+/// otherwise (bad keys, network failure, …).
+fn verify_spotify_credentials(client_id: &str, client_secret: &str) -> Result<(), String> {
+    // A one-shot client-credentials token request. Done inline rather than via
+    // the `SpotifyApi` trait, which now models the OAuth *user-login* flow
+    // (refresh token) and no longer exposes an app-only token call. Credentials
+    // go in the form body (a supported alternative to the Basic auth header) to
+    // avoid a base64 dependency.
+    let response: serde_json::Value = ureq::post("https://accounts.spotify.com/api/token")
+        .send_form(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+        ])
+        .map_err(|e| format!("token request failed: {e}"))?
+        .into_json()
+        .map_err(|e| format!("token response is not json: {e}"))?;
+    if response["access_token"].as_str().is_some() {
+        Ok(())
+    } else {
+        Err("token response missing access_token".into())
+    }
+}
+
 /// A placeholder of one bullet per character for a configured secret, so the
 /// field shows that something is set without revealing it. `if_unset` is the
 /// hint shown when there's no secret yet. Capped so a long secret can't blow
@@ -1053,9 +1105,15 @@ fn render_bulk_page(config: &Config) -> String {
     shell("soulrust — bulk downloads", "bulk", &config.server.username, &body)
 }
 
-fn render_spotify_page(config: &Config, banner: Option<String>) -> String {
+/// `verified` reflects a just-completed credential check after a save:
+/// `Some(false)` means Spotify rejected the keys — the pill shows "Not
+/// connected" regardless of what's stored. `Some(true)` / `None` (e.g. a plain
+/// GET) fall through to the login-state pill (logged in / not logged in).
+fn render_spotify_page(config: &Config, banner: Option<String>, verified: Option<bool>) -> String {
     let redirect_uri = format!("http://{}/spotify/callback", config.ui.bind_addr);
-    let status = if spotify_logged_in(config) {
+    let status = if verified == Some(false) {
+        r#"<span class="pill warn">● Not connected</span>"#
+    } else if spotify_logged_in(config) {
         r#"<span class="pill ok">● Logged in</span>"#
     } else if spotify_credentials_set(config) {
         r#"<span class="pill warn">● Not logged in</span>"#
@@ -1506,7 +1564,7 @@ mod tests {
 
     #[test]
     fn spotify_page_shows_setup_steps_and_form() {
-        let html = render_spotify_page(&Config::default(), None);
+        let html = render_spotify_page(&Config::default(), None, None);
         assert!(html.contains("developer.spotify.com/dashboard"), "links to the dashboard");
         assert!(html.contains("Create app"), "walks through creating an app");
         assert!(html.contains(r#"name="spotify_client_id""#));
@@ -1520,7 +1578,7 @@ mod tests {
         config.spotify.client_id = Some("pub-id".into());
         config.spotify.client_secret = Some("the-secret".into());
         assert!(spotify_credentials_set(&config) && !spotify_logged_in(&config));
-        let html = render_spotify_page(&config, None);
+        let html = render_spotify_page(&config, None, None);
         // Credentials set but not logged in -> prompts login.
         assert!(html.contains("Not logged in"));
         assert!(html.contains(r#"href="/spotify/login""#), "shows the login button");
@@ -1534,10 +1592,21 @@ mod tests {
         config.spotify.client_id = Some("pub-id".into());
         config.spotify.client_secret = Some("the-secret".into());
         config.spotify.refresh_token = Some("rt".into());
-        let html = render_spotify_page(&config, None);
+        let html = render_spotify_page(&config, None, None);
         assert!(spotify_logged_in(&config) && html.contains("Logged in"));
         // The exact redirect URI the user must register is shown.
         assert!(html.contains("http://127.0.0.1:5030/spotify/callback"));
+    }
+
+    #[test]
+    fn spotify_page_verified_override_beats_credential_presence() {
+        let mut config = Config::default();
+        config.spotify.client_id = Some("pub-id".into());
+        config.spotify.client_secret = Some("the-secret".into());
+        // Credentials are present, but Spotify rejected them on save: the pill
+        // must show "Not connected" rather than trusting mere presence.
+        let html = render_spotify_page(&config, None, Some(false));
+        assert!(html.contains("Not connected"));
     }
 
     #[test]
