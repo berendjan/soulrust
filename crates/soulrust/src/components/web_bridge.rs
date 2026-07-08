@@ -226,6 +226,12 @@ impl<W: traits::core::Writer> SharedBridge<W> {
             self.spotify_callback(request, &url);
             return;
         }
+        // Media streaming needs Range/206 support (custom headers), so it builds
+        // its own response rather than going through the HTML tuple flow.
+        if method.as_str() == "GET" && path == "/media" {
+            self.serve_media(request, &url);
+            return;
+        }
 
         let mut body = String::new();
         let _ = request.as_reader().read_to_string(&mut body);
@@ -269,7 +275,6 @@ impl<W: traits::core::Writer> SharedBridge<W> {
                 ("POST", "/search") => self.html_page(self.submit_search(&body)),
                 ("POST", "/search/close") => self.html_page(self.close_search(&body)),
                 ("POST", "/open") => self.html_page(self.open_path(&body)),
-                ("GET", "/media") => self.serve_media(&url),
                 ("POST", "/filter") => self.html_page(self.filter_bitrate(&body)),
                 ("GET", p) if p.starts_with("/sort/") => {
                     let key = p.trim_start_matches("/sort/").to_string();
@@ -394,13 +399,17 @@ impl<W: traits::core::Writer> SharedBridge<W> {
     }
 
     /// GET /media?path=…: stream a finished audio file for the in-browser mini
-    /// player. Restricted to existing files with a known audio extension so a
-    /// stray request can't read arbitrary files off disk. Serves the whole file
-    /// (no Range), which is fine for typical track sizes.
-    fn serve_media(&self, url: &str) -> (u32, &'static str, Vec<u8>) {
+    /// player, honoring `Range` requests so the browser shows a seekable
+    /// timeline (without Range it renders a non-seekable "live" stream).
+    /// Restricted to existing files with a known audio extension so a stray
+    /// request can't read arbitrary files off disk.
+    fn serve_media(&self, request: tiny_http::Request, url: &str) {
+        let fail = |request: tiny_http::Request, code: u32, msg: &str| {
+            let _ = request.respond(tiny_http::Response::from_string(msg).with_status_code(code));
+        };
         let path = match parse_form(url.split('?').nth(1).unwrap_or("")).get("path") {
             Some(p) if !p.is_empty() => p.clone(),
-            _ => return (400, "text/plain", b"missing path".to_vec()),
+            _ => return fail(request, 400, "missing path"),
         };
         let p = std::path::Path::new(&path);
         let mime = match p.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
@@ -410,15 +419,38 @@ impl<W: traits::core::Writer> SharedBridge<W> {
             Some("m4a") | Some("m4b") | Some("aac") | Some("mp4") => "audio/mp4",
             Some("ogg") | Some("opus") => "audio/ogg",
             Some("aiff") | Some("aif") => "audio/aiff",
-            _ => return (415, "text/plain", b"unsupported media type".to_vec()),
+            _ => return fail(request, 415, "unsupported media type"),
         };
         if !p.is_file() {
-            return (404, "text/plain", b"not found".to_vec());
+            return fail(request, 404, "not found");
         }
-        match std::fs::read(p) {
-            Ok(bytes) => (200, mime, bytes),
-            Err(_) => (500, "text/plain", b"read error".to_vec()),
+        let bytes = match std::fs::read(p) {
+            Ok(b) => b,
+            Err(_) => return fail(request, 500, "read error"),
+        };
+        let total = bytes.len();
+
+        let range = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Range"))
+            .and_then(|h| parse_byte_range(h.value.as_str(), total));
+
+        let (status, start, end) = match range {
+            Some((s, e)) => (206u32, s, e),
+            None => (200u32, 0, total.saturating_sub(1)),
+        };
+        let body = if total == 0 { Vec::new() } else { bytes[start..=end].to_vec() };
+
+        let hdr = |k: &str, v: &str| tiny_http::Header::from_bytes(k.as_bytes(), v.as_bytes()).unwrap();
+        let mut response = tiny_http::Response::from_data(body)
+            .with_status_code(status)
+            .with_header(hdr("Content-Type", mime))
+            .with_header(hdr("Accept-Ranges", "bytes"));
+        if status == 206 {
+            response = response.with_header(hdr("Content-Range", &format!("bytes {start}-{end}/{total}")));
         }
+        let _ = request.respond(response);
     }
 
     /// POST /filter: set the minimum-bitrate filter (kbps; blank/0 clears it)
@@ -1172,6 +1204,44 @@ fn parse_form(body: &str) -> HashMap<String, String> {
         .collect()
 }
 
+/// Parse a single-range HTTP `Range` header (`bytes=start-end`, with either end
+/// optional, or a `bytes=-suffix`) into an inclusive `(start, end)` within a file
+/// of `total` bytes. Returns `None` for absent/unsatisfiable/multi-range values,
+/// in which case the caller serves the whole file (200).
+fn parse_byte_range(header: &str, total: usize) -> Option<(usize, usize)> {
+    if total == 0 {
+        return None;
+    }
+    let spec = header.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        return None; // multi-range not supported
+    }
+    let (start_s, end_s) = spec.split_once('-')?;
+    let (start, end) = if start_s.is_empty() {
+        // Suffix range: the last N bytes.
+        let n: usize = end_s.trim().parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        (total.saturating_sub(n), total - 1)
+    } else {
+        let start: usize = start_s.trim().parse().ok()?;
+        if start >= total {
+            return None;
+        }
+        let end = if end_s.trim().is_empty() {
+            total - 1
+        } else {
+            end_s.trim().parse::<usize>().ok()?.min(total - 1)
+        };
+        (start, end)
+    };
+    if end < start {
+        return None;
+    }
+    Some((start, end))
+}
+
 /// Open `target` (a URL or a local directory) with the OS default handler,
 /// detached. Best-effort: any failure (no opener on a headless box, spawn error)
 /// is ignored so it never breaks the caller.
@@ -1406,6 +1476,18 @@ mod tests {
         assert!(spotify_logged_in(&config) && html.contains("Logged in"));
         // The exact redirect URI the user must register is shown.
         assert!(html.contains("http://127.0.0.1:5030/spotify/callback"));
+    }
+
+    #[test]
+    fn byte_range_parsing() {
+        assert_eq!(parse_byte_range("bytes=0-99", 1000), Some((0, 99)));
+        assert_eq!(parse_byte_range("bytes=100-", 1000), Some((100, 999)));
+        assert_eq!(parse_byte_range("bytes=-200", 1000), Some((800, 999)));
+        assert_eq!(parse_byte_range("bytes=0-99999", 1000), Some((0, 999)), "end clamps to EOF");
+        assert_eq!(parse_byte_range("bytes=2000-", 1000), None, "start past EOF");
+        assert_eq!(parse_byte_range("bytes=0-10,20-30", 1000), None, "multi-range unsupported");
+        assert_eq!(parse_byte_range("bytes=0-99", 0), None, "empty file");
+        assert_eq!(parse_byte_range("nonsense", 1000), None);
     }
 
     #[test]
