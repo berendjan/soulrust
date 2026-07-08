@@ -12,7 +12,7 @@ use rust_messenger::traits::extended::Sender;
 use crate::config::AppContext;
 use crate::messages::{
     CancelDownload, EnumValue, ConfigChanged, DownloadComplete, DownloadFailed, DownloadQueuePosition,
-    HandlerId, HttpHtml, HttpRender, Page, PauseDownload, PeerActivity, SearchResultReceived, SessionEvent,
+    HandlerId, HttpHtml, HttpRender, Page, PauseDownload, PeerActivity, RemoveSearch, SearchResultReceived, SessionEvent,
     SessionEventKind, StartDownload, TransferProgress, UpdaterStatusChanged, UpdaterStatusKind,
     UploadComplete, UploadFailed, UploadStarted,
 };
@@ -339,14 +339,22 @@ impl Ui {
     fn render_index(&self) -> String {
         let body = format!(
             r##"<h1>Search</h1>
-<p class="sub">Search the Soulseek network or browse a user's shared files. For many tracks at once, use <a href="/bulk">Bulk downloads</a>.</p>
+<p class="sub">Search the Soulseek network, or paste a Spotify playlist / album / track link to queue a whole set. Both add to the searches below.</p>
 <div id="status" hx-get="/fragments/status" hx-trigger="load, every 2s"></div>
 <div class="card">
 <form hx-post="/search" hx-target="#searches" hx-swap="innerHTML" style="display:flex; gap:0.5rem; align-items:flex-end;">
   <div style="flex:1"><label for="q" style="margin-top:0">Search</label>
-  <input id="q" type="text" name="input" placeholder="search text, or a spotify playlist / album / track link" autofocus></div>
+  <input id="q" type="text" name="input" placeholder="search text" autofocus></div>
   <button class="btn" type="submit">Search</button>
 </form>
+</div>
+<div class="card">
+<form hx-post="/search" hx-target="#searches" hx-swap="innerHTML" style="display:flex; gap:0.5rem; align-items:flex-end;">
+  <div style="flex:1"><label for="bulk" style="margin-top:0">Bulk (Spotify)</label>
+  <input id="bulk" type="text" name="input" placeholder="https://open.spotify.com/playlist/…"></div>
+  <button class="btn" type="submit">Start searches</button>
+</form>
+<p class="muted" style="margin:0.5rem 0 0">Paste a playlist, album, or track link — needs <a href="/spotify">Spotify connected</a>.</p>
 </div>
 {col_bar}
 <div id="searches" class="results" hx-get="/fragments/searches" hx-trigger="load, every 2s"></div>
@@ -474,7 +482,7 @@ impl Ui {
             Some(DownloadState::Starting) => {
                 cancellable(r#"<span class="pill ok">downloading…</span>"#)
             }
-            Some(DownloadState::Completed(_)) => r#"<span class="pill ok">done</span>"#.into(),
+            Some(DownloadState::Completed(path)) => done_link(path),
             _ => format!(
                 r##"<form hx-post="/download" hx-target="this" hx-swap="outerHTML" style="margin:0"><input type="hidden" name="username" value="{user}"><input type="hidden" name="filename" value="{path}"><input type="hidden" name="size" value="{size}"><button class="btn xs" type="submit">Get</button></form>"##,
                 user = escape(username),
@@ -516,9 +524,10 @@ impl Ui {
         let total_files: usize = s.results.iter().map(|r| r.files.len()).sum();
         if s.results.is_empty() {
             return format!(
-                r#"<div class="card"><h3 style="margin-top:0">{query} <span class="muted">— no results yet</span></h3>{form}</div>"#,
+                r#"<div class="card">{close}<h3 style="margin-top:0">{query} <span class="muted">— no results yet</span></h3>{form}</div>"#,
                 query = escape(&s.query),
                 form = research_form(s.token, &s.query),
+                close = close_button(s.token),
             );
         }
         // Flatten to (peer, file) rows, applying the bitrate filter.
@@ -566,10 +575,11 @@ impl Ui {
             format!("{shown} of {total_files} file(s) — bitrate filter active")
         };
         format!(
-            r##"<div class="card"><h3 style="margin-top:0">{query} <span class="muted">— {count}</span></h3>{form}<div class="results-scroll"><table class="results-table"><thead><tr>{th_user}{th_folder}{th_file}{th_size}{th_bitrate}{th_length}{th_slot}{th_speed}{th_queue}<th class="col-dl"></th></tr></thead><tbody>{body}</tbody></table></div></div>"##,
+            r##"<div class="card">{close}<h3 style="margin-top:0">{query} <span class="muted">— {count}</span></h3>{form}<div class="results-scroll"><table class="results-table"><thead><tr>{th_user}{th_folder}{th_file}{th_size}{th_bitrate}{th_length}{th_slot}{th_speed}{th_queue}<th class="col-dl"></th></tr></thead><tbody>{body}</tbody></table></div></div>"##,
             query = escape(&s.query),
             count = count,
             form = research_form(s.token, &s.query),
+            close = close_button(s.token),
             th_user = self.sort_th("user", "User", false),
             th_folder = self.sort_th("folder", "Folder", false),
             th_file = self.sort_th("file", "File", false),
@@ -609,7 +619,8 @@ impl Ui {
                         r#"<span class="pill ok">downloading…</span>"#.to_string()
                     }
                     DownloadState::Completed(path) => format!(
-                        r#"<span class="pill ok">done</span> <span class="muted">{}</span>"#,
+                        r#"{} <span class="muted">{}</span>"#,
+                        done_link(path),
                         escape(path)
                     ),
                     DownloadState::Failed(reason) => format!(
@@ -908,6 +919,13 @@ impl traits::core::Handle<SearchResultReceived> for Ui {
     }
 }
 
+impl traits::core::Handle<RemoveSearch> for Ui {
+    fn handle<W: traits::core::Writer>(&mut self, message: &RemoveSearch, _writer: &W) {
+        // Close button, or the old card being replaced by a re-search.
+        self.searches.retain(|s| s.token != message.token);
+    }
+}
+
 impl traits::core::Handle<DownloadQueuePosition> for Ui {
     fn handle<W: traits::core::Writer>(&mut self, message: &DownloadQueuePosition, _writer: &W) {
         if message.place == 0 {
@@ -1008,14 +1026,44 @@ fn escape(text: &str) -> String {
 }
 
 /// An editable query box + "Search again" button for one search card. Posts the
-/// (possibly edited) text back through /search, which starts a fresh search.
-/// `hx-preserve` keeps whatever the user has typed across the 2s results poll so
-/// their edit isn't wiped mid-typing; the id is unique per search token.
+/// (possibly edited) text back through /search with `replace_token`, so the
+/// re-search replaces this card instead of adding a new one. `hx-preserve` keeps
+/// whatever the user has typed across the 2s results poll so their edit isn't
+/// wiped mid-typing; the id is unique per search token.
 fn research_form(token: u32, query: &str) -> String {
     format!(
-        r##"<form hx-post="/search" hx-target="closest .results" hx-swap="innerHTML" style="display:flex;gap:0.4rem;align-items:center;margin:0.4rem 0 0.2rem"><input type="text" name="input" id="q-{token}" value="{q}" hx-preserve="true" style="flex:1;min-width:0"><button class="btn xs secondary" type="submit">Search again</button></form>"##,
+        r##"<form hx-post="/search" hx-target="closest .results" hx-swap="innerHTML" style="display:flex;gap:0.4rem;align-items:center;margin:0.4rem 0 0.2rem"><input type="hidden" name="replace_token" value="{token}"><input type="text" name="input" id="q-{token}" value="{q}" hx-preserve="true" style="flex:1;min-width:0"><button class="btn xs secondary" type="submit">Search again</button></form>"##,
         token = token,
         q = escape(query),
+    )
+}
+
+/// The finished-download controls: a ▶ Play button (streams the file into the
+/// sidebar mini player — see app.js) next to a green "done ↗" button that opens
+/// its containing folder. Falls back to a plain pill if the path has no
+/// directory part.
+fn done_link(file_path: &str) -> String {
+    let play = format!(
+        r##"<button class="btn xs" type="button" data-play-path="{f}" data-title="{name}" title="Play">▶</button>"##,
+        f = escape(file_path),
+        name = escape(basename(file_path)),
+    );
+    let dir = dirname(file_path);
+    if dir.is_empty() {
+        return format!(r#"<span class="pill ok">done</span> {play}"#);
+    }
+    format!(
+        r##"<form hx-post="/open" hx-swap="none" style="display:inline;margin:0"><input type="hidden" name="path" value="{dir}"><button class="pill ok" type="submit" title="Open {dir}">done ↗</button></form> {play}"##,
+        dir = escape(dir),
+    )
+}
+
+/// A small ✕ that removes this search card. Deletes the card immediately client
+/// side and tells the app to drop it from state so the 2s poll doesn't re-add it.
+fn close_button(token: u32) -> String {
+    format!(
+        r##"<form hx-post="/search/close" hx-target="closest .card" hx-swap="delete" style="float:right;margin:0"><input type="hidden" name="token" value="{token}"><button class="btn xs secondary" type="submit" title="Close this search">✕</button></form>"##,
+        token = token,
     )
 }
 

@@ -27,3 +27,24 @@
   document.addEventListener("htmx:beforeSwap", function (e) { save(e.target); });
   document.addEventListener("htmx:afterSwap", function (e) { restore(e.target); });
 })();
+
+// Mini player: clicking any [data-play-path] control streams that file into the
+// sidebar <audio> element and plays it in the browser. Delegated on document so
+// it keeps working for buttons rendered by htmx swaps.
+(function () {
+  document.addEventListener("click", function (e) {
+    var el = e.target.closest("[data-play-path]");
+    if (!el) return;
+    e.preventDefault();
+    var player = document.getElementById("player");
+    if (!player) return;
+    var wrap = document.getElementById("player-wrap");
+    var np = document.getElementById("np");
+    var path = el.getAttribute("data-play-path");
+    var title = el.getAttribute("data-title") || "";
+    if (wrap) wrap.hidden = false;
+    if (np) { np.textContent = title; np.title = title; }
+    player.src = "/media?path=" + encodeURIComponent(path);
+    player.play().catch(function () {});
+  });
+})();

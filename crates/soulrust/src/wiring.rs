@@ -26,6 +26,7 @@ use crate::messages::{
     IncomingSearch, NetConn,
     NetRx, NetTx, PeerActivity, PeerBrowseConnect, PeerDownloadConnect, PeerPierce, PeerPierceDistrib,
     PauseDownload, PeerPierceFile, PeerDistribConnect, PeerUploadConnect, RelayDistribSearch,
+    RemoveSearch,
     ResolveUploadPeer,
     SearchResultReceived,
     SetConfigReq,
@@ -87,6 +88,8 @@ rust_messenger::Messenger! {
             Session, PeerPierceDistrib: [ peer_net ],
             // requesting: filtered inbound search results -> ui
             PeerNet, SearchResultReceived: [ ui ],
+            // close a search card / replace it on re-search
+            WebBridge, RemoveSearch: [ ui ],
             // downloads: bridge -> session resolves address -> peer_net -> ui log
             WebBridge, StartDownload: [ session, ui ],
             WebBridge, CancelDownload: [ ui, peer_net ],

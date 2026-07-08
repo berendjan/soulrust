@@ -187,6 +187,12 @@ message SearchResultReceived {
   repeated SearchResultFile files = 6;
 }
 
+// Ask the UI to drop a search card — the per-card close button, and the
+// "search again" flow which removes the old card before starting the new one.
+message RemoveSearch {
+  uint32 token = 1;
+}
+
 // --- Batch 2: peer address (location) messages. `port` is uint32 (proto has no
 // u16); call sites cast to/from u16 at the soulseek-proto boundary. ----------
 

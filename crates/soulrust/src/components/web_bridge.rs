@@ -21,7 +21,7 @@ use crate::extract::Job;
 use crate::messages::{
     ApplyUpdateReq, ApplyUpdateResult, BrowseAccepted, BrowseHtml, BrowseRenderReq, BrowseUser,
     CancelDownload, ConfigSnapshot, ExtractRequest, ExtractResult, GetConfigReq, HandlerId, PauseDownload,
-    HttpHtml, HttpRender, Page, SetConfigReq, SetConfigResult, StartDownload, StartSearch,
+    HttpHtml, HttpRender, Page, RemoveSearch, SetConfigReq, SetConfigResult, StartDownload, StartSearch,
     StartSearchResult, StartedSearch,
 };
 
@@ -94,7 +94,7 @@ impl traits::core::Handler for WebBridge {
         // The server is bound now, so the page is reachable the moment the
         // browser opens. Best-effort: a missing opener (headless box) is ignored.
         if self.open_browser {
-            open_in_browser(&format!("http://{}", self.bind_addr));
+            os_open(&format!("http://{}", self.bind_addr));
         }
 
         for n in 0..HTTP_WORKERS {
@@ -267,6 +267,9 @@ impl<W: traits::core::Writer> SharedBridge<W> {
                 ("POST", "/download/cancel") => self.html_page(self.cancel_download(&body)),
                 ("POST", "/download/pause") => self.html_page(self.pause_download(&body)),
                 ("POST", "/search") => self.html_page(self.submit_search(&body)),
+                ("POST", "/search/close") => self.html_page(self.close_search(&body)),
+                ("POST", "/open") => self.html_page(self.open_path(&body)),
+                ("GET", "/media") => self.serve_media(&url),
                 ("POST", "/filter") => self.html_page(self.filter_bitrate(&body)),
                 ("GET", p) if p.starts_with("/sort/") => {
                     let key = p.trim_start_matches("/sort/").to_string();
@@ -312,6 +315,12 @@ impl<W: traits::core::Writer> SharedBridge<W> {
     fn submit_search(&self, body: &str) -> Result<String, String> {
         let form = parse_form(body);
         let input = form.get("input").cloned().unwrap_or_default();
+        // "Search again" sends the token of the card to replace; we drop it once
+        // the new search has started so the refined one takes its place.
+        let replace_token = form
+            .get("replace_token")
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|t| *t > 0);
 
         let extract = match self.round_trip(|corr| {
             WebBridge::send(&ExtractRequest { corr, input: input.clone(), ..Default::default() }, &self.writer);
@@ -350,14 +359,66 @@ impl<W: traits::core::Writer> SharedBridge<W> {
             (_, Some(error)) => {
                 format!(r#"<div class="banner error">{}</div>"#, escape(&error))
             }
-            (started, None) => format!(
-                r#"<div class="banner">{} — started {} search(es)</div>"#,
-                escape(&job.source_label),
-                started.len()
-            ),
+            (started, None) => {
+                if let Some(token) = replace_token {
+                    WebBridge::send(&RemoveSearch { token, ..Default::default() }, &self.writer);
+                }
+                format!(
+                    r#"<div class="banner">{} — started {} search(es)</div>"#,
+                    escape(&job.source_label),
+                    started.len()
+                )
+            }
         };
         let fragment = self.render(Page::SearchesFragment)?;
         Ok(format!("{banner}{fragment}"))
+    }
+
+    /// POST /search/close: drop a search card from the UI state.
+    fn close_search(&self, body: &str) -> Result<String, String> {
+        if let Some(token) = parse_form(body).get("token").and_then(|v| v.trim().parse::<u32>().ok()) {
+            WebBridge::send(&RemoveSearch { token, ..Default::default() }, &self.writer);
+        }
+        Ok(String::new())
+    }
+
+    /// POST /open: open a local directory in the OS file manager. Only existing
+    /// directories are opened (benign), so a stray request can't launch files.
+    fn open_path(&self, body: &str) -> Result<String, String> {
+        if let Some(path) = parse_form(body).get("path") {
+            if !path.is_empty() && std::path::Path::new(path).is_dir() {
+                os_open(path);
+            }
+        }
+        Ok(String::new())
+    }
+
+    /// GET /media?path=…: stream a finished audio file for the in-browser mini
+    /// player. Restricted to existing files with a known audio extension so a
+    /// stray request can't read arbitrary files off disk. Serves the whole file
+    /// (no Range), which is fine for typical track sizes.
+    fn serve_media(&self, url: &str) -> (u32, &'static str, Vec<u8>) {
+        let path = match parse_form(url.split('?').nth(1).unwrap_or("")).get("path") {
+            Some(p) if !p.is_empty() => p.clone(),
+            _ => return (400, "text/plain", b"missing path".to_vec()),
+        };
+        let p = std::path::Path::new(&path);
+        let mime = match p.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
+            Some("mp3") => "audio/mpeg",
+            Some("flac") => "audio/flac",
+            Some("wav") => "audio/wav",
+            Some("m4a") | Some("m4b") | Some("aac") | Some("mp4") => "audio/mp4",
+            Some("ogg") | Some("opus") => "audio/ogg",
+            Some("aiff") | Some("aif") => "audio/aiff",
+            _ => return (415, "text/plain", b"unsupported media type".to_vec()),
+        };
+        if !p.is_file() {
+            return (404, "text/plain", b"not found".to_vec());
+        }
+        match std::fs::read(p) {
+            Ok(bytes) => (200, mime, bytes),
+            Err(_) => (500, "text/plain", b"read error".to_vec()),
+        }
     }
 
     /// POST /filter: set the minimum-bitrate filter (kbps; blank/0 clears it)
@@ -1039,6 +1100,10 @@ fn render_config_page(config: &Config, banner: Option<String>) -> String {
 </div>
 <p><button class="btn" type="submit">Save</button></p>
 </form>
+<div class="card"><h2 style="margin-top:0">Download folder</h2>
+<p class="muted" style="margin-top:0">Finished downloads land here. <code>{open_path}</code></p>
+<form hx-post="/open" hx-swap="none" style="margin:0"><input type="hidden" name="path" value="{open_path}"><button class="btn secondary" type="submit">Open download folder</button></form>
+</div>
 <div class="card"><h2 style="margin-top:0">Inspect</h2>
 <p class="muted" style="margin-top:0">See the effective configuration as stored YAML (the password and Spotify secret are hidden).</p>
 <button class="btn secondary" hx-get="/config/view" hx-target="#config-view" hx-swap="innerHTML">View config</button>
@@ -1071,6 +1136,7 @@ fn render_config_page(config: &Config, banner: Option<String>) -> String {
         max_queue = config.sharing.max_peer_queue_length,
         max_down = config.sharing.max_download_speed,
         max_up = config.sharing.max_upload_speed,
+        open_path = escape(&config.sharing.download_path().display().to_string()),
     );
     shell("soulrust — settings", "config", &config.server.username, &body)
 }
@@ -1106,26 +1172,27 @@ fn parse_form(body: &str) -> HashMap<String, String> {
         .collect()
 }
 
-/// Open `url` in the OS default browser, detached. Best-effort: any failure
-/// (no opener on a headless box, spawn error) is ignored so startup never fails.
-fn open_in_browser(url: &str) {
+/// Open `target` (a URL or a local directory) with the OS default handler,
+/// detached. Best-effort: any failure (no opener on a headless box, spawn error)
+/// is ignored so it never breaks the caller.
+fn os_open(target: &str) {
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut c = std::process::Command::new("open");
-        c.arg(url);
+        c.arg(target);
         c
     };
     #[cfg(target_os = "windows")]
     let mut command = {
         // `start` is a cmd builtin; the empty "" is its window-title argument.
         let mut c = std::process::Command::new("cmd");
-        c.args(["/C", "start", "", url]);
+        c.args(["/C", "start", "", target]);
         c
     };
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let mut command = {
         let mut c = std::process::Command::new("xdg-open");
-        c.arg(url);
+        c.arg(target);
         c
     };
     let _ = command.spawn();
@@ -1218,7 +1285,7 @@ mod tests {
         assert!(!html.contains("sssh"));
         assert!(html.contains("server.slsknet.org"));
         // Shares the themed shell + nav.
-        assert!(html.contains(r#"href="/bulk""#) && html.contains(r#"href="/spotify""#));
+        assert!(html.contains(r#"href="/""#) && html.contains(r#"href="/spotify""#));
     }
 
     #[test]

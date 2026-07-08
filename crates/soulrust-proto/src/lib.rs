@@ -107,6 +107,7 @@ rust_messenger::messenger_id_enum!(
         UploadStarted = 47,
         TransferProgress = 48,
         PauseDownload = 49,
+        RemoveSearch = 50,
     }
 );
 
@@ -250,6 +251,7 @@ impl_bus_buffa!(
     bus::ConfigSnapshot => MessageId::ConfigSnapshot,
     bus::SetConfigReq => MessageId::SetConfigReq,
     bus::ConfigChanged => MessageId::ConfigChanged,
+    bus::RemoveSearch => MessageId::RemoveSearch,
 );
 
 #[cfg(test)]
