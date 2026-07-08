@@ -340,9 +340,15 @@ impl SpotifyExtractor {
                 // A later page failed after we already have some tracks: keep them.
                 Err(_) => break,
             };
-            for item in page["items"].as_array().into_iter().flatten() {
-                // Playlist items wrap the track; local files have track: null.
-                let track = &item["track"];
+            for entry in page["items"].as_array().into_iter().flatten() {
+                // The /items endpoint nests the track (or episode) under `item`;
+                // the older /tracks endpoint used `track`. Accept either. Local
+                // files have a null item/track.
+                let track = if entry["item"].is_object() {
+                    &entry["item"]
+                } else {
+                    &entry["track"]
+                };
                 if track.is_object() {
                     if let Some(job) = Self::track_job(track, None) {
                         searches.push(job);
@@ -545,16 +551,17 @@ mod tests {
             (
                 "https://api.spotify.com/v1/playlists/pl/items?limit=50",
                 json!({
+                    // The /items endpoint nests the track under `item`.
                     "items": [
-                        { "track": track("X", "First") },
-                        { "track": null }
+                        { "item": track("X", "First") },
+                        { "item": null }
                     ],
                     "next": "https://api.spotify.com/v1/playlists/pl/items?limit=50&offset=50"
                 }),
             ),
             (
                 "https://api.spotify.com/v1/playlists/pl/items?limit=50&offset=50",
-                json!({ "items": [{ "track": track("Y", "Second") }], "next": null }),
+                json!({ "items": [{ "item": track("Y", "Second") }], "next": null }),
             ),
         ]);
         let extractor = SpotifyExtractor::new(Box::new(api));
