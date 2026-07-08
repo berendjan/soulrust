@@ -252,6 +252,9 @@ impl<W: traits::core::Writer> SharedBridge<W> {
                     self.html_page(self.render(Page::SearchesFragment))
                 }
                 ("GET", "/fragments/browse") => self.html_page(self.browse_fragment()),
+                ("GET", "/fragments/spotify-status") => {
+                    self.html_page(self.spotify_status_fragment())
+                }
                 ("GET", "/fragments/account-status") => {
                     self.html_page(self.render(Page::AccountStatus))
                 }
@@ -739,6 +742,15 @@ impl<W: traits::core::Writer> SharedBridge<W> {
         Ok(render_bulk_page(&config))
     }
 
+    /// GET /fragments/spotify-status: the live connection hint under the bulk
+    /// input on the index page. Green pill once logged in, otherwise the amber
+    /// "needs Spotify connected" prompt. Polled by htmx so it flips the moment
+    /// the OAuth login completes, no page reload.
+    fn spotify_status_fragment(&self) -> Result<String, String> {
+        let config = self.current_config()?;
+        Ok(render_spotify_status_hint(&config))
+    }
+
     /// GET /spotify: how to connect Spotify (create an app, get keys) plus the
     /// credential form. `banner` is shown after a save.
     fn spotify_page(&self, banner: Option<String>) -> Result<String, String> {
@@ -960,6 +972,19 @@ fn spotify_status_card(config: &Config) -> String {
         r#"<div class="card"><span class="pill warn">● Spotify not connected</span>
 <a class="btn spotify" style="margin-left:0.6rem" href="/spotify">Set up Spotify</a>
 <p class="muted" style="margin:0.6rem 0 0">Connect Spotify to paste playlist, album, and track links.</p></div>"#
+            .to_string()
+    }
+}
+
+/// The compact connection hint shown under the bulk input on the index page.
+/// Once logged in it's a green "Spotify connected" pill; otherwise it's the
+/// prompt to go connect one.
+fn render_spotify_status_hint(config: &Config) -> String {
+    if spotify_logged_in(config) {
+        r#"<p style="margin:0.5rem 0 0"><span class="pill ok">● Spotify connected</span></p>"#
+            .to_string()
+    } else {
+        r#"<p class="muted" style="margin:0.5rem 0 0">Paste a playlist, album, or track link — needs <a href="/spotify">Spotify connected</a>.</p>"#
             .to_string()
     }
 }

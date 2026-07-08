@@ -354,7 +354,7 @@ impl Ui {
   <input id="bulk" type="text" name="input" placeholder="https://open.spotify.com/playlist/…"></div>
   <button class="btn" type="submit">Start searches</button>
 </form>
-<p class="muted" style="margin:0.5rem 0 0">Paste a playlist, album, or track link — needs <a href="/spotify">Spotify connected</a>.</p>
+<div hx-get="/fragments/spotify-status" hx-trigger="load, every 2s"></div>
 </div>
 {col_bar}
 <div id="searches" class="results" hx-get="/fragments/searches" hx-trigger="load, every 2s"></div>
