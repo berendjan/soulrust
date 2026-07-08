@@ -144,7 +144,7 @@ enum PeerCommand {
     /// relay the peer's distributed searches.
     PierceDistrib { username: String, ip: String, port: u16, token: u32 },
     IncomingSearch { username: String, token: u32, query: String },
-    Download { username: String, ip: String, port: u16, filename: String, size: u64 },
+    Download { username: String, ip: String, port: u16, filename: String, size: u64, subdir: String, prefix: String },
     /// Drop a pending/active download so it is no longer accepted or continued.
     CancelDownload { username: String, filename: String },
     /// A downloader approved an upload we offered; ask session to resolve their
@@ -241,19 +241,33 @@ impl ProgressReporter {
 /// keyed by user+file and the active transfer keyed by token.
 #[derive(Default)]
 struct Downloads {
-    /// (username, filename) -> expected size, set when we send `QueueUpload`,
-    /// matched when the uploader's `TransferRequest` arrives.
-    pending: HashMap<(String, String), u64>,
+    /// (username, filename) -> the queued download, set when we send
+    /// `QueueUpload`, matched when the uploader's `TransferRequest` arrives.
+    pending: HashMap<(String, String), PendingDownload>,
     /// transfer token -> the download to write, set when we accept a
     /// `TransferRequest`, matched when the `F`-connection's `FileTransferInit`
     /// arrives.
     by_token: HashMap<u32, ActiveDownload>,
 }
 
+/// A download we've queued but not yet received: the size we recorded (trusted
+/// over the uploader's claim) plus the "organize" destination hints.
+#[derive(Default)]
+struct PendingDownload {
+    size: u64,
+    /// Destination subfolder under the download dir (empty = none).
+    subdir: String,
+    /// Filename prefix, e.g. a zero-padded track number (empty = none).
+    prefix: String,
+}
+
 struct ActiveDownload {
     username: String,
     filename: String,
     size: u64,
+    /// "Organize" destination hints carried from the download request.
+    subdir: String,
+    prefix: String,
 }
 
 /// Uploads we have offered, keyed by the transfer token we minted. Marked
@@ -666,6 +680,8 @@ impl traits::core::Handle<PeerDownloadConnect> for PeerNet {
             port: message.port as u16,
             filename: message.filename.clone(),
             size: message.size,
+            subdir: message.subdir.clone(),
+            prefix: message.prefix.clone(),
         });
     }
 }
@@ -878,10 +894,10 @@ async fn command_loop<W: traits::core::Writer>(
                 let ctx = ctx.clone();
                 tokio::spawn(pierce_distrib_task(ip, port, token, peer, ctx));
             }
-            PeerCommand::Download { username: peer, ip, port, filename, size } => {
+            PeerCommand::Download { username: peer, ip, port, filename, size, subdir, prefix } => {
                 let ctx = ctx.clone();
                 let writer = writer.clone();
-                tokio::spawn(download_init_task(ip, port, peer, filename, size, ctx, writer));
+                tokio::spawn(download_init_task(ip, port, peer, filename, size, subdir, prefix, ctx, writer));
             }
             PeerCommand::DistribConnect { username: peer, ip, port } => {
                 let ctx = ctx.clone();
@@ -1241,6 +1257,8 @@ async fn download_init_task<W: traits::core::Writer>(
     peer: String,
     filename: String,
     size: u64,
+    subdir: String,
+    prefix: String,
     ctx: Arc<ConnCtx>,
     writer: W,
 ) {
@@ -1280,7 +1298,11 @@ async fn download_init_task<W: traits::core::Writer>(
     }
 
     // Record the expected transfer so the uploader's TransferRequest is matched.
-    ctx.downloads.lock().unwrap().pending.insert((peer.clone(), filename.clone()), size);
+    ctx.downloads
+        .lock()
+        .unwrap()
+        .pending
+        .insert((peer.clone(), filename.clone()), PendingDownload { size, subdir, prefix });
 
     // Keep the connection open to answer the TransferRequest if it arrives here.
     let result = serve_connection(stream, &ctx, Some(peer.clone()), |note| {
@@ -1530,13 +1552,15 @@ where
                     // Trust the size WE recorded when queueing, not the uploader's
                     // TransferRequest.filesize (which a malicious peer could set to
                     // 0 to make us report an empty file as a complete download).
-                    if let Some(size) = downloads.pending.remove(&key) {
+                    if let Some(pending) = downloads.pending.remove(&key) {
                         downloads.by_token.insert(
                             request.token,
                             ActiveDownload {
                                 username: peer.clone(),
                                 filename: request.file.clone(),
-                                size,
+                                size: pending.size,
+                                subdir: pending.subdir,
+                                prefix: pending.prefix,
                             },
                         );
                         true
@@ -1904,7 +1928,25 @@ where
     };
     on_activity(format!("receiving {} from {} (token {token})", active.filename, active.username));
 
-    let basename = download_basename(&active.filename);
+    // Apply the "organize" hints: prepend the track-number prefix to the file
+    // name and land the file in a per-playlist subfolder. Both are sanitized
+    // defensively (the request already sanitizes) so a hostile value can't
+    // escape the download dir or inject path separators.
+    let basename = {
+        let base = download_basename(&active.filename);
+        // Strip path separators / illegal chars from the prefix but keep its
+        // trailing space (e.g. "01 ") — it is a name fragment, not a component.
+        let prefix: String = active
+            .prefix
+            .chars()
+            .filter(|c| !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') && (*c as u32) >= 0x20)
+            .collect();
+        if prefix.is_empty() { base } else { format!("{prefix}{base}") }
+    };
+    let download_dir = {
+        let subdir = crate::components::sanitize_path_component(&active.subdir);
+        if subdir.is_empty() { ctx.download_dir() } else { ctx.download_dir().join(subdir) }
+    };
     // Name the partial by (username, virtual path), NOT the per-attempt transfer
     // token: the token is fresh on every (re)negotiation, so a token-keyed name
     // could never be found again to resume. A stable key lets a re-queued
@@ -1923,7 +1965,7 @@ where
     match receive_to_disk(
         stream,
         &incomplete,
-        &ctx.download_dir(),
+        &download_dir,
         &basename,
         active.size,
         &mut |b| rep.report(b),
@@ -2558,7 +2600,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pending
-                .insert(("bob".into(), "Music\\f.mp3".into()), 5);
+                .insert(("bob".into(), "Music\\f.mp3".into()), PendingDownload { size: 5, ..Default::default() });
             let ctx_serve = ctx.clone();
             let serve = tokio::spawn(async move {
                 serve_connection(server, &ctx_serve, Some("bob".into()), |_| {}).await
@@ -2619,7 +2661,7 @@ mod tests {
             });
             ctx.downloads.lock().unwrap().by_token.insert(
                 42,
-                ActiveDownload { username: "bob".into(), filename: "Music\\got.mp3".into(), size: 11 },
+                ActiveDownload { username: "bob".into(), filename: "Music\\got.mp3".into(), size: 11, subdir: String::new(), prefix: String::new() },
             );
 
             let (mut client, server) = tokio::io::duplex(64 * 1024);
@@ -2643,6 +2685,71 @@ mod tests {
             assert_eq!(filename, "Music\\got.mp3");
             assert_eq!(std::fs::read(&path).unwrap(), b"hello world");
             let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    #[test]
+    fn organize_download_lands_in_subfolder_with_numbered_name() {
+        // With the "organize" hints set, the finished file lands in the named
+        // subfolder and its basename is prefixed with the track number.
+        runtime().block_on(async {
+            let dir = std::env::temp_dir().join(format!("soulrust-org-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::create_dir_all(&dir);
+            let (cmd_tx, cmd_rx) = unbounded_channel();
+            std::mem::forget(cmd_rx);
+            let ctx = Arc::new(ConnCtx {
+                shares: Mutex::new(Arc::new(test_index())),
+                queue: Arc::new(Mutex::new(PendingDeliveries::default())),
+                downloads: Mutex::new(Downloads::default()),
+                distrib: DistribState::default(),
+                upload_speed: AtomicU32::new(0),
+                uploads_gate: UploadGate::default(),
+                uploads: Mutex::new(Uploads::default()),
+                our_username: "me".into(),
+                download_dir: Mutex::new(dir.clone()),
+                incomplete_dir: Mutex::new(dir.clone()),
+                cmd_tx,
+                next_token: AtomicU32::new(1),
+                excluded_phrases: Mutex::new(Vec::new()),
+                upload_queue: Mutex::new(UploadQueue::new(false)),
+                live: Mutex::new(LiveConfig {
+                    search_filter: SearchFilter { min_files: 1, min_upload_speed: 0, max_queue_length: 0 },
+                    max_results: 100,
+                }),
+            });
+            ctx.downloads.lock().unwrap().by_token.insert(
+                42,
+                ActiveDownload {
+                    username: "bob".into(),
+                    filename: "Music\\got.mp3".into(),
+                    size: 11,
+                    // A subdir with an illegal separator is sanitized to one component.
+                    subdir: "Road Trip/2024".into(),
+                    prefix: "03 ".into(),
+                },
+            );
+
+            let (mut client, server) = tokio::io::duplex(64 * 1024);
+            let serve = tokio::spawn(async move { serve_connection(server, &ctx, None, |_| {}).await });
+
+            let init = PeerInit { username: "bob".into(), connection_type: ConnectionType::File, token: 0 };
+            client.write_all(&init.to_frame()).await.unwrap();
+            client.write_all(&FileTransferInit { token: 42 }.to_bytes()).await.unwrap();
+            let mut offset = [0u8; 8];
+            client.read_exact(&mut offset).await.unwrap();
+            client.write_all(b"hello world").await.unwrap();
+            drop(client);
+
+            let outcome = serve.await.unwrap().unwrap();
+            let ConnOutcome::Downloaded { path, .. } = outcome else {
+                panic!("expected a completed download");
+            };
+            let landed = PathBuf::from(&path);
+            assert_eq!(landed.parent().unwrap(), dir.join("Road Trip_2024"), "lands in the sanitized subfolder");
+            assert_eq!(landed.file_name().unwrap(), "03 got.mp3", "basename carries the track-number prefix");
+            assert_eq!(std::fs::read(&landed).unwrap(), b"hello world");
+            let _ = std::fs::remove_dir_all(&dir);
         });
     }
 
@@ -2758,7 +2865,7 @@ mod tests {
             });
             ctx.downloads.lock().unwrap().by_token.insert(
                 7,
-                ActiveDownload { username: "bob".into(), filename: "Music\\got.mp3".into(), size: 100 },
+                ActiveDownload { username: "bob".into(), filename: "Music\\got.mp3".into(), size: 100, subdir: String::new(), prefix: String::new() },
             );
 
             let (mut client, mut server) = tokio::io::duplex(64 * 1024);
@@ -3008,7 +3115,7 @@ mod tests {
             let size = payload.len() as u64;
             ctx.downloads.lock().unwrap().by_token.insert(
                 77,
-                ActiveDownload { username: "up".into(), filename: "Dir\\f.mp3".into(), size },
+                ActiveDownload { username: "up".into(), filename: "Dir\\f.mp3".into(), size, subdir: String::new(), prefix: String::new() },
             );
 
             let (mut client, mut server) = tokio::io::duplex(64 * 1024);
@@ -3163,7 +3270,7 @@ mod tests {
             });
             ctx.downloads.lock().unwrap().by_token.insert(
                 42,
-                ActiveDownload { username: "alice".into(), filename: "a.mp3".into(), size: 5 },
+                ActiveDownload { username: "alice".into(), filename: "a.mp3".into(), size: 5, subdir: String::new(), prefix: String::new() },
             );
 
             let (mut client, server) = tokio::io::duplex(1024);
@@ -3195,7 +3302,7 @@ mod tests {
             use soulseek_proto::transfer::TransferRequest;
             let (mut client, server) = tokio::io::duplex(64 * 1024);
             let ctx = test_ctx();
-            ctx.downloads.lock().unwrap().pending.insert(("bob".into(), "f.mp3".into()), 5);
+            ctx.downloads.lock().unwrap().pending.insert(("bob".into(), "f.mp3".into()), PendingDownload { size: 5, ..Default::default() });
             let ctx_serve = ctx.clone();
             let serve = tokio::spawn(async move {
                 serve_connection(server, &ctx_serve, Some("bob".into()), |_| {}).await
@@ -3232,7 +3339,7 @@ mod tests {
             use soulseek_proto::transfer::UploadDenied;
             let (mut client, server) = tokio::io::duplex(64 * 1024);
             let ctx = test_ctx();
-            ctx.downloads.lock().unwrap().pending.insert(("bob".into(), "f.mp3".into()), 5);
+            ctx.downloads.lock().unwrap().pending.insert(("bob".into(), "f.mp3".into()), PendingDownload { size: 5, ..Default::default() });
             let ctx_serve = ctx.clone();
             let serve = tokio::spawn(async move {
                 serve_connection(server, &ctx_serve, Some("bob".into()), |_| {}).await
@@ -3264,7 +3371,7 @@ mod tests {
             use soulseek_proto::transfer::UploadDenied;
             let (mut client, server) = tokio::io::duplex(64 * 1024);
             let ctx = test_ctx();
-            ctx.downloads.lock().unwrap().pending.insert(("bob".into(), "f.mp3".into()), 5);
+            ctx.downloads.lock().unwrap().pending.insert(("bob".into(), "f.mp3".into()), PendingDownload { size: 5, ..Default::default() });
             let ctx_serve = ctx.clone();
             let serve = tokio::spawn(async move {
                 serve_connection(server, &ctx_serve, Some("bob".into()), |_| {}).await
@@ -3294,7 +3401,7 @@ mod tests {
             use soulseek_proto::transfer::UploadFailed;
             let (mut client, server) = tokio::io::duplex(64 * 1024);
             let ctx = test_ctx();
-            ctx.downloads.lock().unwrap().pending.insert(("bob".into(), "f.mp3".into()), 5);
+            ctx.downloads.lock().unwrap().pending.insert(("bob".into(), "f.mp3".into()), PendingDownload { size: 5, ..Default::default() });
             let ctx_serve = ctx.clone();
             let serve = tokio::spawn(async move {
                 serve_connection(server, &ctx_serve, Some("bob".into()), |_| {}).await

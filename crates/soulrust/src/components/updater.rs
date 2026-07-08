@@ -373,8 +373,11 @@ mod tests {
     #[test]
     fn up_to_date_release_reports_up_to_date() {
         let writer = CapturingWriter::default();
+        // A release whose tag equals our own version is "up to date". Track the
+        // live VERSION constant so a version bump doesn't turn this into a
+        // spurious "newer release available".
         let api = MockGithub {
-            release: Ok(release_with_platform_asset("v0.1.0")),
+            release: Ok(release_with_platform_asset(&format!("v{VERSION}"))),
             download_result: Ok(()),
         };
         run_check("owner/repo", &api, &writer);

@@ -280,6 +280,7 @@ impl SpotifyExtractor {
         Ok(Job {
             source_label: format!("spotify track: {}", job.title.as_deref().unwrap_or(id)),
             searches: vec![job],
+            ..Default::default()
         })
     }
 
@@ -306,7 +307,11 @@ impl SpotifyExtractor {
             }
         }
 
-        Ok(Job { source_label: format!("spotify album: {album_name}"), searches })
+        Ok(Job {
+            source_label: format!("spotify album: {album_name}"),
+            searches,
+            folder: Some(album_name),
+        })
     }
 
     fn extract_playlist(&self, token: &str, id: &str) -> Result<Job, ExtractError> {
@@ -361,7 +366,11 @@ impl SpotifyExtractor {
             }
         }
 
-        Ok(Job { source_label: format!("spotify playlist: {playlist_name}"), searches })
+        Ok(Job {
+            source_label: format!("spotify playlist: {playlist_name}"),
+            searches,
+            folder: Some(playlist_name),
+        })
     }
 }
 

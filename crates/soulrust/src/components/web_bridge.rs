@@ -345,12 +345,39 @@ impl<W: traits::core::Writer> SharedBridge<W> {
             }
         };
 
+        // "Organize" (bulk playlists): when checked and the source is a playlist
+        // or album, downloads land in a subfolder named after it, each track
+        // prefixed with a zero-padded index so the folder sorts in track order.
+        let organize = form
+            .get("organize")
+            .is_some_and(|v| v == "1" || v == "on" || v == "true");
+        let subdir = organize
+            .then(|| job.folder.as_deref().map(crate::components::sanitize_path_component))
+            .flatten()
+            .filter(|s| !s.is_empty());
+        // Pad to the width of the largest index, with a floor of 2 digits
+        // (01, 02, …; 001, 002, … once a playlist has 100+ tracks).
+        let width = job.searches.len().to_string().len().max(2);
+        let jobs: Vec<_> = job
+            .searches
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let mut proto = crate::extract::searchjob_to_proto(s);
+                if let Some(folder) = &subdir {
+                    proto.folder = folder.clone();
+                    proto.prefix = format!("{n:0width$} ", n = i + 1, width = width);
+                }
+                proto
+            })
+            .collect();
+
         let search = match self.round_trip(|corr| {
             WebBridge::send(
                 &StartSearch {
                     corr,
                     source_label: job.source_label.clone(),
-                    jobs: job.searches.iter().map(crate::extract::searchjob_to_proto).collect(),
+                    jobs: jobs.clone(),
                     ..Default::default()
                 },
                 &self.writer,
@@ -472,10 +499,16 @@ impl<W: traits::core::Writer> SharedBridge<W> {
         let username = form.get("username").cloned().unwrap_or_default();
         let filename = form.get("filename").cloned().unwrap_or_default();
         let size = form.get("size").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        // "Organize" destination hints carried by the result row's Get form.
+        let subdir = form.get("subdir").cloned().unwrap_or_default();
+        let prefix = form.get("prefix").cloned().unwrap_or_default();
         if username.is_empty() || filename.is_empty() {
             return Ok(r#"<span class="pill warn">bad request</span>"#.into());
         }
-        WebBridge::send(&StartDownload { username, filename, size, ..Default::default() }, &self.writer);
+        WebBridge::send(
+            &StartDownload { username, filename, size, subdir, prefix, ..Default::default() },
+            &self.writer,
+        );
         // Matches how the polled row renders a queued download, so it doesn't
         // visibly change when the next 2s refresh lands.
         Ok(r#"<span class="pill">queued</span>"#.into())
@@ -979,6 +1012,10 @@ fn render_bulk_page(config: &Config) -> String {
   <label for="input" style="margin-top:0.9rem">Paste here</label>
   <textarea id="input" name="input" placeholder="https://open.spotify.com/playlist/...&#10;— or —&#10;Daft Punk - Get Lucky&#10;Justice - Genesis"></textarea>
   <p class="muted" style="margin:0.5rem 0 0.9rem">Spotify links need credentials set up first. Plain track lists work with no setup.</p>
+  <label style="display:flex; align-items:center; gap:0.4rem; font-weight:normal; margin:0 0 0.9rem">
+    <input type="checkbox" name="organize" value="1" checked>
+    Organize into a folder named after the playlist, numbering tracks (01, 02, …)
+  </label>
   <button class="btn" type="submit">Start searches</button>
 </form>
 </div>

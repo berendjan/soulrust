@@ -31,7 +31,7 @@ enum SessionEventKind {
     Connecting,
     LoggedIn { greeting: String, own_ip: String },
     LoginFailed { reason: String },
-    SearchStarted { token: u32, query: String },
+    SearchStarted { token: u32, query: String, folder: String, prefix: String },
     SearchBroadcastSeen { username: String, query: String },
     Disconnected { reason: String },
     ProtocolNote { note: String },
@@ -49,9 +49,12 @@ fn local_session_kind(ev: &SessionEvent) -> SessionEventKind {
         EnumValue::Known(K::SessionLoginFailed) => {
             SessionEventKind::LoginFailed { reason: ev.reason.clone() }
         }
-        EnumValue::Known(K::SessionSearchStarted) => {
-            SessionEventKind::SearchStarted { token: ev.token, query: ev.query.clone() }
-        }
+        EnumValue::Known(K::SessionSearchStarted) => SessionEventKind::SearchStarted {
+            token: ev.token,
+            query: ev.query.clone(),
+            folder: ev.folder.clone(),
+            prefix: ev.prefix.clone(),
+        },
         EnumValue::Known(K::SessionSearchBroadcastSeen) => SessionEventKind::SearchBroadcastSeen {
             username: ev.username.clone(),
             query: ev.query.clone(),
@@ -103,6 +106,9 @@ pub struct Session {
 struct PendingDownload {
     filename: String,
     size: u64,
+    /// "Organize" destination hints: subfolder + filename prefix (empty = none).
+    subdir: String,
+    prefix: String,
 }
 
 /// Client identity sent in the Login message.
@@ -141,10 +147,12 @@ impl Session {
             SessionEventKind::LoginFailed { reason } => {
                 SessionEvent { kind: K::SessionLoginFailed.into(), reason, ..Default::default() }
             }
-            SessionEventKind::SearchStarted { token, query } => SessionEvent {
+            SessionEventKind::SearchStarted { token, query, folder, prefix } => SessionEvent {
                 kind: K::SessionSearchStarted.into(),
                 token,
                 query,
+                folder,
+                prefix,
                 ..Default::default()
             },
             SessionEventKind::SearchBroadcastSeen { username, query } => SessionEvent {
@@ -382,7 +390,9 @@ impl traits::core::Handle<NetRx> for Session {
                                 ip: ip.clone(),
                                 port: u32::from(port),
                                 filename: download.filename,
-                                size: download.size, ..Default::default() },
+                                size: download.size,
+                                subdir: download.subdir,
+                                prefix: download.prefix, ..Default::default() },
                             writer,
                         );
                     }
@@ -484,7 +494,12 @@ impl traits::core::Handle<StartSearch> for Session {
             let request = FileSearchRequest { token, query: query.clone() };
             Self::send(&NetTx { frame: request.to_frame(), ..Default::default() }, writer);
             Self::emit(
-                SessionEventKind::SearchStarted { token, query: query.clone() },
+                SessionEventKind::SearchStarted {
+                    token,
+                    query: query.clone(),
+                    folder: job.folder.clone(),
+                    prefix: job.prefix.clone(),
+                },
                 writer,
             );
             started.push(StartedSearch { token, query, ..Default::default() });
@@ -559,6 +574,8 @@ impl traits::core::Handle<StartDownload> for Session {
         self.pending_downloads.entry(username.to_owned()).or_default().push(PendingDownload {
             filename: message.filename.clone(),
             size: message.size,
+            subdir: message.subdir.clone(),
+            prefix: message.prefix.clone(),
         });
     }
 }
@@ -854,7 +871,7 @@ mod tests {
         assert!(writer
             .events()
             .iter()
-            .any(|e| matches!(e, SessionEventKind::SearchStarted { token: 1, query } if query == "A One")));
+            .any(|e| matches!(e, SessionEventKind::SearchStarted { token: 1, query, .. } if query == "A One")));
     }
 
     #[test]

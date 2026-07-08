@@ -15,6 +15,7 @@ impl Extractor for PlainQueryExtractor {
         Ok(Job {
             source_label: format!("search: {query}"),
             searches: vec![SearchJob { raw_query: Some(query), ..Default::default() }],
+            ..Default::default()
         })
     }
 }

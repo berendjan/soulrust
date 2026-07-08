@@ -60,6 +60,10 @@ struct SearchRow {
     token: u32,
     query: String,
     results: Vec<SearchResultRow>,
+    /// "Organize" destination hints shared by every result of this search: the
+    /// subfolder and the track's filename prefix (empty = none).
+    folder: String,
+    prefix: String,
 }
 
 /// A user-requested download and its latest known state, for the Downloads page.
@@ -349,10 +353,14 @@ impl Ui {
 </form>
 </div>
 <div class="card">
-<form hx-post="/search" hx-target="#searches" hx-swap="innerHTML" style="display:flex; gap:0.5rem; align-items:flex-end;">
+<form hx-post="/search" hx-target="#searches" hx-swap="innerHTML" style="display:flex; gap:0.5rem; align-items:flex-end; flex-wrap:wrap;">
   <div style="flex:1"><label for="bulk" style="margin-top:0">Bulk (Spotify)</label>
   <input id="bulk" type="text" name="input" placeholder="https://open.spotify.com/playlist/…"></div>
   <button class="btn" type="submit">Start searches</button>
+  <label style="flex-basis:100%; display:flex; align-items:center; gap:0.4rem; font-weight:normal; margin:0">
+    <input type="checkbox" name="organize" value="1" checked>
+    Organize into a folder named after the playlist, numbering tracks (01, 02, …)
+  </label>
 </form>
 <p class="muted" style="margin:0.5rem 0 0">Paste a playlist, album, or track link — needs <a href="/spotify">Spotify connected</a>.</p>
 </div>
@@ -456,7 +464,7 @@ impl Ui {
     /// list, show its live status (so the 2s poll preserves it instead of
     /// reverting to "Get"); otherwise a Get button that posts the download.
     /// Failed downloads fall through to a Get button so they can be retried.
-    fn download_cell(&self, username: &str, filename: &str, size: u64) -> String {
+    fn download_cell(&self, username: &str, filename: &str, size: u64, subdir: &str, prefix: &str) -> String {
         let state = self
             .downloads
             .iter()
@@ -484,10 +492,12 @@ impl Ui {
             }
             Some(DownloadState::Completed(path)) => done_link(path),
             _ => format!(
-                r##"<form hx-post="/download" hx-target="this" hx-swap="outerHTML" style="margin:0"><input type="hidden" name="username" value="{user}"><input type="hidden" name="filename" value="{path}"><input type="hidden" name="size" value="{size}"><button class="btn xs" type="submit">Get</button></form>"##,
+                r##"<form hx-post="/download" hx-target="this" hx-swap="outerHTML" style="margin:0"><input type="hidden" name="username" value="{user}"><input type="hidden" name="filename" value="{path}"><input type="hidden" name="size" value="{size}"><input type="hidden" name="subdir" value="{subdir}"><input type="hidden" name="prefix" value="{prefix}"><button class="btn xs" type="submit">Get</button></form>"##,
                 user = escape(username),
                 path = escape(filename),
                 size = size,
+                subdir = escape(subdir),
+                prefix = escape(prefix),
             ),
         }
     }
@@ -565,7 +575,7 @@ impl Ui {
                     slot = slot,
                     speed = r.upload_speed,
                     queue = r.in_queue,
-                    dl_cell = self.download_cell(&r.username, &f.name, f.size),
+                    dl_cell = self.download_cell(&r.username, &f.name, f.size, &s.folder, &s.prefix),
                 )
             })
             .collect();
@@ -800,6 +810,8 @@ impl traits::core::Handle<SessionEvent> for Ui {
                     token: message.token,
                     query: message.query.clone(),
                     results: Vec::new(),
+                    folder: message.folder.clone(),
+                    prefix: message.prefix.clone(),
                 });
             }
             EnumValue::Known(SessionEventKind::SessionSearchBroadcastSeen) => {
@@ -1301,7 +1313,9 @@ mod tests {
 
     /// A local rich enum for tests (shadows the flat buffa `SessionEventKind`
     /// brought in by the glob import) so the assertions below read naturally;
-    /// `apply` maps it to the flat buffa `SessionEvent`.
+    /// `apply` maps it to the flat buffa `SessionEvent`. It mirrors every real
+    /// event variant for fidelity even though the tests only build a few.
+    #[allow(dead_code)]
     enum SessionEventKind {
         Connecting,
         LoggedIn { greeting: String, own_ip: String },

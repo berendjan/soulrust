@@ -81,6 +81,11 @@ message StartDownload {
   string username = 1;
   string filename = 2;
   uint64 size = 3;
+  // "Organize" option (bulk playlist downloads): a destination subfolder under
+  // the download dir (empty = none) and a filename prefix to prepend, e.g. a
+  // zero-padded track number "01 " (empty = none).
+  string subdir = 4;
+  string prefix = 5;
 }
 
 message CancelDownload {
@@ -229,6 +234,9 @@ message PeerDownloadConnect {
   uint32 port = 3;
   string filename = 4;
   uint64 size = 5;
+  // "Organize" option: destination subfolder + filename prefix (see StartDownload).
+  string subdir = 6;
+  string prefix = 7;
 }
 
 message PeerUploadConnect {
@@ -295,6 +303,8 @@ message SessionEvent {
   string query = 6;      // SEARCH_STARTED / SEARCH_BROADCAST_SEEN
   string username = 7;   // SEARCH_BROADCAST_SEEN
   string note = 8;       // PROTOCOL_NOTE
+  string folder = 9;     // SEARCH_STARTED (organize: destination subfolder)
+  string prefix = 10;    // SEARCH_STARTED (organize: filename prefix)
 }
 
 enum UpdaterStatusKind {
@@ -362,11 +372,19 @@ message SearchJob {
   optional string title = 2;
   optional string album = 3;
   optional string raw_query = 4;
+  // "Organize" option: destination subfolder + filename prefix for the file
+  // this search downloads (empty = none). Set by the web bridge when the user
+  // opts to organize a playlist into a numbered folder.
+  string folder = 5;
+  string prefix = 6;
 }
 
 message Job {
   string source_label = 1;
   repeated SearchJob searches = 2;
+  // The playlist/album title, when the source is one (empty otherwise). Used as
+  // the destination subfolder name for the "organize" download option.
+  string folder = 3;
 }
 
 message ExtractResult {

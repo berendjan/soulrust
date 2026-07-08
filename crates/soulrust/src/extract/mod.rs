@@ -45,10 +45,13 @@ impl SearchJob {
 }
 
 /// The extraction result: where the jobs came from plus the jobs themselves.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Job {
     pub source_label: String,
     pub searches: Vec<SearchJob>,
+    /// The playlist/album title when the source is one (`None` otherwise). Used
+    /// as the destination subfolder name for the "organize" download option.
+    pub folder: Option<String>,
 }
 
 // Conversions between these rich types and the buffa bus messages (StartSearch /
@@ -78,6 +81,7 @@ pub fn job_to_proto(j: &Job) -> bus::Job {
     bus::Job {
         source_label: j.source_label.clone(),
         searches: j.searches.iter().map(searchjob_to_proto).collect(),
+        folder: j.folder.clone().unwrap_or_default(),
         ..Default::default()
     }
 }
@@ -86,6 +90,7 @@ pub fn job_from_proto(j: &bus::Job) -> Job {
     Job {
         source_label: j.source_label.clone(),
         searches: j.searches.iter().map(searchjob_from_proto).collect(),
+        folder: Some(j.folder.clone()).filter(|s| !s.is_empty()),
     }
 }
 
@@ -214,6 +219,7 @@ mod tests {
             Ok(Job {
                 source_label: self.label.into(),
                 searches: vec![SearchJob { raw_query: Some(input.into()), ..Default::default() }],
+                ..Default::default()
             })
         }
     }
