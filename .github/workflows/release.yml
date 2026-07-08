@@ -1,0 +1,270 @@
+name: release
+
+# Builds installable packages for Linux (.deb), macOS (.pkg) and Windows
+# (Inno Setup installer), plus the raw platform binaries the built-in
+# self-updater looks for (`soulrust-<arch>-<os>`, see components/github.rs).
+#
+# The app builds with Bazel — protobuf/bus codegen is Bazel-only (no build.rs,
+# no committed generated code), so a plain `cargo build` cannot produce the
+# generated types. Target: //crates/soulrust:soulrust_bin.
+#
+# Triggers:
+#   - push a tag `vX.Y.Z`  -> build all platforms and publish a GitHub Release.
+#   - manual (Actions tab) -> build all platforms, upload as run artifacts only
+#     (no Release). Use this to test the pipeline without cutting a tag.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version for a manual build (e.g. 0.1.0-test). Defaults to a dev string."
+        required: false
+        default: ""
+
+permissions:
+  contents: write # create/upload GitHub Releases on tag builds
+
+env:
+  BAZEL_TARGET: "//crates/soulrust:soulrust_bin"
+  # Pin Bazel (bazelisk reads this) so CI matches the version the repo builds
+  # with locally instead of drifting to whatever "latest" is on the runner.
+  USE_BAZEL_VERSION: "9.1.1"
+
+jobs:
+  # Compute a single version string all build jobs share.
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      is_release: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    steps:
+      - id: v
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            V="${{ github.event.inputs.version }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            V="0.0.0-$(echo "${GITHUB_SHA}" | cut -c1-8)"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "resolved version: $V"
+
+  # ---------------------------------------------------------------- Linux (.deb)
+  linux:
+    needs: meta
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Bazel
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel-disk
+          key: bazel-linux-${{ hashFiles('MODULE.bazel.lock') }}
+          restore-keys: bazel-linux-
+
+      - name: Build (Bazel, opt)
+        run: bazel build -c opt --disk_cache="$HOME/.cache/bazel-disk" "$BAZEL_TARGET"
+
+      - name: Stage binary
+        run: |
+          set -euo pipefail
+          BIN="$(bazel cquery -c opt --output=files "$BAZEL_TARGET" 2>/dev/null | tail -n1)"
+          echo "built: $BIN"
+          mkdir -p dist
+          install -m 0755 "$BIN" dist/soulrust-x86_64-linux   # raw asset for the self-updater
+
+      - name: Build .deb
+        run: |
+          set -euo pipefail
+          root="pkg/soulrust"
+          mkdir -p "$root/DEBIAN" "$root/usr/bin"
+          install -m 0755 dist/soulrust-x86_64-linux "$root/usr/bin/soulrust"
+          cat > "$root/DEBIAN/control" <<EOF
+          Package: soulrust
+          Version: ${VERSION}
+          Section: net
+          Priority: optional
+          Architecture: amd64
+          Depends: libc6
+          Maintainer: soulrust maintainers <berend@rootline.com>
+          Description: Soulseek client with a web UI, self-updater and Spotify extractor.
+           soulrust is a Soulseek network client that serves an htmx web UI on
+           localhost (default http://127.0.0.1:5030). Run \`soulrust\` and open the
+           printed URL in a browser.
+          EOF
+          dpkg-deb --build --root-owner-group "$root" "dist/soulrust_${VERSION}_amd64.deb"
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- macOS (.pkg)
+  macos:
+    needs: meta
+    runs-on: macos-latest # arm64 runner -> aarch64-macos
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Bazel
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel-disk
+          key: bazel-macos-${{ hashFiles('MODULE.bazel.lock') }}
+          restore-keys: bazel-macos-
+
+      - name: Build (Bazel, opt)
+        run: bazel build -c opt --disk_cache="$HOME/.cache/bazel-disk" "$BAZEL_TARGET"
+
+      - name: Stage binary
+        run: |
+          set -euo pipefail
+          BIN="$(bazel cquery -c opt --output=files "$BAZEL_TARGET" 2>/dev/null | tail -n1)"
+          echo "built: $BIN"
+          mkdir -p dist
+          install -m 0755 "$BIN" dist/soulrust-aarch64-macos  # raw asset for the self-updater
+
+      - name: Build .pkg
+        run: |
+          set -euo pipefail
+          root="pkgroot/usr/local/bin"
+          mkdir -p "$root"
+          install -m 0755 dist/soulrust-aarch64-macos "$root/soulrust"
+          pkgbuild \
+            --identifier com.rootline.soulrust \
+            --version "$VERSION" \
+            --root pkgroot \
+            --install-location / \
+            "dist/soulrust-${VERSION}-macos-arm64.pkg"
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+          if-no-files-found: error
+
+  # ------------------------------------------------------------ Windows (setup)
+  windows:
+    needs: meta
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash # git-bash; keeps the packaging scripts uniform with the others
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      # Short output base avoids Windows MAX_PATH failures when Bazel builds
+      # protobuf from source. Startup flag, so it precedes the command.
+      BAZEL_STARTUP: "--output_base=C:/bzl"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Bazel
+        uses: actions/cache@v4
+        with:
+          path: C:/bzl-disk
+          key: bazel-windows-${{ hashFiles('MODULE.bazel.lock') }}
+          restore-keys: bazel-windows-
+
+      - name: Build (Bazel, opt)
+        run: bazel $BAZEL_STARTUP build -c opt --disk_cache=C:/bzl-disk "$BAZEL_TARGET"
+
+      - name: Stage binary
+        run: |
+          set -euo pipefail
+          BIN="$(bazel $BAZEL_STARTUP cquery -c opt --output=files "$BAZEL_TARGET" 2>/dev/null | tail -n1)"
+          echo "built: $BIN"
+          mkdir -p dist stage
+          cp "$BIN" stage/soulrust.exe
+          cp "$BIN" dist/soulrust-x86_64-windows   # raw asset for the self-updater (no extension)
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        run: |
+          set -euo pipefail
+          cat > stage/soulrust.iss <<EOF
+          [Setup]
+          AppId=9F3B2C41-6E2A-4D1F-9B7E-3B1A2C4D5E6F
+          AppName=soulrust
+          AppVersion=${VERSION}
+          AppPublisher=rootline
+          DefaultDirName={autopf}\\soulrust
+          DefaultGroupName=soulrust
+          OutputDir=dist
+          OutputBaseFilename=soulrust-${VERSION}-windows-x64-setup
+          Compression=lzma2
+          SolidCompression=yes
+          ArchitecturesAllowed=x64
+          ArchitecturesInstallIn64BitMode=x64
+          UninstallDisplayName=soulrust
+
+          [Files]
+          Source: "soulrust.exe"; DestDir: "{app}"; Flags: ignoreversion
+
+          [Icons]
+          Name: "{group}\\soulrust"; Filename: "{app}\\soulrust.exe"
+          Name: "{group}\\Uninstall soulrust"; Filename: "{uninstallexe}"
+
+          [Run]
+          Filename: "{app}\\soulrust.exe"; Description: "Launch soulrust"; Flags: nowait postinstall skipifsilent
+          EOF
+          ISCC="$(command -v ISCC || echo '/c/Program Files (x86)/Inno Setup 6/ISCC.exe')"
+          cd stage
+          "$ISCC" soulrust.iss
+          cd ..
+          # ISCC wrote into stage/dist due to relative OutputDir; normalize.
+          find stage -name "soulrust-*-windows-x64-setup.exe" -exec cp {} dist/ \;
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+          if-no-files-found: error
+
+  # ----------------------------------------------------- Publish GitHub Release
+  release:
+    needs: [meta, linux, macos, windows]
+    if: needs.meta.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: incoming
+
+      - name: Collect assets + checksums
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find incoming -type f -exec cp {} release/ \;
+          cd release
+          sha256sum * > SHA256SUMS.txt
+          echo "release assets:"; ls -la
+
+      - name: Create / update GitHub Release
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release/* --clobber
+          else
+            gh release create "$TAG" release/* \
+              --title "$TAG" \
+              --generate-notes \
+              --verify-tag
+          fi
