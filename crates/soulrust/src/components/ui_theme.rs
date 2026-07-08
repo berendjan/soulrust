@@ -66,7 +66,7 @@ a { color: inherit; }
 .nav-collapse:checked ~ .layout .sidebar .brand,
 .nav-collapse:checked ~ .layout .sidebar .nav a,
 .nav-collapse:checked ~ .layout .sidebar .user { justify-content: center; padding: 0; }
-.main { flex: 1; min-width: 0; padding: 1.5rem 2rem; max-width: 920px; }
+.main { flex: 1; min-width: 0; padding: 1.5rem 2rem; }
 h1 { font-size: 22px; font-weight: 600; margin: 0 0 0.25rem; }
 h2 { font-size: 16px; font-weight: 600; margin: 1.5rem 0 0.5rem; }
 .sub { color: var(--text-soft); margin: 0 0 1.25rem; }
