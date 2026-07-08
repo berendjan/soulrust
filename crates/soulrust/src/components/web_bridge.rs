@@ -52,6 +52,8 @@ pub struct WebBridge {
     /// The pending OAuth `state` nonce between `/spotify/login` and its callback,
     /// for CSRF protection. Shared across HTTP workers.
     oauth_state: Arc<Mutex<Option<String>>>,
+    /// Open the UI in the OS default browser once the server is listening.
+    open_browser: bool,
 }
 
 impl WebBridge {
@@ -63,6 +65,7 @@ impl WebBridge {
             control: ctx.control.clone(),
             config_path: ctx.config_path.clone(),
             oauth_state: Arc::new(Mutex::new(None)),
+            open_browser: ctx.config.ui.open_browser,
         }
     }
 
@@ -87,6 +90,12 @@ impl traits::core::Handler for WebBridge {
             }
         };
         println!("soulrust UI listening on http://{}", self.bind_addr);
+
+        // The server is bound now, so the page is reachable the moment the
+        // browser opens. Best-effort: a missing opener (headless box) is ignored.
+        if self.open_browser {
+            open_in_browser(&format!("http://{}", self.bind_addr));
+        }
 
         for n in 0..HTTP_WORKERS {
             let server = server.clone();
@@ -1095,6 +1104,31 @@ fn parse_form(body: &str) -> HashMap<String, String> {
             }
         })
         .collect()
+}
+
+/// Open `url` in the OS default browser, detached. Best-effort: any failure
+/// (no opener on a headless box, spawn error) is ignored so startup never fails.
+fn open_in_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut c = std::process::Command::new("open");
+        c.arg(url);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        // `start` is a cmd builtin; the empty "" is its window-title argument.
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", "", url]);
+        c
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    let _ = command.spawn();
 }
 
 /// Percent-encode a query value: keep the RFC 3986 unreserved set, escape the

@@ -403,6 +403,10 @@ message UpdateConfig {
 
 message UiConfig {
   string bind_addr = 1;
+  // Open the web UI in the OS default browser on startup. optional so an unset
+  // value can default to true (proto3 bools default to false). Off for headless
+  // / server installs.
+  optional bool open_browser = 2;
 }
 
 message SharingConfig {

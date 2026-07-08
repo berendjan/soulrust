@@ -71,11 +71,14 @@ impl Default for UpdateConfig {
 #[serde(default)]
 pub struct UiConfig {
     pub bind_addr: String,
+    /// Open the web UI in the OS default browser on startup. Default on; set
+    /// false for headless/server installs.
+    pub open_browser: bool,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
-        UiConfig { bind_addr: "127.0.0.1:5030".into() }
+        UiConfig { bind_addr: "127.0.0.1:5030".into(), open_browser: true }
     }
 }
 
@@ -203,6 +206,7 @@ pub fn config_to_proto(c: &Config) -> bus::Config {
         }),
         ui: MessageField::some(bus::UiConfig {
             bind_addr: c.ui.bind_addr.clone(),
+            open_browser: Some(c.ui.open_browser),
             ..Default::default()
         }),
         sharing: MessageField::some(bus::SharingConfig {
@@ -243,7 +247,11 @@ pub fn config_from_proto(c: &bus::Config) -> Config {
             auto_apply: c.update.auto_apply,
             repo: c.update.repo.clone(),
         },
-        ui: UiConfig { bind_addr: c.ui.bind_addr.clone() },
+        ui: UiConfig {
+            bind_addr: c.ui.bind_addr.clone(),
+            // Absent (older config / default proto) means enabled.
+            open_browser: c.ui.open_browser.unwrap_or(true),
+        },
         sharing: SharingConfig {
             folders: c.sharing.folders.clone(),
             download_dir: c.sharing.download_dir.clone(),
