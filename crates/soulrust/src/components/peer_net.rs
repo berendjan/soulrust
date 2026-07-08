@@ -70,6 +70,21 @@ const BROWSE_DEADLINE: Duration = Duration::from_secs(120);
 /// and only the largest shares get truncated.
 const MAX_LISTING_BYTES: usize = 1536 * 1024;
 
+/// Byte budget for a *single* search-result message on the bus. A heavily-shared
+/// query (e.g. a popular artist like "deadmau5") can make one peer return tens of
+/// thousands of files in one response, which would serialize past the bus's
+/// per-message cap and panic the worker. Rather than drop the overflow, we split
+/// a peer's response into as many messages of this size as it takes; the UI
+/// merges the chunks back together by (token, user). Kept well under the
+/// per-message cap (~8 MiB at the 16 MiB ring) so a chunk always fits.
+const MAX_RESULT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Over-estimated serialized cost of a [`SearchResultFile`] beyond its name: the
+/// size + optional bitrate/length/sample-rate/bit-depth/vbr fields plus the
+/// repeated-field framing. Over-estimating keeps the real message smaller than
+/// the budget regardless of which attributes a peer advertised.
+const SEARCH_FILE_OVERHEAD: usize = 48;
+
 /// Bound on distinct pending deliveries. A searcher that never connects back
 /// (offline / firewalled / malicious) would otherwise leave its queued frame in
 /// the map forever; when full, the oldest pending delivery (lowest token) is
@@ -1755,26 +1770,63 @@ where
                 // originating search by token.
                 let accepted = ctx.live.lock().unwrap().search_filter.accepts(&resp);
                 if accepted {
-                    let files = resp
-                        .files
-                        .into_iter()
-                        .map(|f| SearchResultFile {
+                    // Forward the whole response, but split it across as many
+                    // bus messages as it takes to stay under the per-message cap:
+                    // one peer's answer to a popular query can be huge and would
+                    // otherwise panic the bus worker. Each chunk carries the same
+                    // (token, user); the UI merges them back together.
+                    let token = resp.token;
+                    let free_slots = resp.free_slots;
+                    let upload_speed = resp.upload_speed;
+                    let in_queue = resp.in_queue;
+                    let username = resp.username;
+                    let total = resp.files.len();
+
+                    let mut chunks = 0usize;
+                    let mut chunk: Vec<SearchResultFile> = Vec::new();
+                    let mut budget = MAX_RESULT_BYTES;
+                    for f in resp.files {
+                        let cost = f.name.len() + SEARCH_FILE_OVERHEAD;
+                        // Flush the current chunk before it would overflow (but a
+                        // lone oversized file still goes out as its own chunk).
+                        if cost > budget && !chunk.is_empty() {
+                            let _ = ctx.cmd_tx.send(PeerCommand::SearchResult {
+                                token,
+                                username: username.clone(),
+                                free_slots,
+                                upload_speed,
+                                in_queue,
+                                files: std::mem::take(&mut chunk),
+                            });
+                            chunks += 1;
+                            budget = MAX_RESULT_BYTES;
+                        }
+                        budget = budget.saturating_sub(cost);
+                        chunk.push(SearchResultFile {
                             bitrate: f.bitrate(),
                             length: f.length(),
                             vbr: f.is_vbr(),
                             sample_rate: f.sample_rate(),
                             bit_depth: f.bit_depth(),
                             name: f.name,
-                            size: f.size, ..Default::default() })
-                        .collect();
-                    let _ = ctx.cmd_tx.send(PeerCommand::SearchResult {
-                        token: resp.token,
-                        username: resp.username,
-                        free_slots: resp.free_slots,
-                        upload_speed: resp.upload_speed,
-                        in_queue: resp.in_queue,
-                        files,
-                    });
+                            size: f.size, ..Default::default() });
+                    }
+                    if !chunk.is_empty() {
+                        let _ = ctx.cmd_tx.send(PeerCommand::SearchResult {
+                            token,
+                            username: username.clone(),
+                            free_slots,
+                            upload_speed,
+                            in_queue,
+                            files: chunk,
+                        });
+                        chunks += 1;
+                    }
+                    if chunks > 1 {
+                        on_activity(format!(
+                            "large result from {username} ({total} files) split into {chunks} messages"
+                        ));
+                    }
                 }
             }
             _ => {} // not-yet-handled messages
@@ -2138,7 +2190,12 @@ fn relay_distrib_search<F: FnMut(String)>(ctx: &ConnCtx, search: DistribSearch, 
         token: search.token,
         query: search.query,
     });
-    on_activity(format!("relayed a distributed search to {children} child(ren)"));
+    // Only note the fan-out when we actually forwarded to a child. As a tree
+    // member we receive a steady stream of searches; logging every no-op relay
+    // to zero children floods the activity log.
+    if children > 0 {
+        on_activity(format!("relayed a distributed search to {children} child(ren)"));
+    }
 }
 
 /// Serve an inbound distributed child: send it our branch position, register it

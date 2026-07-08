@@ -42,6 +42,10 @@ impl Default for ServerConfig {
 pub struct SpotifyConfig {
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
+    /// OAuth refresh token from the user-login flow; present once the user has
+    /// logged in via `/spotify/login`. The extractor exchanges it for short-lived
+    /// user access tokens.
+    pub refresh_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -188,6 +192,7 @@ pub fn config_to_proto(c: &Config) -> bus::Config {
         spotify: MessageField::some(bus::SpotifyConfig {
             client_id: c.spotify.client_id.clone(),
             client_secret: c.spotify.client_secret.clone(),
+            refresh_token: c.spotify.refresh_token.clone(),
             ..Default::default()
         }),
         update: MessageField::some(bus::UpdateConfig {
@@ -231,6 +236,7 @@ pub fn config_from_proto(c: &bus::Config) -> Config {
         spotify: SpotifyConfig {
             client_id: c.spotify.client_id.clone(),
             client_secret: c.spotify.client_secret.clone(),
+            refresh_token: c.spotify.refresh_token.clone(),
         },
         update: UpdateConfig {
             enabled: c.update.enabled,
@@ -317,7 +323,10 @@ pub struct AppContext {
     pub config_path: PathBuf,
     pub control: Arc<Control>,
     /// Message bus ring size; a power of two. Generous so that a reader
-    /// stalled in a slow handler can never be lapped in practice.
+    /// stalled in a slow handler can never be lapped in practice. The bus caps a
+    /// single message at ~half this (the wrap size), so a larger ring also raises
+    /// the per-message ceiling — 16 MiB here gives ~8 MiB per message, enough for
+    /// a busy peer's search response to arrive whole in the common case.
     pub bus_buffer_size: usize,
 }
 
@@ -327,7 +336,7 @@ impl AppContext {
             config,
             config_path,
             control: Arc::new(Control::default()),
-            bus_buffer_size: 4 * 1024 * 1024,
+            bus_buffer_size: 16 * 1024 * 1024,
         }
     }
 }

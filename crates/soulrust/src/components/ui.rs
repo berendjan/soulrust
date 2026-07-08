@@ -21,6 +21,10 @@ const MAX_LOG_LINES: usize = 100;
 /// Cap on results kept per search, so a flood of responses can't grow the UI
 /// state without bound (filtering already drops the worst before they arrive).
 const MAX_RESULTS_PER_SEARCH: usize = 200;
+/// Cap on files kept per peer result row. `peer_net` splits a large response
+/// across several messages that we merge into one row; this bounds how big that
+/// merged row can get.
+const MAX_FILES_PER_RESULT: usize = 5000;
 /// Cap on tracked downloads shown on the Downloads page.
 const MAX_DOWNLOADS: usize = 200;
 
@@ -869,31 +873,36 @@ impl traits::core::Handle<SearchResultReceived> for Ui {
     fn handle<W: traits::core::Writer>(&mut self, message: &SearchResultReceived, _writer: &W) {
         // Correlate to the search we started; results for an unknown token (not
         // ours, or already cleared) are ignored.
-        let Some(row) = self.searches.iter_mut().find(|s| s.token == message.token) else {
+        let Some(search) = self.searches.iter_mut().find(|s| s.token == message.token) else {
             return;
         };
-        if row.results.len() >= MAX_RESULTS_PER_SEARCH {
-            return;
-        }
-        row.results.push(SearchResultRow {
-            username: message.username.clone(),
-            free_slots: message.free_slots,
-            upload_speed: message.upload_speed,
-            in_queue: message.in_queue,
-            files: message
-                .files
-                .iter()
-                .map(|f| ResultFile {
-                    name: f.name.clone(),
-                    size: f.size,
-                    bitrate: f.bitrate,
-                    length: f.length,
-                    vbr: f.vbr,
-                    sample_rate: f.sample_rate,
-                    bit_depth: f.bit_depth,
-                })
-                .collect(),
+        let mut incoming = message.files.iter().map(|f| ResultFile {
+            name: f.name.clone(),
+            size: f.size,
+            bitrate: f.bitrate,
+            length: f.length,
+            vbr: f.vbr,
+            sample_rate: f.sample_rate,
+            bit_depth: f.bit_depth,
         });
+        // peer_net splits one peer's large response across several messages;
+        // merge chunks into that peer's existing row (bounded) so it shows as a
+        // single result no matter how many messages it arrived in.
+        if let Some(existing) = search.results.iter_mut().find(|r| r.username == message.username) {
+            let room = MAX_FILES_PER_RESULT.saturating_sub(existing.files.len());
+            existing.files.extend(incoming.by_ref().take(room));
+            existing.free_slots = message.free_slots;
+            existing.upload_speed = message.upload_speed;
+            existing.in_queue = message.in_queue;
+        } else if search.results.len() < MAX_RESULTS_PER_SEARCH {
+            search.results.push(SearchResultRow {
+                username: message.username.clone(),
+                free_slots: message.free_slots,
+                upload_speed: message.upload_speed,
+                in_queue: message.in_queue,
+                files: incoming.take(MAX_FILES_PER_RESULT).collect(),
+            });
+        }
     }
 }
 
@@ -1630,6 +1639,27 @@ mod tests {
         assert!(entries
             .iter()
             .any(|d| d.filename == "half.flac" && d.state == DownloadState::Incomplete));
+    }
+
+    #[test]
+    fn chunked_results_from_one_peer_merge_into_a_single_row() {
+        // peer_net may split a big response into several messages sharing the
+        // same (token, user); the UI merges them into one row, while a different
+        // user still gets its own row.
+        let mut ui = test_ui();
+        apply(&mut ui, SessionEventKind::SearchStarted { token: 7, query: "q".into() });
+        feed_result(&mut ui, 7, "bob", "a.mp3", Some(320));
+        feed_result(&mut ui, 7, "bob", "b.mp3", Some(320));
+        feed_result(&mut ui, 7, "carol", "c.mp3", Some(256));
+
+        let search = ui.searches.iter().find(|s| s.token == 7).unwrap();
+        assert_eq!(search.results.len(), 2, "bob's two chunks merged; carol is separate");
+        let bob = search.results.iter().find(|r| r.username == "bob").unwrap();
+        assert_eq!(bob.files.len(), 2, "both of bob's files are kept");
+
+        // Both files render.
+        let html = ui.render(&Page::SearchesFragment);
+        assert!(html.contains("a.mp3") && html.contains("b.mp3") && html.contains("c.mp3"));
     }
 
     #[test]

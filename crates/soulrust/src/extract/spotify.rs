@@ -1,6 +1,8 @@
-//! Spotify extractor: playlist/album/track URLs and URIs via the Web API
-//! client-credentials flow. HTTP access is behind [`SpotifyApi`] so unit
-//! tests run against JSON fixtures.
+//! Spotify extractor: playlist/album/track URLs and URIs via the Web API.
+//! Uses the OAuth Authorization Code (user-login) flow — Spotify no longer
+//! serves playlist tracks to the app-only Client Credentials flow. The stored
+//! refresh token is exchanged for short-lived user access tokens. HTTP access is
+//! behind [`SpotifyApi`] so unit tests run against JSON fixtures.
 
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
@@ -13,13 +15,16 @@ pub struct SpotifyToken {
     pub expires_at: Instant,
 }
 
-/// The two HTTP operations the extractor needs. Pagination and JSON mapping
-/// stay above this boundary so they're covered by fixture tests.
+/// The HTTP operations the extractor needs. Pagination and JSON mapping stay
+/// above this boundary so they're covered by fixture tests.
 pub trait SpotifyApi: Send {
-    fn client_credentials_token(
+    /// Exchange the stored OAuth refresh token for a short-lived user access
+    /// token (`grant_type=refresh_token`).
+    fn refresh_access_token(
         &self,
         client_id: &str,
         client_secret: &str,
+        refresh_token: &str,
     ) -> Result<SpotifyToken, String>;
     fn get_json(&self, access_token: &str, url: &str) -> Result<serde_json::Value, String>;
 }
@@ -45,10 +50,11 @@ impl Default for UreqSpotifyApi {
 }
 
 impl SpotifyApi for UreqSpotifyApi {
-    fn client_credentials_token(
+    fn refresh_access_token(
         &self,
         client_id: &str,
         client_secret: &str,
+        refresh_token: &str,
     ) -> Result<SpotifyToken, String> {
         // Credentials in the form body (supported alternative to the
         // Authorization: Basic header) to avoid a base64 dependency.
@@ -56,11 +62,12 @@ impl SpotifyApi for UreqSpotifyApi {
             .agent
             .post("https://accounts.spotify.com/api/token")
             .send_form(&[
-                ("grant_type", "client_credentials"),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
                 ("client_id", client_id),
                 ("client_secret", client_secret),
             ])
-            .map_err(|e| format!("token request failed: {e}"))?
+            .map_err(|e| format!("token refresh failed: {e}"))?
             .into_json()
             .map_err(|e| format!("token response is not json: {e}"))?;
 
@@ -77,14 +84,74 @@ impl SpotifyApi for UreqSpotifyApi {
     }
 
     fn get_json(&self, access_token: &str, url: &str) -> Result<serde_json::Value, String> {
-        self.agent
+        let response = match self
+            .agent
             .get(url)
             .set("Authorization", &format!("Bearer {access_token}"))
             .call()
-            .map_err(|e| format!("GET {url} failed: {e}"))?
+        {
+            Ok(response) => response,
+            // Non-2xx: surface Spotify's own error message. Its body is
+            // `{"error":{"status":..,"message":".."}}`, so a 403/404 explains
+            // itself (e.g. "This playlist is not accessible") instead of leaving
+            // the user with a bare status code.
+            Err(ureq::Error::Status(code, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                let detail = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v["error"]["message"].as_str().map(str::to_owned))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| body.trim().to_owned());
+                return Err(format!("GET {url}: status {code}: {detail}"));
+            }
+            Err(e) => return Err(format!("GET {url} failed: {e}")),
+        };
+        response
             .into_json()
             .map_err(|e| format!("GET {url}: response is not json: {e}"))
     }
+}
+
+/// The refresh token obtained from the Authorization Code exchange. The access
+/// token isn't kept — the extractor mints its own from the refresh token.
+pub struct OauthTokens {
+    pub refresh_token: String,
+}
+
+/// Exchange an authorization `code` (from the `/spotify/callback` redirect) for
+/// a refresh token. Standalone (not on [`SpotifyApi`]) because only the web
+/// bridge's OAuth callback calls it, once per login. `redirect_uri` must match
+/// the one used to start the flow exactly.
+pub fn exchange_authorization_code(
+    client_id: &str,
+    client_secret: &str,
+    code: &str,
+    redirect_uri: &str,
+) -> Result<OauthTokens, String> {
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).build();
+    let response: serde_json::Value = match agent
+        .post("https://accounts.spotify.com/api/token")
+        .send_form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+        ]) {
+        Ok(resp) => resp
+            .into_json()
+            .map_err(|e| format!("token response is not json: {e}"))?,
+        Err(ureq::Error::Status(status, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            return Err(format!("token exchange failed: status {status}: {}", body.trim()));
+        }
+        Err(e) => return Err(format!("token exchange failed: {e}")),
+    };
+    let refresh_token = response["refresh_token"].as_str().unwrap_or_default().to_owned();
+    if refresh_token.is_empty() {
+        return Err("token exchange returned no refresh_token".into());
+    }
+    Ok(OauthTokens { refresh_token })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,6 +234,18 @@ impl SpotifyExtractor {
                 )
             })?;
 
+        let refresh_token = config
+            .spotify
+            .refresh_token
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                ExtractError::MissingCredentials(
+                    "not logged in to Spotify — open /spotify and click \"Log in with Spotify\""
+                        .into(),
+                )
+            })?;
+
         let mut cached = self.token.borrow_mut();
         if let Some(token) = cached.as_ref() {
             if token.expires_at > Instant::now() {
@@ -175,7 +254,7 @@ impl SpotifyExtractor {
         }
         let fresh = self
             .api
-            .client_credentials_token(client_id, client_secret)
+            .refresh_access_token(client_id, client_secret, refresh_token)
             .map_err(ExtractError::Api)?;
         let access = fresh.access_token.clone();
         *cached = Some(fresh);
@@ -241,9 +320,26 @@ impl SpotifyExtractor {
         let playlist_name = meta["name"].as_str().unwrap_or(id).to_owned();
 
         let mut searches = Vec::new();
-        let mut url = format!("https://api.spotify.com/v1/playlists/{id}/tracks?limit=100");
+        // The modern "Get Playlist Items" endpoint (user token required; max
+        // limit 50). Spotify only serves this for playlists the logged-in user
+        // owns or collaborates on.
+        let mut url = format!("https://api.spotify.com/v1/playlists/{id}/items?limit=50");
         loop {
-            let page = self.api.get_json(token, &url).map_err(ExtractError::Api)?;
+            let page = match self.api.get_json(token, &url) {
+                Ok(page) => page,
+                // Surface a clear reason instead of a bare status code when the
+                // very first page is refused (typically: the playlist isn't one
+                // you own or collaborate on).
+                Err(e) if searches.is_empty() => {
+                    return Err(ExtractError::Api(format!(
+                        "Spotify wouldn't return this playlist's tracks ({e}). Spotify \
+                         only serves playlists you own or collaborate on — check you're \
+                         logged in (see /spotify) and that it's your playlist."
+                    )));
+                }
+                // A later page failed after we already have some tracks: keep them.
+                Err(_) => break,
+            };
             for item in page["items"].as_array().into_iter().flatten() {
                 // Playlist items wrap the track; local files have track: null.
                 let track = &item["track"];
@@ -329,14 +425,15 @@ mod tests {
     }
 
     impl SpotifyApi for MockApi {
-        fn client_credentials_token(
+        fn refresh_access_token(
             &self,
             _client_id: &str,
             _client_secret: &str,
+            _refresh_token: &str,
         ) -> Result<SpotifyToken, String> {
             *self.token_calls.lock().unwrap() += 1;
             if self.fail_token {
-                return Err("401 invalid_client".into());
+                return Err("401 invalid_grant".into());
             }
             Ok(SpotifyToken {
                 access_token: "test-token".into(),
@@ -359,6 +456,9 @@ mod tests {
         let mut config = Config::default();
         config.spotify.client_id = Some("id".into());
         config.spotify.client_secret = Some("secret".into());
+        // Logged in: a refresh token is present, so the extractor can mint a
+        // user access token.
+        config.spotify.refresh_token = Some("refresh".into());
         config
     }
 
@@ -443,17 +543,17 @@ mod tests {
                 json!({ "name": "Mix" }),
             ),
             (
-                "https://api.spotify.com/v1/playlists/pl/tracks?limit=100",
+                "https://api.spotify.com/v1/playlists/pl/items?limit=50",
                 json!({
                     "items": [
                         { "track": track("X", "First") },
                         { "track": null }
                     ],
-                    "next": "https://api.spotify.com/v1/playlists/pl/tracks?limit=100&offset=100"
+                    "next": "https://api.spotify.com/v1/playlists/pl/items?limit=50&offset=50"
                 }),
             ),
             (
-                "https://api.spotify.com/v1/playlists/pl/tracks?limit=100&offset=100",
+                "https://api.spotify.com/v1/playlists/pl/items?limit=50&offset=50",
                 json!({ "items": [{ "track": track("Y", "Second") }], "next": null }),
             ),
         ]);
@@ -465,6 +565,37 @@ mod tests {
         assert_eq!(job.searches.len(), 2);
         assert_eq!(job.searches[0].to_query(), "X First");
         assert_eq!(job.searches[1].to_query(), "Y Second");
+    }
+
+    #[test]
+    fn playlist_inaccessible_tracks_give_an_actionable_error() {
+        // The /items endpoint is refused (here the mock has no such entry,
+        // standing in for a 403 on a playlist you don't own). With no tracks yet
+        // gathered, we surface a clear explanation, not a bare status code.
+        let api = MockApi::new(vec![(
+            "https://api.spotify.com/v1/playlists/pl?fields=name",
+            json!({ "name": "Mix" }),
+        )]);
+        let extractor = SpotifyExtractor::new(Box::new(api));
+        let err = extractor.extract("spotify:playlist:pl", &config_with_creds()).unwrap_err();
+        assert!(
+            matches!(&err, ExtractError::Api(m) if m.contains("own or collaborate")),
+            "expected an actionable ownership message, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn not_logged_in_is_a_clear_error() {
+        // Credentials set but no refresh token yet -> a "log in" message.
+        let mut config = Config::default();
+        config.spotify.client_id = Some("id".into());
+        config.spotify.client_secret = Some("secret".into());
+        let extractor = SpotifyExtractor::new(Box::new(MockApi::new(vec![])));
+        let err = extractor.extract("spotify:playlist:pl", &config).unwrap_err();
+        assert!(
+            matches!(&err, ExtractError::MissingCredentials(m) if m.contains("Log in")),
+            "expected a login prompt, got: {err:?}"
+        );
     }
 
     #[test]

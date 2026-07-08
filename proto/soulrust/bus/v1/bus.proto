@@ -389,6 +389,10 @@ message ServerConfig {
 message SpotifyConfig {
   optional string client_id = 1;
   optional string client_secret = 2;
+  // OAuth Authorization Code refresh token, obtained after the user logs in via
+  // /spotify/login. Used to mint short-lived user access tokens for the Web API
+  // (playlist reads require a user token; Client Credentials is no longer enough).
+  optional string refresh_token = 3;
 }
 
 message UpdateConfig {

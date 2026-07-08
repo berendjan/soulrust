@@ -7,6 +7,7 @@
 //! handlers complete those channels when the response messages come back.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -45,6 +46,12 @@ pub struct WebBridge {
     corr: Arc<AtomicU64>,
     bind_addr: String,
     control: Arc<Control>,
+    /// The config file path (for the "View config" fragment); the same path
+    /// `main` loaded from.
+    config_path: PathBuf,
+    /// The pending OAuth `state` nonce between `/spotify/login` and its callback,
+    /// for CSRF protection. Shared across HTTP workers.
+    oauth_state: Arc<Mutex<Option<String>>>,
 }
 
 impl WebBridge {
@@ -54,6 +61,8 @@ impl WebBridge {
             corr: Arc::new(AtomicU64::new(0)),
             bind_addr: ctx.config.ui.bind_addr.clone(),
             control: ctx.control.clone(),
+            config_path: ctx.config_path.clone(),
+            oauth_state: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -85,6 +94,8 @@ impl traits::core::Handler for WebBridge {
                 pending: self.pending.clone(),
                 corr: self.corr.clone(),
                 control: self.control.clone(),
+                config_path: self.config_path.clone(),
+                oauth_state: self.oauth_state.clone(),
                 writer: writer.clone(),
             };
             std::thread::Builder::new()
@@ -162,6 +173,8 @@ struct SharedBridge<W: traits::core::Writer> {
     pending: Pending,
     corr: Arc<AtomicU64>,
     control: Arc<Control>,
+    config_path: PathBuf,
+    oauth_state: Arc<Mutex<Option<String>>>,
     writer: W,
 }
 
@@ -193,6 +206,17 @@ impl<W: traits::core::Writer> SharedBridge<W> {
         let method = request.method().clone();
         let url = request.url().to_string();
         let path = url.split('?').next().unwrap_or("/").to_string();
+
+        // OAuth endpoints respond with redirects, so they bypass the HTML tuple
+        // flow below and write their own responses.
+        if method.as_str() == "GET" && path == "/spotify/login" {
+            self.spotify_login(request);
+            return;
+        }
+        if method.as_str() == "GET" && path == "/spotify/callback" {
+            self.spotify_callback(request, &url);
+            return;
+        }
 
         let mut body = String::new();
         let _ = request.as_reader().read_to_string(&mut body);
@@ -228,6 +252,7 @@ impl<W: traits::core::Writer> SharedBridge<W> {
                 ("GET", "/bulk") => self.html_page(self.bulk_page()),
                 ("GET", "/spotify") => self.html_page(self.spotify_page(None)),
                 ("GET", "/config") => self.html_page(self.config_page()),
+                ("GET", "/config/view") => self.html_page(self.config_view()),
                 ("POST", "/account") => self.html_page(self.save_account(&body)),
                 ("POST", "/download") => self.html_page(self.submit_download(&body)),
                 ("POST", "/download/cancel") => self.html_page(self.cancel_download(&body)),
@@ -437,6 +462,28 @@ impl<W: traits::core::Writer> SharedBridge<W> {
         Ok(render_config_page(&config, None))
     }
 
+    /// GET /config/view: the effective configuration serialized to YAML (with
+    /// secrets redacted), plus the on-disk path and whether the file exists yet.
+    fn config_view(&self) -> Result<String, String> {
+        let config = self.current_config()?;
+        let path = self.config_path.display().to_string();
+        let (pill, note) = if self.config_path.exists() {
+            (r#"<span class="pill ok">on disk</span>"#, "")
+        } else {
+            (
+                r#"<span class="pill warn">not saved yet</span>"#,
+                " — showing the effective defaults; the file is written on the first Save.",
+            )
+        };
+        Ok(format!(
+            r#"<div class="card"><h3 style="margin-top:0">Effective configuration</h3><p class="muted" style="margin-top:0"><code>{path}</code> {pill}{note}</p><pre class="log">{yaml}</pre></div>"#,
+            path = escape(&path),
+            pill = pill,
+            note = escape(note),
+            yaml = escape(&config_as_redacted_yaml(&config)),
+        ))
+    }
+
     fn save_config(&self, body: &str) -> Result<String, String> {
         let form = parse_form(body);
         let mut config = self.current_config()?;
@@ -619,11 +666,154 @@ impl<W: traits::core::Writer> SharedBridge<W> {
 
         let banner = match &result {
             Ok(()) => {
-                r#"<div class="banner">Spotify credentials saved.</div>"#.to_string()
+                r#"<div class="banner">Spotify credentials saved — now click <strong>Log in with Spotify</strong> below.</div>"#.to_string()
             }
             Err(err) => format!(r#"<div class="banner error">{}</div>"#, escape(err)),
         };
         Ok(render_spotify_page(&config, Some(banner)))
+    }
+
+    /// The redirect URI registered with Spotify — derived from the UI bind
+    /// address so it matches exactly what the user entered in the dashboard.
+    fn spotify_redirect_uri(&self, config: &Config) -> String {
+        format!("http://{}/spotify/callback", config.ui.bind_addr)
+    }
+
+    /// Mint a fresh OAuth `state` nonce and remember it for the callback to
+    /// verify. Not cryptographic, but enough to bind a callback to a login we
+    /// started on this loopback-only server.
+    fn new_oauth_state(&self) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = self.corr.fetch_add(1, Ordering::Relaxed);
+        let state = format!("{nanos:x}{seq:x}");
+        *self.oauth_state.lock().unwrap() = Some(state.clone());
+        state
+    }
+
+    /// Build the Spotify authorize URL to redirect the browser to.
+    fn spotify_authorize_url(&self) -> Result<String, String> {
+        let config = self.current_config()?;
+        let client_id = config
+            .spotify
+            .client_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or("set your Spotify Client ID first (see the Connect Spotify page)")?;
+        let redirect_uri = self.spotify_redirect_uri(&config);
+        let state = self.new_oauth_state();
+        Ok(format!(
+            "https://accounts.spotify.com/authorize?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}",
+            percent_encode(client_id),
+            percent_encode(&redirect_uri),
+            percent_encode("playlist-read-private playlist-read-collaborative"),
+            percent_encode(&state),
+        ))
+    }
+
+    /// GET /spotify/login: 302 the browser to Spotify's authorize screen.
+    fn spotify_login(&self, request: tiny_http::Request) {
+        match self.spotify_authorize_url() {
+            Ok(location) => {
+                let header = tiny_http::Header::from_bytes(&b"Location"[..], location.as_bytes())
+                    .expect("location header");
+                let _ = request.respond(tiny_http::Response::empty(302).with_header(header));
+            }
+            Err(err) => {
+                let html = format!(r#"<div class="banner error">{}</div>"#, escape(&err));
+                let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..])
+                    .expect("content-type header");
+                let _ = request.respond(
+                    tiny_http::Response::from_data(html.into_bytes())
+                        .with_status_code(400)
+                        .with_header(header),
+                );
+            }
+        }
+    }
+
+    /// GET /spotify/callback: verify state, exchange the code for a refresh
+    /// token, persist it, then bounce back to the Connect Spotify page.
+    fn spotify_callback(&self, request: tiny_http::Request, url: &str) {
+        match self.complete_spotify_login(url) {
+            Ok(()) => {
+                let header = tiny_http::Header::from_bytes(&b"Location"[..], &b"/spotify"[..])
+                    .expect("location header");
+                let _ = request.respond(tiny_http::Response::empty(302).with_header(header));
+            }
+            Err(err) => {
+                let banner =
+                    format!(r#"<div class="banner error">Spotify login failed: {}</div>"#, escape(&err));
+                let html = self
+                    .spotify_page(Some(banner))
+                    .unwrap_or_else(|e| format!("<p>error: {}</p>", escape(&e)));
+                let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..])
+                    .expect("content-type header");
+                let _ = request.respond(
+                    tiny_http::Response::from_data(html.into_bytes())
+                        .with_status_code(400)
+                        .with_header(header),
+                );
+            }
+        }
+    }
+
+    fn complete_spotify_login(&self, url: &str) -> Result<(), String> {
+        let params = parse_form(url.split('?').nth(1).unwrap_or(""));
+        if let Some(err) = params.get("error") {
+            return Err(format!("Spotify returned '{err}'"));
+        }
+        let code = params
+            .get("code")
+            .filter(|s| !s.is_empty())
+            .ok_or("callback had no authorization code")?;
+        let returned_state = params.get("state").cloned().unwrap_or_default();
+        // Consume the pending state and require an exact match.
+        match self.oauth_state.lock().unwrap().take() {
+            Some(expected) if expected == returned_state => {}
+            _ => return Err("state mismatch — please start the login again".into()),
+        }
+
+        let mut config = self.current_config()?;
+        let client_id = config
+            .spotify
+            .client_id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .ok_or("Spotify Client ID is not set")?;
+        let client_secret = config
+            .spotify
+            .client_secret
+            .clone()
+            .filter(|s| !s.is_empty())
+            .ok_or("Spotify Client Secret is not set")?;
+        let redirect_uri = self.spotify_redirect_uri(&config);
+
+        let tokens = crate::extract::spotify::exchange_authorization_code(
+            &client_id,
+            &client_secret,
+            code,
+            &redirect_uri,
+        )?;
+        config.spotify.refresh_token = Some(tokens.refresh_token);
+
+        // Persist via the config store, which also broadcasts ConfigChanged so
+        // the extractor picks up the new refresh token.
+        match self.round_trip(|corr| {
+            WebBridge::send(
+                &SetConfigReq {
+                    corr,
+                    config: soulrust_proto::MessageField::some(crate::config::config_to_proto(&config)),
+                    ..Default::default()
+                },
+                &self.writer,
+            );
+        })? {
+            BridgeReply::SetConfig(result) => result,
+            _ => Err("unexpected reply type".into()),
+        }
     }
 }
 
@@ -640,18 +830,29 @@ fn secret_placeholder(secret: &str, if_unset: &str) -> String {
     }
 }
 
-/// True when both Spotify credentials are present.
-fn spotify_connected(config: &Config) -> bool {
+/// True once the user has completed the OAuth login (a refresh token is stored).
+fn spotify_logged_in(config: &Config) -> bool {
+    config.spotify.refresh_token.as_deref().is_some_and(|s| !s.is_empty())
+}
+
+/// True when both app credentials (client id + secret) are present — the
+/// prerequisite for starting the login.
+fn spotify_credentials_set(config: &Config) -> bool {
     config.spotify.client_id.as_deref().is_some_and(|s| !s.is_empty())
         && config.spotify.client_secret.as_deref().is_some_and(|s| !s.is_empty())
 }
 
-/// A status pill + "set up" button for Spotify, shown on the bulk + spotify
-/// pages.
+/// A status pill + next-step button for Spotify, shown on the bulk + spotify
+/// pages: logged in, credentials-set-but-not-logged-in, or nothing set.
 fn spotify_status_card(config: &Config) -> String {
-    if spotify_connected(config) {
+    if spotify_logged_in(config) {
         r#"<div class="card"><span class="pill ok">● Spotify connected</span>
 <a class="btn secondary" style="margin-left:0.6rem" href="/spotify">Manage</a></div>"#
+            .to_string()
+    } else if spotify_credentials_set(config) {
+        r#"<div class="card"><span class="pill warn">● Spotify not logged in</span>
+<a class="btn spotify" style="margin-left:0.6rem" href="/spotify/login">Log in with Spotify</a>
+<p class="muted" style="margin:0.6rem 0 0">Log in so soulrust can read your playlists.</p></div>"#
             .to_string()
     } else {
         r#"<div class="card"><span class="pill warn">● Spotify not connected</span>
@@ -689,26 +890,44 @@ fn render_bulk_page(config: &Config) -> String {
 }
 
 fn render_spotify_page(config: &Config, banner: Option<String>) -> String {
-    let status = if spotify_connected(config) {
-        r#"<span class="pill ok">● Connected</span>"#
+    let redirect_uri = format!("http://{}/spotify/callback", config.ui.bind_addr);
+    let status = if spotify_logged_in(config) {
+        r#"<span class="pill ok">● Logged in</span>"#
+    } else if spotify_credentials_set(config) {
+        r#"<span class="pill warn">● Not logged in</span>"#
     } else {
         r#"<span class="pill warn">● Not connected</span>"#
     };
+    // The login button only appears once app credentials are saved.
+    let login = if spotify_credentials_set(config) {
+        let (heading, label) = if spotify_logged_in(config) {
+            ("Logged in", "Re-log in with Spotify")
+        } else {
+            ("Log in", "Log in with Spotify")
+        };
+        format!(
+            r#"<div class="card"><h2 style="margin-top:0">{heading}</h2>
+<p class="muted" style="margin-top:0">soulrust opens Spotify in your browser to authorize read-only access to your playlists. Spotify only serves playlists you own or collaborate on.</p>
+<a class="btn spotify" href="/spotify/login">{label}</a></div>"#
+        )
+    } else {
+        String::new()
+    };
     let body = format!(
         r#"<h1>Connect Spotify</h1>
-<p class="sub">{status} &nbsp; soulrust reads <strong>public</strong> Spotify playlists, albums, and tracks to turn them into searches. You'll create a free Spotify app once and paste its two keys below.</p>
+<p class="sub">{status} &nbsp; soulrust reads your Spotify playlists (plus albums and tracks) to turn them into searches. Create a free Spotify app once, paste its two keys, then log in.</p>
 {banner}
 <div class="card">
 <h2 style="margin-top:0">Get your keys (about 2 minutes)</h2>
 <ol class="steps">
   <li>Open the <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noopener">Spotify Developer Dashboard</a> and log in with any Spotify account (a free account works).</li>
   <li>Click <strong>Create app</strong>.</li>
-  <li>Fill in an <strong>App name</strong> (e.g. <code>soulrust</code>) and a short description. For <strong>Redirect URI</strong> enter <code>http://127.0.0.1/callback</code> — soulrust never uses it, but Spotify's form won't save without one. Under "Which API/SDKs…?" tick <strong>Web API</strong>, accept the terms, and click <strong>Save</strong>.</li>
+  <li>Fill in an <strong>App name</strong> (e.g. <code>soulrust</code>) and a short description. For <strong>Redirect URI</strong> enter <code>{redirect_uri}</code> <strong>exactly</strong> — this is where Spotify sends you back after you log in. Under "Which API/SDKs…?" tick <strong>Web API</strong>, accept the terms, and click <strong>Save</strong>.</li>
   <li>Open your new app and go to <strong>Settings</strong>.</li>
   <li>Copy the <strong>Client ID</strong>. Click <strong>View client secret</strong> and copy the <strong>Client secret</strong>.</li>
-  <li>Paste both below and click <strong>Save</strong>. That's it.</li>
+  <li>Paste both below and click <strong>Save</strong>, then <strong>Log in with Spotify</strong>.</li>
 </ol>
-<p class="muted">This uses Spotify's "Client Credentials" mode: it reads public playlists/albums/tracks only, and never logs into or touches your account, so your private and liked songs aren't visible.</p>
+<p class="muted">This uses Spotify's Authorization Code flow: after you approve it once, soulrust gets read-only access to your playlists and stores only a refresh token locally — it never sees your password.</p>
 </div>
 <div class="card">
 <form hx-post="/spotify" hx-target="body">
@@ -717,14 +936,17 @@ fn render_spotify_page(config: &Config, banner: Option<String>) -> String {
   <p style="margin-top:0.9rem"><button class="btn spotify" type="submit">Save</button>
   <a class="btn secondary" style="margin-left:0.5rem" href="/bulk">Back to bulk downloads</a></p>
 </form>
-</div>"#,
+</div>
+{login}"#,
         status = status,
         banner = banner.unwrap_or_default(),
+        redirect_uri = escape(&redirect_uri),
         client_id = escape(config.spotify.client_id.as_deref().unwrap_or("")),
         secret_ph = secret_placeholder(
             config.spotify.client_secret.as_deref().unwrap_or(""),
             "paste the client secret",
         ),
+        login = login,
     );
     shell("soulrust — connect Spotify", "spotify", &config.server.username, &body)
 }
@@ -763,7 +985,7 @@ fn render_account_page(config: &Config, banner: Option<String>) -> String {
 fn render_config_page(config: &Config, banner: Option<String>) -> String {
     let checked = |b: bool| if b { "checked" } else { "" };
     let body = format!(
-        r#"<h1>Settings</h1>
+        r##"<h1>Settings</h1>
 <p class="sub">Server, Spotify, updates, and the web UI address. Server and Spotify changes apply after a restart.</p>
 <div id="result">{banner}</div>
 <form hx-post="/config" hx-target="body">
@@ -807,7 +1029,12 @@ fn render_config_page(config: &Config, banner: Option<String>) -> String {
 <label>max upload speed (B/s, 0 = unlimited) <input type="text" name="max_upload_speed" value="{max_up}"></label>
 </div>
 <p><button class="btn" type="submit">Save</button></p>
-</form>"#,
+</form>
+<div class="card"><h2 style="margin-top:0">Inspect</h2>
+<p class="muted" style="margin-top:0">See the effective configuration as stored YAML (the password and Spotify secret are hidden).</p>
+<button class="btn secondary" hx-get="/config/view" hx-target="#config-view" hx-swap="innerHTML">View config</button>
+<div id="config-view" style="margin-top:1rem"></div>
+</div>"##,
         banner = banner.unwrap_or_default(),
         host = escape(&config.server.host),
         port = config.server.port,
@@ -839,6 +1066,21 @@ fn render_config_page(config: &Config, banner: Option<String>) -> String {
     shell("soulrust — settings", "config", &config.server.username, &body)
 }
 
+/// Serialize a config to YAML for display, with secret fields masked so the
+/// view never reveals the Soulseek password or Spotify client secret (the rest
+/// of the settings UI is careful never to render them either).
+fn config_as_redacted_yaml(config: &Config) -> String {
+    const HIDDEN: &str = "(hidden)";
+    let mut c = config.clone();
+    if !c.server.password.is_empty() {
+        c.server.password = HIDDEN.into();
+    }
+    if c.spotify.client_secret.as_deref().is_some_and(|s| !s.is_empty()) {
+        c.spotify.client_secret = Some(HIDDEN.into());
+    }
+    serde_yaml::to_string(&c).unwrap_or_else(|e| format!("failed to serialize config: {e}"))
+}
+
 /// Minimal application/x-www-form-urlencoded parser (avoids a url dep).
 fn parse_form(body: &str) -> HashMap<String, String> {
     body.split('&')
@@ -853,6 +1095,21 @@ fn parse_form(body: &str) -> HashMap<String, String> {
             }
         })
         .collect()
+}
+
+/// Percent-encode a query value: keep the RFC 3986 unreserved set, escape the
+/// rest (so a redirect URI's `:` and `/` and the scope's spaces are encoded).
+fn percent_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for &b in input.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 fn percent_decode(input: &str) -> String {
@@ -931,6 +1188,29 @@ mod tests {
     }
 
     #[test]
+    fn config_page_has_a_view_config_control() {
+        let html = render_config_page(&Config::default(), None);
+        assert!(html.contains(r#"hx-get="/config/view""#), "settings page exposes View config");
+        assert!(html.contains("View config"));
+        assert!(html.contains(r#"id="config-view""#), "has a target container for the fragment");
+    }
+
+    #[test]
+    fn redacted_yaml_hides_secrets_but_keeps_other_fields() {
+        let mut config = Config::default();
+        config.server.username = "alice".into();
+        config.server.password = "hunter2".into();
+        config.spotify.client_id = Some("pub-id".into());
+        config.spotify.client_secret = Some("sssh".into());
+        let yaml = config_as_redacted_yaml(&config);
+        assert!(!yaml.contains("hunter2"), "password is masked");
+        assert!(!yaml.contains("sssh"), "client secret is masked");
+        assert!(yaml.contains("alice"), "non-secret fields are shown");
+        assert!(yaml.contains("pub-id"), "the public client id is shown");
+        assert!(yaml.contains("(hidden)"));
+    }
+
+    #[test]
     fn config_page_exposes_download_dir_and_shared_folders() {
         let mut config = Config::default();
         config.sharing.download_dir = "/home/me/Music/soulrust".into();
@@ -1002,14 +1282,37 @@ mod tests {
     }
 
     #[test]
-    fn spotify_page_reflects_connected_state_without_leaking_the_secret() {
+    fn spotify_page_offers_login_once_credentials_are_set() {
         let mut config = Config::default();
         config.spotify.client_id = Some("pub-id".into());
         config.spotify.client_secret = Some("the-secret".into());
-        assert!(spotify_connected(&config));
+        assert!(spotify_credentials_set(&config) && !spotify_logged_in(&config));
         let html = render_spotify_page(&config, None);
-        assert!(html.contains("Connected"));
+        // Credentials set but not logged in -> prompts login.
+        assert!(html.contains("Not logged in"));
+        assert!(html.contains(r#"href="/spotify/login""#), "shows the login button");
         assert!(html.contains("pub-id"), "the public client id is shown");
         assert!(!html.contains("the-secret"), "the secret is never rendered");
+    }
+
+    #[test]
+    fn spotify_page_shows_logged_in_and_the_callback_redirect_uri() {
+        let mut config = Config::default();
+        config.spotify.client_id = Some("pub-id".into());
+        config.spotify.client_secret = Some("the-secret".into());
+        config.spotify.refresh_token = Some("rt".into());
+        let html = render_spotify_page(&config, None);
+        assert!(spotify_logged_in(&config) && html.contains("Logged in"));
+        // The exact redirect URI the user must register is shown.
+        assert!(html.contains("http://127.0.0.1:5030/spotify/callback"));
+    }
+
+    #[test]
+    fn percent_encode_escapes_reserved_characters() {
+        assert_eq!(
+            percent_encode("http://127.0.0.1:5030/spotify/callback"),
+            "http%3A%2F%2F127.0.0.1%3A5030%2Fspotify%2Fcallback"
+        );
+        assert_eq!(percent_encode("a b-c_d.e~f"), "a%20b-c_d.e~f");
     }
 }
