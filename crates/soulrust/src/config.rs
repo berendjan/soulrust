@@ -270,14 +270,17 @@ pub fn config_from_proto(c: &bus::Config) -> Config {
 }
 
 /// `$XDG_CONFIG_HOME/soulrust.yaml`, falling back to `~/.config/soulrust.yaml`.
+/// The home directory is resolved cross-platform (`HOME`, then `USERPROFILE`
+/// on Windows) so the path is always absolute on a real desktop — a relative
+/// `./.config/...` would otherwise resolve against the (GUI-dependent) process
+/// CWD and be unreadable/unwritable, silently losing the saved config.
 pub fn default_config_path() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
             return PathBuf::from(xdg).join("soulrust.yaml");
         }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".config").join("soulrust.yaml")
+    home_dir().join(".config").join("soulrust.yaml")
 }
 
 /// Loads the config, falling back to defaults when the file is missing or

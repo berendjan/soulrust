@@ -1,6 +1,6 @@
 [package]
 name = "soulrust"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 description = "Soulseek client: components on the rust-messenger bus, htmx web UI, self-updater, Spotify extractor."
 license = "MIT"

@@ -473,7 +473,7 @@
     "@@rules_rust+//crate_universe:extensions.bzl%crate": {
       "general": {
         "bzlTransitiveDigest": "r2A95SmJhS2rIQw2sdLDi1N35RppjyyJ14+DCSDlDsI=",
-        "usagesDigest": "vKIO7tqkvM55Lua1Z8qDpUBCTdj+uPiFBXde3QLl5T0=",
+        "usagesDigest": "LM6grRUIUtouU67oMMPXfZ/ydHHOsYrnu7BZj0uAGoY=",
         "recordedInputs": [
           "ENV:CARGO_BAZEL_DEBUG \\0",
           "ENV:CARGO_BAZEL_GENERATOR_SHA256 \\0",
@@ -496,11 +496,11 @@
           "REPO_MAPPING:rules_rust+,bazel_tools bazel_tools",
           "REPO_MAPPING:rules_rust+,rules_cc rules_cc+",
           "REPO_MAPPING:rules_rust+,rules_rust rules_rust+",
-          "FILE:@@//Cargo.lock 76e3bff8088a625612c5cb01d16925c5072d03f9f98e6ebbbd9b246b063d995d",
+          "FILE:@@//Cargo.lock 22cee20b7b5fbecf1f93592147f0bc48904414be9ac89edab17bb718be4b3400",
           "FILE:@@//Cargo.toml 622151f56124438cbf1fa5d5ffa00ea3f06b7364a8ebd8985858c9dd3f0ccd6d",
           "FILE:@@//crates/messenger-macro/Cargo.toml f2b149e026518ae2cd1dec259f9fce0c66486e92c5a937a08235278e4e1dd3e6",
           "FILE:@@//crates/messenger-tests/Cargo.toml ddc5c150f42d061d52267ac2f72a4cf6c4daa43c4733da87a632a0a87766911a",
-          "FILE:@@//crates/soulrust/Cargo.toml 2ec1c7b24fa487024c49cbe0387dac4d942ff376b5e9f650f03d79a1eee761a0",
+          "FILE:@@//crates/soulrust/Cargo.toml 5cf3687c12efac5a8563f7a12e2f671f1b107eff788dfb33afe83fce9ad6c609",
           "FILE:@@//crates/soulrust-integration-tests/Cargo.toml 09289e2b0ae891ee5c1d5e28ce0120af47a74927600f8480ae1049a3ed0746d3",
           "FILE:@@//crates/soulseek-proto/Cargo.toml 70c39be034e3931489254918f6b054c15b96b5b73136d03b602c76beef5a9484",
           "FILE:@@//crates/actor_messenger/Cargo.toml c246d5737ebe2c5b59bc443545c864c7666d7b4e93fc11a6b753c6091064c8f8",
