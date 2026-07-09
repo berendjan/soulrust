@@ -1,14 +1,18 @@
 [package]
 name = "soulrust"
-version = "0.0.3"
+version = "0.0.5"
 edition = "2021"
 description = "Soulseek client: components on the rust-messenger bus, Connect API + React web UI, self-updater, Spotify extractor."
 license = "MIT"
 
 [dependencies]
 rust-messenger = { git = "https://github.com/berendjan/rust-messenger.git", rev = "00fbefe" }
+soulrust-proto = { path = "../soulrust-proto" }
 soulseek-proto = { path = "../soulseek-proto" }
+axum = "0.8"
 bincode = { version = "2", default-features = false, features = ["std", "serde"] }
+connectrpc = { version = "0.7", features = ["axum"] }
+futures = "0.3"
 lofty = "0.24"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -16,5 +20,6 @@ serde_yaml = "0.9"
 semver = "1"
 self-replace = "1"
 socket2 = "0.6"
-tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "fs"] }
+tower-http = "0.6"
 ureq = { version = "2", features = ["json"] }

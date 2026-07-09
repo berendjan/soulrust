@@ -3,10 +3,9 @@
 // htmx layout. Tabs swap the main view client-side.
 import { useState } from "react";
 
-import { statusClient } from "./client";
-import { useWatch } from "./useWatch";
 import { ConnectionState } from "./format";
 import { PlayerProvider, SidebarPlayer } from "./player";
+import { StatusProvider, useStatus } from "./status";
 import { DownloadIcon, LogoIcon, SearchIcon, SettingsIcon, SpotifyIcon, UserIcon } from "./icons";
 import { SearchView } from "./views/SearchView";
 import { DownloadsView } from "./views/DownloadsView";
@@ -26,11 +25,21 @@ const TABS = [
 type TabId = (typeof TABS)[number]["id"];
 
 export function App() {
+  return (
+    <StatusProvider>
+      <PlayerProvider>
+        <Shell />
+      </PlayerProvider>
+    </StatusProvider>
+  );
+}
+
+function Shell() {
   const [tab, setTab] = useState<TabId>("search");
-  const status = useWatch<Status>((signal) => statusClient.watchStatus({}, { signal }));
+  const status = useStatus();
 
   return (
-    <PlayerProvider>
+    <>
       <input type="checkbox" id="nav-collapse" className="nav-collapse" />
       <div className="layout">
         <aside className="sidebar">
@@ -68,7 +77,7 @@ export function App() {
         </aside>
         <main className="main">{TABS.find((t) => t.id === tab)?.view}</main>
       </div>
-    </PlayerProvider>
+    </>
   );
 }
 

@@ -17,8 +17,13 @@ Guidance for Claude Code when working in this repository.
 
 ## Build & test
 
-- The project builds with **Bazel**, not Cargo — protobuf/bus codegen is
-  Bazel-only (no `build.rs`, no committed generated code), so a plain
-  `cargo build` cannot produce the generated types.
+- The project builds with **Bazel**, not Cargo. Bazel is the only thing that
+  runs protobuf/bus codegen and bundles the React frontend, so it is the only
+  build that produces a working binary.
 - Build: `bazel build //crates/soulrust:soulrust_bin`
 - Test:  `bazel test //crates/soulrust:soulrust_test`
+- `cargo check` works as an editor/type-check convenience only. It is fed by
+  `crates/soulrust-proto/generated/`, a committed copy of Bazel's codegen
+  output, plus a `build.rs` that stubs out the embedded web assets. **After
+  changing a `.proto`, refresh those copies from `bazel-bin/` or `cargo check`
+  will type-check against a stale API.**

@@ -7,12 +7,21 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 
 import { searchClient, transfersClient } from "../client";
 import { useWatch } from "../useWatch";
-import { basename, dirname, effectiveBitrate, humanSize, isAudio, lengthStr, quality } from "../format";
+import {
+  basename,
+  dirname,
+  DownloadStatus,
+  effectiveBitrate,
+  humanSize,
+  isAudio,
+  lengthStr,
+  quality,
+} from "../format";
 import { usePlayer } from "../player";
 import { EditIcon, FolderIcon } from "../icons";
 import { StatusPanel } from "./StatusPanel";
 import { BrowsePanel } from "./BrowsePanel";
-import type { Search, Searches, SearchResult, ResultFile } from "../gen/soulrust/api/v1/api_pb";
+import type { Search, Searches, SearchResult, ResultFile, Transfers } from "../gen/soulrust/api/v1/api_pb";
 
 type Row = { r: SearchResult; f: ResultFile };
 
@@ -23,7 +32,11 @@ interface TableControls {
   minBitrate: number;
   hidden: Set<string>;
   searchAgain: (token: number, query: string) => void;
+  /// Local path of an already-downloaded result, keyed by peer + remote name.
+  localPath: Map<string, string>;
 }
+
+const localKey = (username: string, filename: string) => `${username}\n${filename}`;
 
 // Toggleable columns (File is always shown), matching the old column bar.
 const COLUMNS: { key: string; label: string; num: boolean; toggle: boolean }[] = [
@@ -55,6 +68,17 @@ export function SearchView() {
   const placement = useRef<Map<number, number>>(new Map());
 
   const cards = useMemo(() => searches?.searches ?? [], [searches]);
+
+  // The player streams from disk, so a result row can only be previewed once
+  // that exact file has finished downloading. Map peer+remote-name → local path.
+  const transfers = useWatch<Transfers>((signal) => transfersClient.watchTransfers({}, { signal }));
+  const localPath = useMemo(() => {
+    const paths = new Map<string, string>();
+    for (const d of transfers?.downloads ?? []) {
+      if (d.status === DownloadStatus.COMPLETED && d.path) paths.set(localKey(d.username, d.filename), d.path);
+    }
+    return paths;
+  }, [transfers]);
 
   useEffect(() => {
     const live = new Set(cards.map((c) => c.token));
@@ -118,26 +142,31 @@ export function SearchView() {
       return n;
     });
 
-  const controls: TableControls = { sortKey, sortDesc, toggleSort, minBitrate, hidden, searchAgain };
+  const controls: TableControls = { sortKey, sortDesc, toggleSort, minBitrate, hidden, searchAgain, localPath };
 
-  // Build ordered items, grouping bulk (playlist/album) searches by their shared
-  // group name. Standalone searches (empty group) render on their own.
+  // Build ordered items, gathering each bulk (playlist/album) search into one
+  // group card. Only a *contiguous* run of cards sharing a group name joins the
+  // same card, so grabbing the same playlist twice yields two group cards rather
+  // than one with every track listed twice. Standalone searches (empty group)
+  // render on their own.
   const byToken = new Map(cards.map((c) => [c.token, c]));
-  type Item = { group: string; searches: Search[] } | { single: Search };
+  type Item = { group: string; key: string; searches: Search[] } | { single: Search };
   const items: Item[] = [];
-  const groupAt = new Map<string, number>();
+  const seen = new Map<string, number>();
   for (const token of order) {
     const c = byToken.get(token);
     if (!c) continue;
-    if (c.group) {
-      if (groupAt.has(c.group)) {
-        (items[groupAt.get(c.group)!] as { searches: Search[] }).searches.push(c);
-      } else {
-        groupAt.set(c.group, items.length);
-        items.push({ group: c.group, searches: [c] });
-      }
-    } else {
+    const last = items[items.length - 1];
+    if (!c.group) {
       items.push({ single: c });
+    } else if (last && "group" in last && last.group === c.group) {
+      last.searches.push(c);
+    } else {
+      // Name plus how many same-named groups precede it: a React key that
+      // survives both re-searching a track and closing a card above.
+      const nth = seen.get(c.group) ?? 0;
+      seen.set(c.group, nth + 1);
+      items.push({ group: c.group, key: `g-${c.group}-${nth}`, searches: [c] });
     }
   }
 
@@ -174,12 +203,12 @@ export function SearchView() {
       )}
 
       {items.length === 0 && <p className="muted">No searches yet.</p>}
-      {items.map((it, i) =>
+      {items.map((it) =>
         "single" in it ? (
           <SearchCard key={it.single.token} card={it.single} controls={controls} />
         ) : (
           <GroupCard
-            key={`g-${it.group}-${i}`}
+            key={it.key}
             folder={it.group}
             searches={it.searches}
             controls={controls}
@@ -309,7 +338,7 @@ function SearchCard(props: { card: Search; controls: TableControls; trackNo?: nu
 
 function ResultsTable({ card, controls }: { card: Search; controls: TableControls }) {
   const play = usePlayer();
-  const { sortKey, sortDesc, toggleSort, minBitrate, hidden } = controls;
+  const { sortKey, sortDesc, toggleSort, minBitrate, hidden, localPath } = controls;
 
   let rows: Row[] = card.results.flatMap((r) => r.files.map((f) => ({ r, f })));
   if (minBitrate > 0) rows = rows.filter(({ f }) => effectiveBitrate(f) >= minBitrate);
@@ -375,23 +404,28 @@ function ResultsTable({ card, controls }: { card: Search; controls: TableControl
           </tr>
         </thead>
         <tbody>
-          {rows.slice(0, 1000).map(({ r, f }, i) => (
-            <tr key={`${r.username}-${i}`}>
-              {COLUMNS.filter((c) => !hidden.has(c.key)).map((c) => (
-                <Fragment key={c.key}>{cell(c.key, r, f)}</Fragment>
-              ))}
-              <td className="actions">
-                <button className="btn xs" onClick={() => download(r.username, f.name, f.size)}>
-                  Get
-                </button>
-                {isAudio(f.name) && (
-                  <button className="btn xs secondary" title="preview (if downloaded)" onClick={() => play(f.name)}>
-                    ▶
+          {rows.slice(0, 1000).map(({ r, f }, i) => {
+            // f.name is the peer's own path; only a completed download of it has
+            // a local file the player can stream.
+            const local = localPath.get(localKey(r.username, f.name));
+            return (
+              <tr key={`${r.username}-${i}`}>
+                {COLUMNS.filter((c) => !hidden.has(c.key)).map((c) => (
+                  <Fragment key={c.key}>{cell(c.key, r, f)}</Fragment>
+                ))}
+                <td className="actions">
+                  <button className="btn xs" onClick={() => download(r.username, f.name, f.size)}>
+                    Get
                   </button>
-                )}
-              </td>
-            </tr>
-          ))}
+                  {local && isAudio(local) && (
+                    <button className="btn xs secondary" title="preview downloaded file" onClick={() => play(local)}>
+                      ▶
+                    </button>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>

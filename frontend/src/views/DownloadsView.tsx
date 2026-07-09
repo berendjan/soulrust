@@ -14,6 +14,17 @@ export function DownloadsView() {
   const active = all.filter((d) => ACTIVE.has(d.status));
   const previous = all.filter((d) => !ACTIVE.has(d.status));
 
+  const resume = (d: Download) =>
+    transfersClient
+      .startDownload({
+        username: d.username,
+        filename: d.filename,
+        size: d.size,
+        subdir: d.subdir,
+        prefix: d.prefix,
+      })
+      .catch(() => {});
+
   const statusPill = (d: Download) => {
     const label = downloadStatusLabel(d.status, d.place);
     if (d.status === DownloadStatus.COMPLETED) return <span className="pill ok">{label}</span>;
@@ -53,6 +64,22 @@ export function DownloadsView() {
             </button>
             <button
               className="btn xs secondary"
+              onClick={() => transfersClient.cancelDownload({ username: d.username, filename: d.filename }).catch(() => {})}
+            >
+              ✕
+            </button>
+          </>
+        )}
+        {/* A paused transfer keeps the peer, size and destination it started
+            with, so it can be picked up again where it left off. */}
+        {d.status === DownloadStatus.PAUSED && d.username && (
+          <>
+            <button className="btn xs" onClick={() => resume(d)}>
+              Resume
+            </button>
+            <button
+              className="btn xs secondary"
+              title="cancel"
               onClick={() => transfersClient.cancelDownload({ username: d.username, filename: d.filename }).catch(() => {})}
             >
               ✕

@@ -139,8 +139,14 @@ export function SettingsView() {
             onChange={(v) => set("password", v)}
           />
           <Field label="Server host" value={form.host} onChange={(v) => set("host", v)} />
-          <NumField label="Server port" value={form.port} onChange={(v) => set("port", v)} />
-          <NumField label="Listen port" value={form.listenPort} onChange={(v) => set("listenPort", v)} />
+          <NumField label="Server port" value={form.port} min={1} max={65535} onChange={(v) => set("port", v)} />
+          <NumField
+            label="Listen port"
+            value={form.listenPort}
+            min={1}
+            max={65535}
+            onChange={(v) => set("listenPort", v)}
+          />
         </fieldset>
 
         <fieldset>
@@ -266,11 +272,17 @@ function Field(props: {
   );
 }
 
-function NumField(props: { label: string; value: number; onChange: (v: number) => void }) {
+function NumField(props: { label: string; value: number; min?: number; max?: number; onChange: (v: number) => void }) {
   return (
     <label className="field">
       <span>{props.label}</span>
-      <input type="number" value={props.value} onChange={(e) => props.onChange(Number(e.target.value) || 0)} />
+      <input
+        type="number"
+        value={props.value}
+        min={props.min}
+        max={props.max}
+        onChange={(e) => props.onChange(Number(e.target.value) || 0)}
+      />
     </label>
   );
 }

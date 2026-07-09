@@ -602,7 +602,6 @@ impl traits::core::Handle<ResolveUploadPeer> for Session {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::extract::SearchJob;
     use crate::messages::MessageId;
     use rust_messenger::traits::core::Handle;
     use std::net::Ipv4Addr;

@@ -7,5 +7,6 @@ members = [
     "crates/messenger-tests",
     "crates/soulrust",
     "crates/soulrust-integration-tests",
+    "crates/soulrust-proto",
     "crates/soulseek-proto",
 ]

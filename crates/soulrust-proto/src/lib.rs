@@ -279,8 +279,8 @@ mod tests {
             ..Default::default()
         };
         let bytes = original.encode_to_vec();
-        let view = proto::soulrust::greet::v1::GreetRequestView::decode_view(&bytes)
-            .expect("view decode");
+        let view =
+            proto::soulrust::greet::v1::GreetRequestView::decode_view(&bytes).expect("view decode");
         assert_eq!(view.name, "berend");
     }
 
@@ -317,7 +317,10 @@ mod tests {
         // Encode through the bus' ExtendedMessage path, then decode through
         // deserialize_from with trailing alignment padding — the exact shape
         // the rust-messenger ring buffer produces.
-        let msg = bus::PeerActivity { note: "listening on 2234".into(), ..Default::default() };
+        let msg = bus::PeerActivity {
+            note: "listening on 2234".into(),
+            ..Default::default()
+        };
         let size = msg.get_size();
         let mut buf = vec![0u8; size + 7]; // 7 bytes of alignment padding
         msg.write_into(&mut buf[..size]);

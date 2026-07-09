@@ -135,6 +135,10 @@ message Download {
   string error = 6;    // FAILED
   uint64 bytes = 7;
   uint64 size = 8;
+  // Destination layout the download was started with, echoed back so a paused
+  // transfer can be resumed into the same folder with the same track prefix.
+  string subdir = 9;
+  string prefix = 10;
 }
 
 enum UploadStatus {
@@ -278,6 +282,13 @@ message SetConfigResponse {
   string error = 1;
 }
 
+// Result of exercising the stored Spotify client credentials. `error` is empty
+// when Spotify issued a token; `unset` means there was nothing to verify.
+message VerifySpotifyResponse {
+  string error = 1;
+  bool unset = 2;
+}
+
 // The effective config as it sits on disk: the file path plus its serialized
 // YAML with secrets redacted (for the "view config file" panel).
 message ConfigFile {
@@ -290,6 +301,7 @@ service ConfigService {
   rpc SetConfig(Config) returns (SetConfigResponse);
   rpc WatchConfig(Empty) returns (stream Config);
   rpc GetConfigFile(Empty) returns (ConfigFile);
+  rpc VerifySpotify(Empty) returns (VerifySpotifyResponse);
 }
 
 // --- Updater ---------------------------------------------------------------

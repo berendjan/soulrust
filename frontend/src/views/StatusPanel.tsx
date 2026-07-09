@@ -1,11 +1,10 @@
 // Session status banner + activity log — the old index page's status fragment.
-import { statusClient } from "../client";
-import { useWatch } from "../useWatch";
 import { ConnectionState } from "../format";
+import { useStatus } from "../status";
 import type { Status } from "../gen/soulrust/api/v1/api_pb";
 
 export function StatusPanel() {
-  const status = useWatch<Status>((signal) => statusClient.watchStatus({}, { signal }));
+  const status = useStatus();
   if (!status) return null;
 
   const [cls, text] = describe(status);

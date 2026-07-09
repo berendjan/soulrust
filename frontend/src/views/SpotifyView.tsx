@@ -9,6 +9,7 @@ export function SpotifyView() {
   const [clientSecret, setClientSecret] = useState("");
   const [connected, setConnected] = useState(false);
   const [banner, setBanner] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     configClient
@@ -23,15 +24,27 @@ export function SpotifyView() {
   const save = async (e: React.FormEvent) => {
     e.preventDefault();
     setBanner(null);
+    setBusy(true);
     try {
       const err = await patchConfig((init) => {
         init.spotify.clientId = clientId;
         init.spotify.clientSecret = clientSecret;
       });
-      setBanner(err ? `error: ${err}` : "saved");
       setClientSecret("");
+      if (err) {
+        setBanner(`error: ${err}`);
+        return;
+      }
+      // Saving a typo'd key should say so now, not fail opaquely later when the
+      // OAuth flow starts: ask Spotify for an app token with what we just stored.
+      const check = await configClient.verifySpotify({});
+      if (check.unset) setBanner("saved");
+      else if (check.error) setBanner(`saved, but Spotify rejected the credentials: ${check.error}`);
+      else setBanner("saved and verified — now click “Connect Spotify”");
     } catch (err) {
       setBanner(String(err));
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -77,8 +90,8 @@ export function SpotifyView() {
             />
           </label>
           <div className="row">
-            <button className="btn" type="submit">
-              Save
+            <button className="btn" type="submit" disabled={busy}>
+              {busy ? "…" : "Save"}
             </button>
             <a className="btn spotify" href="/spotify/login">
               Connect Spotify
