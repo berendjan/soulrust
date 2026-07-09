@@ -438,9 +438,6 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
- "hyper",
- "hyper-util",
- "libc",
  "percent-encoding",
  "pin-project",
  "serde",
@@ -449,7 +446,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower",
- "tower-http",
  "tracing",
  "wasm-bindgen-futures",
  "zstd",
@@ -537,23 +533,6 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 dependencies = [
  "powerfmt",
  "serde_core",
-]
-
-[[package]]
-name = "direct-cargo-bazel-deps"
-version = "0.0.1"
-dependencies = [
- "axum",
- "buffa",
- "buffa-types",
- "connectrpc",
- "futures",
- "http",
- "http-body",
- "serde",
- "serde_json",
- "tokio",
- "tower-http",
 ]
 
 [[package]]
@@ -2437,14 +2416,10 @@ checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
 dependencies = [
  "bitflags",
  "bytes",
- "futures-util",
  "http",
- "http-body",
- "http-body-util",
  "pin-project-lite",
  "tower-layer",
  "tower-service",
- "tracing",
 ]
 
 [[package]]

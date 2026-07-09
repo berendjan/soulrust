@@ -20,6 +20,12 @@ Guidance for Claude Code when working in this repository.
 - The project builds with **Bazel**, not Cargo. Bazel is the only thing that
   runs protobuf/bus codegen and bundles the React frontend, so it is the only
   build that produces a working binary.
+- **The build must stay hermetic.** No dependency on ambient system tools
+  (`protoc`, `buf`, `node`/`npm`, plugin binaries, etc.). Toolchains and codegen
+  plugins are provided by Bazel — pulled from source or pinned per-platform via
+  `http_file` + sha256 — and codegen runs as a Bazel action compatible with
+  `--incompatible_strict_action_env`. Any new toolchain (e.g. a JS/vite build for
+  the frontend) must be brought in the same way, not shelled out to the host.
 - Build: `bazel build //crates/soulrust:soulrust_bin`
 - Test:  `bazel test //crates/soulrust:soulrust_test`
 - `cargo check` works as an editor/type-check convenience only. It is fed by
