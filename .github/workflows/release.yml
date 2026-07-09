@@ -10,11 +10,21 @@ name: release
 #
 # Triggers:
 #   - push a tag `vX.Y.Z`  -> build all platforms and publish a GitHub Release.
+#   - push to main         -> build all platforms, no Release. Exists to save
+#     Bazel disk caches on the default branch, where tag runs can restore them.
 #   - manual (Actions tab) -> build all platforms, upload as run artifacts only
 #     (no Release). Use this to test the pipeline without cutting a tag.
 
 on:
   push:
+    # Branch pushes build too (no Release published — the release job is gated
+    # on a tag ref). This is what makes the Bazel cache work: GitHub Actions
+    # caches are only readable from the ref that wrote them or the default
+    # branch, and every tag is a fresh ref, so tag-triggered runs can never
+    # restore each other's caches. Runs on main save caches every tag run can
+    # restore.
+    branches:
+      - main
     tags:
       - "v*"
   workflow_dispatch:
@@ -62,15 +72,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache Bazel
-        uses: actions/cache@v4
+      - name: Restore Bazel cache
+        uses: actions/cache/restore@v4
         with:
           path: ~/.cache/bazel-disk
-          key: bazel-linux-${{ hashFiles('MODULE.bazel.lock') }}
+          key: bazel-linux-${{ github.sha }}
           restore-keys: bazel-linux-
 
       - name: Build (Bazel, opt)
         run: bazel build -c opt --disk_cache="$HOME/.cache/bazel-disk" "$BAZEL_TARGET"
+
+      # Explicit save with `if: always()` so a failed build still keeps its
+      # compiled progress (plain actions/cache only saves on job success). The
+      # sha-keyed cache means every commit saves; restore-keys picks the newest.
+      - name: Save Bazel cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ~/.cache/bazel-disk
+          key: bazel-linux-${{ github.sha }}
 
       - name: Stage binary
         run: |
@@ -117,15 +137,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache Bazel
-        uses: actions/cache@v4
+      - name: Restore Bazel cache
+        uses: actions/cache/restore@v4
         with:
           path: ~/.cache/bazel-disk
-          key: bazel-macos-${{ hashFiles('MODULE.bazel.lock') }}
+          key: bazel-macos-${{ github.sha }}
           restore-keys: bazel-macos-
 
       - name: Build (Bazel, opt)
         run: bazel build -c opt --disk_cache="$HOME/.cache/bazel-disk" "$BAZEL_TARGET"
+
+      - name: Save Bazel cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ~/.cache/bazel-disk
+          key: bazel-macos-${{ github.sha }}
 
       - name: Stage binary
         run: |
@@ -170,15 +197,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache Bazel
-        uses: actions/cache@v4
+      - name: Restore Bazel cache
+        uses: actions/cache/restore@v4
         with:
           path: C:/bzl-disk
-          key: bazel-windows-${{ hashFiles('MODULE.bazel.lock') }}
+          key: bazel-windows-${{ github.sha }}
           restore-keys: bazel-windows-
 
       - name: Build (Bazel, opt)
         run: bazel $BAZEL_STARTUP build -c opt --disk_cache=C:/bzl-disk "$BAZEL_TARGET"
+
+      - name: Save Bazel cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: C:/bzl-disk
+          key: bazel-windows-${{ github.sha }}
 
       - name: Stage binary
         run: |
