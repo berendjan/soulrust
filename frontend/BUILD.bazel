@@ -1,0 +1,59 @@
+load("@aspect_rules_js//js:defs.bzl", "js_binary")
+load("@npm//:defs.bzl", "npm_link_all_packages")
+load("@npm//frontend:@bufbuild/buf/package_json.bzl", buf_bin = "bin")
+load("@npm//frontend:vite/package_json.bzl", vite_bin = "bin")
+
+npm_link_all_packages(name = "node_modules")
+
+# 1. TS Connect client, generated from the shared proto module via buf +
+#    protoc-gen-es. Hermetic: Node from the rules_js toolchain, buf/plugin from
+#    the pinned node_modules — no system buf/protoc. Output kept out of the
+#    source glob below so it never double-declares.
+buf_bin.buf(
+    name = "gen_ts",
+    srcs = [
+        "buf.gen.yaml",
+        ":node_modules",
+        "//proto:module",
+    ],
+    args = [
+        "generate",
+        "../proto",
+        "--template",
+        "buf.gen.yaml",
+    ],
+    chdir = package_name(),
+    out_dirs = ["src/gen"],
+)
+
+# 2. The Vite production bundle. Consumes the generated client + the React
+#    source. Runs `vite build` under the hermetic Node toolchain.
+vite_bin.vite(
+    name = "dist",
+    srcs = [
+        "index.html",
+        "package.json",
+        "tsconfig.json",
+        "vite.config.ts",
+        ":gen_ts",
+        ":node_modules",
+    ] + glob(
+        [
+            "src/**/*.ts",
+            "src/**/*.tsx",
+        ],
+        exclude = ["src/gen/**"],
+    ),
+    args = ["build"],
+    chdir = package_name(),
+    out_dirs = ["dist"],
+    visibility = ["//visibility:public"],
+)
+
+# 3. Embed tool: turns the built `dist/` into a Rust source table. Consumed by
+#    //crates/soulrust:web_assets.
+js_binary(
+    name = "embed",
+    entry_point = "embed.mjs",
+    visibility = ["//visibility:public"],
+)

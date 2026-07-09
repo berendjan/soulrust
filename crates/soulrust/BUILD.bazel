@@ -1,11 +1,28 @@
+load("@aspect_rules_js//js:defs.bzl", "js_run_binary")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+# Embed the hermetic Vite React bundle (//frontend:dist) into a generated Rust
+# source table (src/web_assets_gen.rs), served by the ApiServer. The `embed`
+# tool runs under the rules_js Node toolchain, so the whole frontend build stays
+# hermetic end to end.
+js_run_binary(
+    name = "web_assets",
+    srcs = ["//frontend:dist"],
+    outs = ["src/web_assets_gen.rs"],
+    # Paths are relative to the js_run_binary working dir (BAZEL_BINDIR).
+    args = [
+        "frontend/dist",
+        "crates/soulrust/src/web_assets_gen.rs",
+    ],
+    tool = "//frontend:embed",
+)
 
 rust_library(
     name = "soulrust",
     srcs = glob(
         ["src/**/*.rs"],
         exclude = ["src/main.rs"],
-    ),
+    ) + [":web_assets"],
     compile_data = glob(["assets/*"]),
     visibility = ["//visibility:public"],
     # `@proto_deps//:tokio` (the copy axum is built against) is aliased to

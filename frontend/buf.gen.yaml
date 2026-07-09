@@ -1,9 +1,13 @@
 # Generates the TypeScript client (messages + service descriptors) from the
 # shared proto schema using protobuf-es v2. Connect-ES v2 reads the service
 # descriptor directly — no separate connect plugin needed.
+#
+# The plugin is referenced by its explicit node_modules path (rather than a bare
+# `protoc-gen-es` on PATH) so the hermetic Bazel `buf generate` action finds it;
+# `npm run generate` from the frontend dir resolves the same path.
 version: v2
 plugins:
-  - local: protoc-gen-es
+  - local: node_modules/@bufbuild/protoc-gen-es/bin/protoc-gen-es
     out: src/gen
     opt:
       - target=ts

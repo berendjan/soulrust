@@ -5,3 +5,14 @@ exports_files(
     glob(["**/*.proto"]),
     visibility = ["//visibility:public"],
 )
+
+# The whole proto module (schema + buf config), staged into bazel-bin so the
+# frontend's `buf generate` (an aspect_rules_js action, which requires its
+# inputs to live in the output tree) can read it as `../proto`.
+load("@aspect_bazel_lib//lib:copy_to_bin.bzl", "copy_to_bin")
+
+copy_to_bin(
+    name = "module",
+    srcs = glob(["**/*.proto"]) + ["buf.yaml"],
+    visibility = ["//visibility:public"],
+)

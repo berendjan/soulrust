@@ -11,12 +11,25 @@
 //! `tokio` here is the proto-deps copy (the one axum is built against), aliased
 //! to `tokio_api` in BUILD.bazel so it doesn't collide with the peer reactor's
 //! `tokio`.
+//!
+//! This edge also serves the React single-page app: the Vite bundle is embedded
+//! at build time ([`crate::web_assets_gen`]) and served from the same port as
+//! the Connect API, so in production the browser talks to one origin (no CORS,
+//! no dev proxy). The Connect service owns its `POST /soulrust.api.v1.*` paths;
+//! everything else is static assets.
 
 use std::sync::{Arc, Mutex};
 
 use rust_messenger::traits;
 
+use axum::body::Body;
+use axum::extract::Path;
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response as HttpResponse};
+use axum::routing::get;
 use connectrpc::{RequestContext, Response, Router, ServiceRequest, ServiceResult};
+
+use crate::web_assets_gen::WEB_ASSETS;
 use soulrust_proto::api::soulrust::api::v1::{GetStatusRequest, GetStatusResponse};
 use soulrust_proto::api_connect::soulrust::api::v1::{StatusService, StatusServiceExt};
 
@@ -144,7 +157,13 @@ fn serve(addr: String, snapshot: Arc<Mutex<StatusSnapshot>>) {
     runtime.block_on(async move {
         let service = Arc::new(StatusApi { snapshot });
         let router = service.register(Router::new());
+        // The SPA is served from explicit GET routes; the Connect service (POST
+        // to `/soulrust.api.v1.*`) is the fallback, so the two never collide.
+        // CORS stays permissive as a dev convenience (the Vite dev server hits a
+        // different origin); in production the SPA is same-origin so it is inert.
         let app = axum::Router::new()
+            .route("/", get(serve_index))
+            .route("/assets/{*path}", get(serve_asset))
             .fallback_service(router.into_axum_service())
             .layer(tower_http::cors::CorsLayer::permissive());
 
@@ -155,9 +174,49 @@ fn serve(addr: String, snapshot: Arc<Mutex<StatusSnapshot>>) {
                 return;
             }
         };
-        println!("soulrust Connect API listening on http://{addr}");
+        println!("soulrust Connect API + web UI listening on http://{addr}");
         if let Err(err) = axum::serve(listener, app).await {
             eprintln!("api server: stopped: {err}");
         }
     });
+}
+
+/// Serve the SPA entry document (`GET /`).
+async fn serve_index() -> HttpResponse {
+    asset_response("index.html").unwrap_or_else(|| {
+        // Only happens if the frontend bundle wasn't embedded.
+        (StatusCode::NOT_FOUND, "web UI not built").into_response()
+    })
+}
+
+/// Serve a hashed static asset (`GET /assets/<path>`).
+async fn serve_asset(Path(path): Path<String>) -> HttpResponse {
+    asset_response(&format!("assets/{path}"))
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+}
+
+/// Look an embedded asset up by its bundle-relative path and wrap it in a
+/// response with a guessed content type. `None` if the path isn't embedded.
+fn asset_response(path: &str) -> Option<HttpResponse> {
+    let bytes = WEB_ASSETS.iter().find(|(p, _)| *p == path).map(|(_, b)| *b)?;
+    Some(
+        HttpResponse::builder()
+            .header(header::CONTENT_TYPE, content_type(path))
+            .body(Body::from(bytes.to_vec()))
+            .expect("static asset response"),
+    )
+}
+
+/// Minimal extension → MIME mapping for the asset kinds Vite emits.
+fn content_type(path: &str) -> &'static str {
+    match path.rsplit('.').next() {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json") => "application/json",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("woff2") => "font/woff2",
+        _ => "application/octet-stream",
+    }
 }
