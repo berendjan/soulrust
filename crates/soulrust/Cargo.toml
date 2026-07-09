@@ -2,7 +2,7 @@
 name = "soulrust"
 version = "0.0.3"
 edition = "2021"
-description = "Soulseek client: components on the rust-messenger bus, htmx web UI, self-updater, Spotify extractor."
+description = "Soulseek client: components on the rust-messenger bus, Connect API + React web UI, self-updater, Spotify extractor."
 license = "MIT"
 
 [dependencies]
@@ -16,6 +16,5 @@ serde_yaml = "0.9"
 semver = "1"
 self-replace = "1"
 socket2 = "0.6"
-tiny_http = "0.12"
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "fs"] }
 ureq = { version = "2", features = ["json"] }

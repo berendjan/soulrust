@@ -23,7 +23,6 @@ rust_library(
         ["src/**/*.rs"],
         exclude = ["src/main.rs"],
     ) + [":web_assets"],
-    compile_data = glob(["assets/*"]),
     visibility = ["//visibility:public"],
     # `@proto_deps//:tokio` (the copy axum is built against) is aliased to
     # `tokio_api` so it coexists with the peer reactor's `@crates//:tokio`
@@ -43,11 +42,11 @@ rust_library(
         "@crates//:serde_json",
         "@crates//:serde_yaml",
         "@crates//:socket2",
-        "@crates//:tiny_http",
         "@crates//:tokio",
         "@crates//:ureq",
         "@proto_deps//:axum",
         "@proto_deps//:connectrpc",
+        "@proto_deps//:futures",
         "@proto_deps//:tokio",
         "@proto_deps//:tower-http",
     ],

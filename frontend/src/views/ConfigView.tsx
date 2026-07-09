@@ -1,0 +1,232 @@
+// Configuration: server account, sharing (shares), Spotify, updater, and
+// process control. Loads the current config once, edits locally, saves via
+// SetConfig.
+import { useEffect, useState } from "react";
+
+import { configClient, systemClient, updaterClient } from "../client";
+import { useWatch } from "../useWatch";
+import { UpdaterStatusKind } from "../format";
+import type { UpdaterStatus } from "../gen/soulrust/api/v1/api_pb";
+
+interface Form {
+  host: string;
+  port: number;
+  username: string;
+  password: string;
+  listenPort: number;
+  clientId: string;
+  clientSecret: string;
+  spotifyConnected: boolean;
+  updateEnabled: boolean;
+  autoApply: boolean;
+  repo: string;
+  bindAddr: string;
+  openBrowser: boolean;
+  folders: string;
+  downloadDir: string;
+  incompleteDir: string;
+  uploadSlots: number;
+  respondToSearches: boolean;
+  maxDownloadSpeed: number;
+  maxUploadSpeed: number;
+}
+
+export function ConfigView() {
+  const [form, setForm] = useState<Form | null>(null);
+  const [banner, setBanner] = useState<string | null>(null);
+  const updater = useWatch<UpdaterStatus>((signal) => updaterClient.watchUpdater({}, { signal }));
+
+  useEffect(() => {
+    configClient
+      .getConfig({})
+      .then((c) =>
+        setForm({
+          host: c.server?.host ?? "",
+          port: c.server?.port ?? 0,
+          username: c.server?.username ?? "",
+          password: c.server?.password ?? "",
+          listenPort: c.server?.listenPort ?? 0,
+          clientId: c.spotify?.clientId ?? "",
+          clientSecret: c.spotify?.clientSecret ?? "",
+          spotifyConnected: c.spotify?.connected ?? false,
+          updateEnabled: c.update?.enabled ?? false,
+          autoApply: c.update?.autoApply ?? false,
+          repo: c.update?.repo ?? "",
+          bindAddr: c.ui?.bindAddr ?? "",
+          openBrowser: c.ui?.openBrowser ?? false,
+          folders: (c.sharing?.folders ?? []).join("\n"),
+          downloadDir: c.sharing?.downloadDir ?? "",
+          incompleteDir: c.sharing?.incompleteDir ?? "",
+          uploadSlots: c.sharing?.uploadSlots ?? 0,
+          respondToSearches: c.sharing?.respondToSearches ?? false,
+          maxDownloadSpeed: c.sharing?.maxDownloadSpeed ?? 0,
+          maxUploadSpeed: c.sharing?.maxUploadSpeed ?? 0,
+        }),
+      )
+      .catch((e) => setBanner(String(e)));
+  }, []);
+
+  if (!form) return <div className="view">Loading config…</div>;
+
+  const set = <K extends keyof Form>(k: K, v: Form[K]) => setForm({ ...form, [k]: v });
+
+  const save = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBanner(null);
+    try {
+      const res = await configClient.setConfig({
+        server: {
+          host: form.host,
+          port: form.port,
+          username: form.username,
+          password: form.password,
+          listenPort: form.listenPort,
+        },
+        spotify: { clientId: form.clientId, clientSecret: form.clientSecret },
+        update: { enabled: form.updateEnabled, autoApply: form.autoApply, repo: form.repo },
+        ui: { bindAddr: form.bindAddr, openBrowser: form.openBrowser },
+        sharing: {
+          folders: form.folders.split("\n").map((s) => s.trim()).filter(Boolean),
+          downloadDir: form.downloadDir,
+          incompleteDir: form.incompleteDir,
+          uploadSlots: form.uploadSlots,
+          respondToSearches: form.respondToSearches,
+          maxDownloadSpeed: form.maxDownloadSpeed,
+          maxUploadSpeed: form.maxUploadSpeed,
+        },
+      });
+      setBanner(res.error ? `error: ${res.error}` : "saved");
+    } catch (err) {
+      setBanner(String(err));
+    }
+  };
+
+  return (
+    <div className="view">
+      {banner && <div className="banner">{banner}</div>}
+      <form onSubmit={save}>
+        <fieldset>
+          <legend>Account</legend>
+          <Field label="Username" value={form.username} onChange={(v) => set("username", v)} />
+          <Field label="Password" type="password" value={form.password} onChange={(v) => set("password", v)} />
+          <Field label="Server host" value={form.host} onChange={(v) => set("host", v)} />
+          <NumField label="Server port" value={form.port} onChange={(v) => set("port", v)} />
+          <NumField label="Listen port" value={form.listenPort} onChange={(v) => set("listenPort", v)} />
+        </fieldset>
+
+        <fieldset>
+          <legend>Sharing</legend>
+          <label className="field">
+            <span>Shared folders (one per line)</span>
+            <textarea value={form.folders} rows={3} onChange={(e) => set("folders", e.target.value)} />
+          </label>
+          <Field label="Download dir" value={form.downloadDir} onChange={(v) => set("downloadDir", v)} />
+          <Field label="Incomplete dir" value={form.incompleteDir} onChange={(v) => set("incompleteDir", v)} />
+          <NumField label="Upload slots" value={form.uploadSlots} onChange={(v) => set("uploadSlots", v)} />
+          <NumField label="Max download B/s (0=∞)" value={form.maxDownloadSpeed} onChange={(v) => set("maxDownloadSpeed", v)} />
+          <NumField label="Max upload B/s (0=∞)" value={form.maxUploadSpeed} onChange={(v) => set("maxUploadSpeed", v)} />
+          <Check label="Respond to searches" value={form.respondToSearches} onChange={(v) => set("respondToSearches", v)} />
+        </fieldset>
+
+        <fieldset>
+          <legend>Spotify</legend>
+          <Field label="Client ID" value={form.clientId} onChange={(v) => set("clientId", v)} />
+          <Field label="Client secret" type="password" value={form.clientSecret} onChange={(v) => set("clientSecret", v)} />
+          <p>
+            {form.spotifyConnected ? (
+              <span className="pill ok">● connected</span>
+            ) : (
+              <span className="pill warn">● not connected</span>
+            )}{" "}
+            <a className="btn xs" href="/spotify/login">
+              Connect Spotify
+            </a>
+            <span className="muted"> (save your client ID/secret first)</span>
+          </p>
+        </fieldset>
+
+        <fieldset>
+          <legend>Updates</legend>
+          <Check label="Check for updates" value={form.updateEnabled} onChange={(v) => set("updateEnabled", v)} />
+          <Check label="Auto-apply" value={form.autoApply} onChange={(v) => set("autoApply", v)} />
+          <Field label="Repo" value={form.repo} onChange={(v) => set("repo", v)} />
+          <p className="muted">{updaterLabel(updater)}</p>
+          <button type="button" className="xs" onClick={() => updaterClient.applyUpdate({}).catch(() => {})}>
+            Apply update
+          </button>
+        </fieldset>
+
+        <fieldset>
+          <legend>Interface</legend>
+          <Field label="Bind address" value={form.bindAddr} onChange={(v) => set("bindAddr", v)} />
+          <Check label="Open browser on start" value={form.openBrowser} onChange={(v) => set("openBrowser", v)} />
+        </fieldset>
+
+        <div className="row">
+          <button type="submit">Save</button>
+          <button type="button" className="ghost" onClick={() => systemClient.restart({}).catch(() => {})}>
+            Restart
+          </button>
+          <button type="button" className="ghost" onClick={() => systemClient.quit({}).catch(() => {})}>
+            Quit
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function updaterLabel(u: UpdaterStatus | null): string {
+  if (!u) return "";
+  switch (u.kind) {
+    case UpdaterStatusKind.CHECKING:
+      return "checking for updates…";
+    case UpdaterStatusKind.UP_TO_DATE:
+      return `up to date (${u.current})`;
+    case UpdaterStatusKind.AVAILABLE:
+      return `update available: ${u.latest}`;
+    case UpdaterStatusKind.DOWNLOADING:
+      return `downloading ${u.latest}…`;
+    case UpdaterStatusKind.READY_TO_APPLY:
+      return `ready to apply ${u.latest}`;
+    case UpdaterStatusKind.RESTART_REQUIRED:
+      return `restart to finish updating to ${u.latest}`;
+    case UpdaterStatusKind.FAILED:
+      return `update failed: ${u.error}`;
+    case UpdaterStatusKind.SKIPPED:
+      return `update skipped: ${u.reason}`;
+    default:
+      return "";
+  }
+}
+
+function Field(props: { label: string; value: string; type?: string; onChange: (v: string) => void }) {
+  return (
+    <label className="field">
+      <span>{props.label}</span>
+      <input type={props.type ?? "text"} value={props.value} onChange={(e) => props.onChange(e.target.value)} />
+    </label>
+  );
+}
+
+function NumField(props: { label: string; value: number; onChange: (v: number) => void }) {
+  return (
+    <label className="field">
+      <span>{props.label}</span>
+      <input
+        type="number"
+        value={props.value}
+        onChange={(e) => props.onChange(Number(e.target.value) || 0)}
+      />
+    </label>
+  );
+}
+
+function Check(props: { label: string; value: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <label className="checkbox">
+      <input type="checkbox" checked={props.value} onChange={(e) => props.onChange(e.target.checked)} />
+      {props.label}
+    </label>
+  );
+}

@@ -99,6 +99,7 @@ crate.spec(
         "net",
         "macros",
         "sync",
+        "time",
     ],
 )
 crate.spec(package = "serde", version = "1", features = ["derive"])

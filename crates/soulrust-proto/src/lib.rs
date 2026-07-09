@@ -300,15 +300,14 @@ mod tests {
             api_connect::soulrust::api::v1::STATUS_SERVICE_SERVICE_NAME,
             "soulrust.api.v1.StatusService"
         );
-        let resp = api::soulrust::api::v1::GetStatusResponse {
+        let resp = api::soulrust::api::v1::Status {
             logged_in: true,
             username: "alice".into(),
             shared_files: 42,
             ..Default::default()
         };
         let bytes = resp.encode_to_vec();
-        let back =
-            api::soulrust::api::v1::GetStatusResponse::decode_from_slice(&bytes).unwrap();
+        let back = api::soulrust::api::v1::Status::decode_from_slice(&bytes).unwrap();
         assert_eq!(back.username, "alice");
         assert_eq!(back.shared_files, 42);
     }

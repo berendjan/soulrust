@@ -20,7 +20,7 @@ fn main() {
     let messenger = soulrust::wiring::Messenger::new(bus);
     let handles = messenger.run(&ctx);
 
-    // The web bridge flips these flags on POST /quit and /restart.
+    // The API edge flips these flags on SystemService Quit / Restart.
     let restart = loop {
         std::thread::sleep(Duration::from_millis(200));
         if ctx.control.quit.load(Ordering::Relaxed) {

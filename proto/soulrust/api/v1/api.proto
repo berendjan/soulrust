@@ -1,0 +1,313 @@
+// The public Connect API consumed by the React frontend and external apps. A
+// stable, versioned surface (soulrust.api.v1) served over Connect / gRPC /
+// gRPC-Web; its handlers bridge to the internal rust-messenger bus (see
+// crates/soulrust/src/components/api_server).
+//
+// Conventions:
+//   - `Empty` is the request/response for calls that take or return nothing.
+//   - An error string field empty ("") means success; non-empty is the message.
+//   - Numeric "unknown" is encoded as 0 (e.g. an unknown bitrate).
+//   - `Watch*` RPCs are server-streaming: they push the current snapshot
+//     immediately, then a fresh snapshot whenever the underlying state changes.
+syntax = "proto3";
+
+package soulrust.api.v1;
+
+message Empty {}
+
+// --- Status ----------------------------------------------------------------
+
+enum ConnectionState {
+  CONNECTION_STATE_UNSPECIFIED = 0;
+  CONNECTION_DISCONNECTED = 1;
+  CONNECTION_CONNECTING = 2;
+  CONNECTION_LOGGED_IN = 3;
+  CONNECTION_LOGIN_FAILED = 4;
+}
+
+message Status {
+  bool logged_in = 1;
+  string username = 2;
+  string greeting = 3;
+  string own_ip = 4;
+  uint32 shared_files = 5;
+  ConnectionState connection = 6;
+  // Human-readable connection detail (failure/disconnect reason, guidance).
+  string detail = 7;
+  // Recent activity log, oldest first.
+  repeated string log = 8;
+}
+
+service StatusService {
+  rpc GetStatus(Empty) returns (Status);
+  rpc WatchStatus(Empty) returns (stream Status);
+}
+
+// --- Search ----------------------------------------------------------------
+
+message SearchRequest {
+  // Free text, a track list, or a Spotify/URL reference — parsed server-side.
+  string input = 1;
+  // "search" (plain query), "spotify", or "tracklist" — the extractor source.
+  string source = 2;
+  // Organize downloads from this search into a numbered subfolder.
+  bool organize = 3;
+  // If non-zero, remove this existing search card before starting (re-search).
+  uint32 replace_token = 4;
+}
+
+message StartedSearch {
+  uint32 token = 1;
+  string query = 2;
+}
+
+message SearchResponse {
+  repeated StartedSearch started = 1;
+  string error = 2;
+}
+
+message RemoveSearchRequest {
+  uint32 token = 1;
+}
+
+message ResultFile {
+  string name = 1;
+  uint64 size = 2;
+  uint32 bitrate = 3;
+  uint32 length = 4;
+  bool vbr = 5;
+  uint32 sample_rate = 6;
+  uint32 bit_depth = 7;
+}
+
+message SearchResult {
+  string username = 1;
+  bool free_slots = 2;
+  uint32 upload_speed = 3;
+  uint32 in_queue = 4;
+  repeated ResultFile files = 5;
+}
+
+message Search {
+  uint32 token = 1;
+  string query = 2;
+  // "Organize" hints shared by every download from this search.
+  string folder = 3;
+  string prefix = 4;
+  repeated SearchResult results = 5;
+}
+
+message Searches {
+  repeated Search searches = 1;
+}
+
+service SearchService {
+  // Parse `input` then start the search(es); returns the started tokens.
+  rpc Search(SearchRequest) returns (SearchResponse);
+  rpc RemoveSearch(RemoveSearchRequest) returns (Empty);
+  rpc WatchSearches(Empty) returns (stream Searches);
+}
+
+// --- Transfers (downloads + uploads) ---------------------------------------
+
+enum DownloadStatus {
+  DOWNLOAD_STATUS_UNSPECIFIED = 0;
+  DOWNLOAD_QUEUED = 1;
+  DOWNLOAD_POSITION = 2;
+  DOWNLOAD_STARTING = 3;
+  DOWNLOAD_COMPLETED = 4;
+  DOWNLOAD_FAILED = 5;
+  DOWNLOAD_INCOMPLETE = 6;
+  DOWNLOAD_PAUSED = 7;
+}
+
+message Download {
+  string username = 1;
+  string filename = 2;
+  DownloadStatus status = 3;
+  uint32 place = 4;    // POSITION
+  string path = 5;     // COMPLETED
+  string error = 6;    // FAILED
+  uint64 bytes = 7;
+  uint64 size = 8;
+}
+
+enum UploadStatus {
+  UPLOAD_STATUS_UNSPECIFIED = 0;
+  UPLOAD_ACTIVE = 1;
+  UPLOAD_COMPLETED = 2;
+  UPLOAD_FAILED = 3;
+}
+
+message Upload {
+  string username = 1;
+  string filename = 2;
+  uint64 bytes = 3;
+  uint64 size = 4;
+  UploadStatus status = 5;
+  string error = 6;    // FAILED
+}
+
+message Transfers {
+  repeated Download downloads = 1;
+  repeated Upload uploads = 2;
+}
+
+message StartDownloadRequest {
+  string username = 1;
+  string filename = 2;
+  uint64 size = 3;
+  string subdir = 4;
+  string prefix = 5;
+}
+
+// Identifies an existing transfer for cancel/pause.
+message TransferRef {
+  string username = 1;
+  string filename = 2;
+}
+
+service TransfersService {
+  rpc StartDownload(StartDownloadRequest) returns (Empty);
+  rpc CancelDownload(TransferRef) returns (Empty);
+  rpc PauseDownload(TransferRef) returns (Empty);
+  rpc WatchTransfers(Empty) returns (stream Transfers);
+}
+
+// --- Browse (peer file browsing) -------------------------------------------
+
+message BrowseRequest {
+  string username = 1;
+}
+
+message BrowseResponse {
+  string error = 1;
+}
+
+message BrowseFileEntry {
+  string name = 1;
+  uint64 size = 2;
+}
+
+message BrowseDirEntry {
+  string path = 1;
+  repeated BrowseFileEntry files = 2;
+}
+
+message BrowseUserListing {
+  string username = 1;
+  repeated BrowseDirEntry directories = 2;
+  uint64 total_files = 3;
+  bool truncated = 4;
+  string error = 5;    // non-empty: the browse failed
+}
+
+message BrowseListings {
+  // Newest browse first.
+  repeated BrowseUserListing users = 1;
+}
+
+service BrowseService {
+  rpc Browse(BrowseRequest) returns (BrowseResponse);
+  rpc WatchBrowse(Empty) returns (stream BrowseListings);
+}
+
+// --- Config (also covers shares) -------------------------------------------
+
+message ServerConfig {
+  string host = 1;
+  uint32 port = 2;
+  string username = 3;
+  string password = 4;
+  uint32 listen_port = 5;
+}
+
+message SpotifyConfig {
+  string client_id = 1;
+  string client_secret = 2;
+  string refresh_token = 3;
+  // Derived: a refresh token is present (the user has completed OAuth login).
+  bool connected = 4;
+}
+
+message UpdateConfig {
+  bool enabled = 1;
+  bool auto_apply = 2;
+  string repo = 3;
+}
+
+message UiConfig {
+  string bind_addr = 1;
+  bool open_browser = 2;
+}
+
+message SharingConfig {
+  repeated string folders = 1;
+  string download_dir = 2;
+  string incomplete_dir = 3;
+  uint32 upload_slots = 4;
+  bool fifo_queue = 5;
+  bool respond_to_searches = 6;
+  uint32 max_search_results = 7;
+  uint32 min_result_files = 8;
+  uint32 min_peer_upload_speed = 9;
+  uint32 max_peer_queue_length = 10;
+  uint32 max_download_speed = 11;
+  uint32 max_upload_speed = 12;
+}
+
+message Config {
+  ServerConfig server = 1;
+  SpotifyConfig spotify = 2;
+  UpdateConfig update = 3;
+  UiConfig ui = 4;
+  SharingConfig sharing = 5;
+}
+
+message SetConfigResponse {
+  string error = 1;
+}
+
+service ConfigService {
+  rpc GetConfig(Empty) returns (Config);
+  rpc SetConfig(Config) returns (SetConfigResponse);
+  rpc WatchConfig(Empty) returns (stream Config);
+}
+
+// --- Updater ---------------------------------------------------------------
+
+enum UpdaterStatusKind {
+  UPDATER_STATUS_KIND_UNSPECIFIED = 0;
+  UPDATER_CHECKING = 1;
+  UPDATER_UP_TO_DATE = 2;
+  UPDATER_AVAILABLE = 3;
+  UPDATER_DOWNLOADING = 4;
+  UPDATER_READY_TO_APPLY = 5;
+  UPDATER_RESTART_REQUIRED = 6;
+  UPDATER_FAILED = 7;
+  UPDATER_SKIPPED = 8;
+}
+
+message UpdaterStatus {
+  UpdaterStatusKind kind = 1;
+  string current = 2;
+  string latest = 3;
+  string error = 4;
+  string reason = 5;
+}
+
+message ApplyUpdateResponse {
+  string error = 1;
+}
+
+service UpdaterService {
+  rpc ApplyUpdate(Empty) returns (ApplyUpdateResponse);
+  rpc WatchUpdater(Empty) returns (stream UpdaterStatus);
+}
+
+// --- System (process control) ----------------------------------------------
+
+service SystemService {
+  rpc Restart(Empty) returns (Empty);
+  rpc Quit(Empty) returns (Empty);
+}

@@ -41,6 +41,7 @@ vite_bin.vite(
         [
             "src/**/*.ts",
             "src/**/*.tsx",
+            "src/**/*.css",
         ],
         exclude = ["src/gen/**"],
     ),

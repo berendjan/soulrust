@@ -21,16 +21,12 @@ pub(crate) fn sanitize_path_component(raw: &str) -> String {
 }
 
 pub mod api_server;
-pub mod browse;
 pub mod github;
 pub mod net_edge;
 pub mod peer_net;
 pub mod session;
 pub mod transfer_io;
-pub mod ui;
-pub mod ui_theme;
 pub mod updater;
-pub mod web_bridge;
 
 #[cfg(test)]
 mod tests {
