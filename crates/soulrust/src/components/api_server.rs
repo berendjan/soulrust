@@ -99,6 +99,8 @@ struct SearchRow {
     results: Vec<SearchResultRow>,
     folder: String,
     prefix: String,
+    group: String,
+    track: u32,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -381,6 +383,8 @@ impl ApiServer {
                 query: s.query.clone(),
                 folder: s.folder.clone(),
                 prefix: s.prefix.clone(),
+                group: s.group.clone(),
+                track: s.track,
                 results: s
                     .results
                     .iter()
@@ -534,6 +538,8 @@ impl traits::core::Handle<SessionEvent> for ApiServer {
                     results: Vec::new(),
                     folder: message.folder.clone(),
                     prefix: message.prefix.clone(),
+                    group: message.group.clone(),
+                    track: message.track,
                 });
                 self.publish_searches();
             }
@@ -988,6 +994,15 @@ impl SearchService for Api {
             .then(|| job.folder.as_deref().map(crate::components::sanitize_path_component))
             .flatten()
             .filter(|s| !s.is_empty());
+        // Bulk (playlist/album) display grouping — set for every job of a
+        // multi-track source, independent of the organize option. The group name
+        // is the collection title (falling back to the source label).
+        let is_bulk = job.searches.len() > 1;
+        let group = job
+            .folder
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| job.source_label.clone());
         let width = job.searches.len().to_string().len().max(2);
         let jobs: Vec<_> = job
             .searches
@@ -998,6 +1013,10 @@ impl SearchService for Api {
                 if let Some(folder) = &subdir {
                     proto.folder = folder.clone();
                     proto.prefix = format!("{n:0width$} ", n = i + 1, width = width);
+                }
+                if is_bulk {
+                    proto.group = group.clone();
+                    proto.track = (i + 1) as u32;
                 }
                 proto
             })

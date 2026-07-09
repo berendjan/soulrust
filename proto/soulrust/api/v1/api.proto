@@ -97,6 +97,11 @@ message Search {
   string folder = 3;
   string prefix = 4;
   repeated SearchResult results = 5;
+  // Bulk (playlist/album) display grouping, independent of organize: the
+  // collection name and this track's 1-based position. Empty group / 0 = a
+  // standalone search.
+  string group = 6;
+  uint32 track = 7;
 }
 
 message Searches {

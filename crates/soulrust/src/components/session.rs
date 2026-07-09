@@ -31,7 +31,7 @@ enum SessionEventKind {
     Connecting,
     LoggedIn { greeting: String, own_ip: String },
     LoginFailed { reason: String },
-    SearchStarted { token: u32, query: String, folder: String, prefix: String },
+    SearchStarted { token: u32, query: String, folder: String, prefix: String, group: String, track: u32 },
     SearchBroadcastSeen { username: String, query: String },
     Disconnected { reason: String },
     ProtocolNote { note: String },
@@ -54,6 +54,8 @@ fn local_session_kind(ev: &SessionEvent) -> SessionEventKind {
             query: ev.query.clone(),
             folder: ev.folder.clone(),
             prefix: ev.prefix.clone(),
+            group: ev.group.clone(),
+            track: ev.track,
         },
         EnumValue::Known(K::SessionSearchBroadcastSeen) => SessionEventKind::SearchBroadcastSeen {
             username: ev.username.clone(),
@@ -147,12 +149,14 @@ impl Session {
             SessionEventKind::LoginFailed { reason } => {
                 SessionEvent { kind: K::SessionLoginFailed.into(), reason, ..Default::default() }
             }
-            SessionEventKind::SearchStarted { token, query, folder, prefix } => SessionEvent {
+            SessionEventKind::SearchStarted { token, query, folder, prefix, group, track } => SessionEvent {
                 kind: K::SessionSearchStarted.into(),
                 token,
                 query,
                 folder,
                 prefix,
+                group,
+                track,
                 ..Default::default()
             },
             SessionEventKind::SearchBroadcastSeen { username, query } => SessionEvent {
@@ -499,6 +503,8 @@ impl traits::core::Handle<StartSearch> for Session {
                     query: query.clone(),
                     folder: job.folder.clone(),
                     prefix: job.prefix.clone(),
+                    group: job.group.clone(),
+                    track: job.track,
                 },
                 writer,
             );
@@ -872,6 +878,50 @@ mod tests {
             .events()
             .iter()
             .any(|e| matches!(e, SessionEventKind::SearchStarted { token: 1, query, .. } if query == "A One")));
+    }
+
+    #[test]
+    fn bulk_search_group_and_track_reach_the_search_started_events() {
+        // The display-grouping fields set by the API edge on each job must ride
+        // through StartSearch to the per-token SearchStarted events, so the
+        // frontend can group a playlist's cards and number the tracks.
+        let writer = CapturingWriter::default();
+        let mut session = test_session();
+        session.handle(&NetConn { kind: NetConnKind::NetConnConnected.into(), ..Default::default() }, &writer);
+        session.handle(&NetRx { payload: login_success_payload(), ..Default::default() }, &writer);
+
+        session.handle(
+            &StartSearch {
+                corr: 1,
+                source_label: "spotify playlist: Mix".into(),
+                jobs: vec![
+                    soulrust_proto::bus::SearchJob {
+                        raw_query: Some("track one".into()),
+                        group: "Mix".into(),
+                        track: 1,
+                        ..Default::default()
+                    },
+                    soulrust_proto::bus::SearchJob {
+                        raw_query: Some("track two".into()),
+                        group: "Mix".into(),
+                        track: 2,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            &writer,
+        );
+
+        let started: Vec<_> = writer
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                SessionEventKind::SearchStarted { group, track, .. } => Some((group, track)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started, vec![("Mix".to_string(), 1), ("Mix".to_string(), 2)]);
     }
 
     #[test]

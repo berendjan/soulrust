@@ -117,7 +117,8 @@ export function SearchView() {
 
   const controls: TableControls = { sortKey, sortDesc, toggleSort, minBitrate, hidden, searchAgain };
 
-  // Build ordered items, grouping bulk searches (shared non-empty folder).
+  // Build ordered items, grouping bulk (playlist/album) searches by their shared
+  // group name. Standalone searches (empty group) render on their own.
   const byToken = new Map(cards.map((c) => [c.token, c]));
   type Item = { group: string; searches: Search[] } | { single: Search };
   const items: Item[] = [];
@@ -125,12 +126,12 @@ export function SearchView() {
   for (const token of order) {
     const c = byToken.get(token);
     if (!c) continue;
-    if (c.folder) {
-      if (groupAt.has(c.folder)) {
-        (items[groupAt.get(c.folder)!] as { searches: Search[] }).searches.push(c);
+    if (c.group) {
+      if (groupAt.has(c.group)) {
+        (items[groupAt.get(c.group)!] as { searches: Search[] }).searches.push(c);
       } else {
-        groupAt.set(c.folder, items.length);
-        items.push({ group: c.folder, searches: [c] });
+        groupAt.set(c.group, items.length);
+        items.push({ group: c.group, searches: [c] });
       }
     } else {
       items.push({ single: c });
@@ -221,13 +222,13 @@ function GroupCard(props: { folder: string; searches: Search[]; controls: TableC
         </span>
       </div>
       {props.searches.map((s) => (
-        <SearchCard key={s.token} card={s} controls={props.controls} trackNo={(s.prefix || "").trim()} inGroup />
+        <SearchCard key={s.token} card={s} controls={props.controls} trackNo={s.track || undefined} inGroup />
       ))}
     </div>
   );
 }
 
-function SearchCard(props: { card: Search; controls: TableControls; trackNo?: string; inGroup?: boolean }) {
+function SearchCard(props: { card: Search; controls: TableControls; trackNo?: number; inGroup?: boolean }) {
   const { card, controls, trackNo, inGroup } = props;
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(card.query);
@@ -242,7 +243,7 @@ function SearchCard(props: { card: Search; controls: TableControls; trackNo?: st
   return (
     <div className={inGroup ? "subcard" : "card"}>
       <div className="card-head">
-        {trackNo && <span className="pill">{trackNo}</span>}
+        {trackNo ? <span className="pill" title={`track ${trackNo}`}>{trackNo}</span> : null}
         {editing ? (
           <form className="search-form" style={{ flex: 1 }} onSubmit={submitRename}>
             <input value={draft} autoFocus onChange={(e) => setDraft(e.target.value)} />

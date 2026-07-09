@@ -305,6 +305,8 @@ message SessionEvent {
   string note = 8;       // PROTOCOL_NOTE
   string folder = 9;     // SEARCH_STARTED (organize: destination subfolder)
   string prefix = 10;    // SEARCH_STARTED (organize: filename prefix)
+  string group = 11;     // SEARCH_STARTED (bulk display group: playlist name)
+  uint32 track = 12;     // SEARCH_STARTED (bulk display: 1-based track index)
 }
 
 enum UpdaterStatusKind {
@@ -373,10 +375,15 @@ message SearchJob {
   optional string album = 3;
   optional string raw_query = 4;
   // "Organize" option: destination subfolder + filename prefix for the file
-  // this search downloads (empty = none). Set by the web bridge when the user
+  // this search downloads (empty = none). Set by the API edge when the user
   // opts to organize a playlist into a numbered folder.
   string folder = 5;
   string prefix = 6;
+  // Display grouping for a bulk (playlist/album) search, independent of the
+  // organize option: the collection name and this track's 1-based position.
+  // Empty group / 0 track = a standalone search.
+  string group = 7;
+  uint32 track = 8;
 }
 
 message Job {
