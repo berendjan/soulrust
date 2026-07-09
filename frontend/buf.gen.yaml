@@ -2,12 +2,14 @@
 # shared proto schema using protobuf-es v2. Connect-ES v2 reads the service
 # descriptor directly — no separate connect plugin needed.
 #
-# The plugin is referenced by its explicit node_modules path (rather than a bare
-# `protoc-gen-es` on PATH) so the hermetic Bazel `buf generate` action finds it;
-# `npm run generate` from the frontend dir resolves the same path.
+# The plugin is invoked as `node <script>` with its explicit node_modules path
+# (rather than a bare `protoc-gen-es` on PATH) so the hermetic Bazel
+# `buf generate` action finds it on every platform — Windows cannot exec the
+# shebang script directly. `node` comes from the rules_js launcher's PATH;
+# `npm run generate` from the frontend dir resolves the same way.
 version: v2
 plugins:
-  - local: node_modules/@bufbuild/protoc-gen-es/bin/protoc-gen-es
+  - local: [node, node_modules/@bufbuild/protoc-gen-es/bin/protoc-gen-es]
     out: src/gen
     opt:
       - target=ts
