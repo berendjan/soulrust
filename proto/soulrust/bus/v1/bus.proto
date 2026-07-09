@@ -453,6 +453,7 @@ message SharingConfig {
   uint32 max_peer_queue_length = 10;
   uint32 max_download_speed = 11;
   uint32 max_upload_speed = 12;
+  bool organize_downloads = 13;
 }
 
 message Config {

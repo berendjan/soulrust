@@ -35,6 +35,7 @@ export function toInit(c: Config) {
       maxPeerQueueLength: c.sharing?.maxPeerQueueLength ?? 0,
       maxDownloadSpeed: c.sharing?.maxDownloadSpeed ?? 0,
       maxUploadSpeed: c.sharing?.maxUploadSpeed ?? 0,
+      organizeDownloads: c.sharing?.organizeDownloads ?? true,
     },
   };
 }

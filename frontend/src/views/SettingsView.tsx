@@ -26,6 +26,7 @@ interface Form {
   uploadSlots: number;
   respondToSearches: boolean;
   fifoQueue: boolean;
+  organizeDownloads: boolean;
   maxSearchResults: number;
   minResultFiles: number;
   minPeerUploadSpeed: number;
@@ -70,6 +71,7 @@ export function SettingsView() {
           uploadSlots: c.sharing?.uploadSlots ?? 0,
           respondToSearches: c.sharing?.respondToSearches ?? false,
           fifoQueue: c.sharing?.fifoQueue ?? false,
+          organizeDownloads: c.sharing?.organizeDownloads ?? true,
           maxSearchResults: c.sharing?.maxSearchResults ?? 0,
           minResultFiles: c.sharing?.minResultFiles ?? 0,
           minPeerUploadSpeed: c.sharing?.minPeerUploadSpeed ?? 0,
@@ -104,6 +106,7 @@ export function SettingsView() {
           incompleteDir: form.incompleteDir,
           uploadSlots: form.uploadSlots,
           fifoQueue: form.fifoQueue,
+          organizeDownloads: form.organizeDownloads,
           respondToSearches: form.respondToSearches,
           maxSearchResults: form.maxSearchResults,
           minResultFiles: form.minResultFiles,
@@ -157,6 +160,15 @@ export function SettingsView() {
           <NumField label="Max peer queue length" value={form.maxPeerQueueLength} onChange={(v) => set("maxPeerQueueLength", v)} />
           <Check label="Respond to searches" value={form.respondToSearches} onChange={(v) => set("respondToSearches", v)} />
           <Check label="FIFO queue" value={form.fifoQueue} onChange={(v) => set("fifoQueue", v)} />
+          <Check
+            label="Organize playlist downloads"
+            value={form.organizeDownloads}
+            onChange={(v) => set("organizeDownloads", v)}
+          />
+          <p className="muted" style={{ margin: "0.2rem 0 0", fontSize: "0.85rem" }}>
+            When downloading a Spotify playlist or album, save its tracks into a subfolder named after the
+            collection, each file prefixed with its track number (01, 02, …) so the folder sorts in order.
+          </p>
         </fieldset>
 
         <fieldset>

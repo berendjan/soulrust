@@ -113,6 +113,10 @@ pub struct SharingConfig {
     /// Aggregate upload throttle in bytes/second across all transfers
     /// (0 = unlimited).
     pub max_upload_speed: u32,
+    /// When downloading a Spotify playlist/album, save its tracks into a
+    /// subfolder named after the collection, each file prefixed with its track
+    /// number so the folder sorts in order. Default on.
+    pub organize_downloads: bool,
 }
 
 impl SharingConfig {
@@ -163,6 +167,7 @@ impl Default for SharingConfig {
             max_peer_queue_length: 0,
             max_download_speed: 0,
             max_upload_speed: 0,
+            organize_downloads: true,
         }
     }
 }
@@ -222,6 +227,7 @@ pub fn config_to_proto(c: &Config) -> bus::Config {
             max_peer_queue_length: c.sharing.max_peer_queue_length,
             max_download_speed: c.sharing.max_download_speed,
             max_upload_speed: c.sharing.max_upload_speed,
+            organize_downloads: c.sharing.organize_downloads,
             ..Default::default()
         }),
         ..Default::default()
@@ -265,6 +271,7 @@ pub fn config_from_proto(c: &bus::Config) -> Config {
             max_peer_queue_length: c.sharing.max_peer_queue_length,
             max_download_speed: c.sharing.max_download_speed,
             max_upload_speed: c.sharing.max_upload_speed,
+            organize_downloads: c.sharing.organize_downloads,
         },
     }
 }

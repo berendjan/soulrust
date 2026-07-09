@@ -988,9 +988,11 @@ impl SearchService for Api {
             }
             _ => return Err(ConnectError::internal("unexpected reply")),
         };
-        // 2. Optionally organize downloads into a numbered subfolder.
-        let subdir = req
-            .organize
+        // 2. Optionally organize downloads into a numbered subfolder. This is a
+        //    persistent preference (config.sharing.organize_downloads), applied
+        //    to any playlist/album source.
+        let organize = self.shared.current.lock().unwrap().sharing.organize_downloads;
+        let subdir = organize
             .then(|| job.folder.as_deref().map(crate::components::sanitize_path_component))
             .flatten()
             .filter(|s| !s.is_empty());
@@ -1615,6 +1617,7 @@ fn config_to_api(c: &Config) -> api::Config {
             max_peer_queue_length: c.sharing.max_peer_queue_length,
             max_download_speed: c.sharing.max_download_speed,
             max_upload_speed: c.sharing.max_upload_speed,
+            organize_downloads: c.sharing.organize_downloads,
             ..Default::default()
         }),
         ..Default::default()
@@ -1656,6 +1659,7 @@ fn api_config_to_serde(c: &api::Config) -> Config {
             max_peer_queue_length: c.sharing.max_peer_queue_length,
             max_download_speed: c.sharing.max_download_speed,
             max_upload_speed: c.sharing.max_upload_speed,
+            organize_downloads: c.sharing.organize_downloads,
         },
     }
 }

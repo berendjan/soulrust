@@ -41,7 +41,6 @@ const COLUMNS: { key: string; label: string; num: boolean; toggle: boolean }[] =
 export function SearchView() {
   const searches = useWatch<Searches>((signal) => searchClient.watchSearches({}, { signal }));
   const [input, setInput] = useState("");
-  const [organize, setOrganize] = useState(false);
   const [banner, setBanner] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -82,7 +81,7 @@ export function SearchView() {
     setBusy(true);
     setBanner(null);
     try {
-      const res = await searchClient.search({ input, organize });
+      const res = await searchClient.search({ input });
       setBanner(res.error ? res.error : `started ${res.started.length} search(es)`);
       setInput("");
     } catch (err) {
@@ -99,6 +98,10 @@ export function SearchView() {
       .search({ input: query, replaceToken: token })
       .then((res) => res.started.forEach((s) => placement.current.set(s.token, idx < 0 ? order.length : idx)))
       .catch(() => {});
+  };
+
+  const closeAll = (tokens: number[]) => {
+    for (const token of tokens) searchClient.removeSearch({ token }).catch(() => {});
   };
 
   const toggleSort = (key: string) => {
@@ -153,10 +156,6 @@ export function SearchView() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
           />
-          <label className="checkbox" style={{ marginTop: 0 }} title="organize a playlist/album into a numbered subfolder">
-            <input type="checkbox" checked={organize} onChange={(e) => setOrganize(e.target.checked)} />
-            Organize
-          </label>
           <button className="btn" type="submit" disabled={busy}>
             {busy ? "…" : "Search"}
           </button>
@@ -164,14 +163,28 @@ export function SearchView() {
         {banner && <div className="banner" style={{ marginTop: "0.8rem" }}>{banner}</div>}
       </div>
 
-      {items.length > 0 && <ColBar minBitrate={minBitrate} setMinBitrate={setMinBitrate} hidden={hidden} toggleCol={toggleCol} />}
+      {items.length > 0 && (
+        <ColBar
+          minBitrate={minBitrate}
+          setMinBitrate={setMinBitrate}
+          hidden={hidden}
+          toggleCol={toggleCol}
+          onCloseAll={() => closeAll(order)}
+        />
+      )}
 
       {items.length === 0 && <p className="muted">No searches yet.</p>}
       {items.map((it, i) =>
         "single" in it ? (
           <SearchCard key={it.single.token} card={it.single} controls={controls} />
         ) : (
-          <GroupCard key={`g-${it.group}-${i}`} folder={it.group} searches={it.searches} controls={controls} />
+          <GroupCard
+            key={`g-${it.group}-${i}`}
+            folder={it.group}
+            searches={it.searches}
+            controls={controls}
+            onCloseAll={() => closeAll(it.searches.map((s) => s.token))}
+          />
         ),
       )}
 
@@ -185,6 +198,7 @@ function ColBar(props: {
   setMinBitrate: (n: number) => void;
   hidden: Set<string>;
   toggleCol: (key: string) => void;
+  onCloseAll: () => void;
 }) {
   return (
     <div className="col-bar">
@@ -204,11 +218,14 @@ function ColBar(props: {
           {c.label}
         </label>
       ))}
+      <button className="btn xs secondary" style={{ marginLeft: "auto" }} onClick={props.onCloseAll}>
+        Close all
+      </button>
     </div>
   );
 }
 
-function GroupCard(props: { folder: string; searches: Search[]; controls: TableControls }) {
+function GroupCard(props: { folder: string; searches: Search[]; controls: TableControls; onCloseAll: () => void }) {
   const total = props.searches.reduce((n, s) => n + s.results.reduce((m, r) => m + r.files.length, 0), 0);
   return (
     <div className="card group-card">
@@ -220,6 +237,9 @@ function GroupCard(props: { folder: string; searches: Search[]; controls: TableC
         <span className="muted">
           — {props.searches.length} track(s), {total} file(s)
         </span>
+        <button className="btn xs secondary spacer" title="close all tracks" onClick={props.onCloseAll}>
+          Close all
+        </button>
       </div>
       {props.searches.map((s) => (
         <SearchCard key={s.token} card={s} controls={props.controls} trackNo={s.track || undefined} inGroup />

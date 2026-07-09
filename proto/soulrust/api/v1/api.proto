@@ -50,10 +50,8 @@ message SearchRequest {
   // which (a Spotify reference is matched by its URL/URI; anything else is a
   // plain-text search), so there is no explicit source selector.
   string input = 1;
-  reserved 2;  // was `source` — the extractor auto-detects, no selector needed
-  reserved "source";
-  // Organize downloads from this search into a numbered subfolder.
-  bool organize = 3;
+  reserved 2, 3;  // was `source` (auto-detected) and `organize` (now a config setting)
+  reserved "source", "organize";
   // If non-zero, remove this existing search card before starting (re-search).
   uint32 replace_token = 4;
 }
@@ -264,6 +262,8 @@ message SharingConfig {
   uint32 max_peer_queue_length = 10;
   uint32 max_download_speed = 11;
   uint32 max_upload_speed = 12;
+  // Organize Spotify playlist/album downloads into a numbered subfolder.
+  bool organize_downloads = 13;
 }
 
 message Config {
