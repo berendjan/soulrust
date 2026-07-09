@@ -1,9 +1,10 @@
-// Configuration: server account, sharing (shares), Spotify, updater, and
-// process control. Loads the current config once, edits locally, saves via
-// SetConfig.
+// Settings: account, sharing, updates, interface, and process control. Loads
+// the current config once, edits locally, and saves via patchConfig (which
+// preserves the sections this view doesn't touch, e.g. Spotify).
 import { useEffect, useState } from "react";
 
 import { configClient, systemClient, updaterClient } from "../client";
+import { patchConfig } from "../configIO";
 import { useWatch } from "../useWatch";
 import { UpdaterStatusKind } from "../format";
 import type { UpdaterStatus } from "../gen/soulrust/api/v1/api_pb";
@@ -14,9 +15,6 @@ interface Form {
   username: string;
   password: string;
   listenPort: number;
-  clientId: string;
-  clientSecret: string;
-  spotifyConnected: boolean;
   updateEnabled: boolean;
   autoApply: boolean;
   repo: string;
@@ -36,7 +34,7 @@ interface Form {
   maxUploadSpeed: number;
 }
 
-export function ConfigView() {
+export function SettingsView() {
   const [form, setForm] = useState<Form | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
   const updater = useWatch<UpdaterStatus>((signal) => updaterClient.watchUpdater({}, { signal }));
@@ -49,11 +47,8 @@ export function ConfigView() {
           host: c.server?.host ?? "",
           port: c.server?.port ?? 0,
           username: c.server?.username ?? "",
-          password: c.server?.password ?? "",
+          password: "",
           listenPort: c.server?.listenPort ?? 0,
-          clientId: c.spotify?.clientId ?? "",
-          clientSecret: c.spotify?.clientSecret ?? "",
-          spotifyConnected: c.spotify?.connected ?? false,
           updateEnabled: c.update?.enabled ?? false,
           autoApply: c.update?.autoApply ?? false,
           repo: c.update?.repo ?? "",
@@ -76,48 +71,48 @@ export function ConfigView() {
       .catch((e) => setBanner(String(e)));
   }, []);
 
-  if (!form) return <div className="view">Loading config…</div>;
-
+  if (!form) return <div className="card">Loading settings…</div>;
   const set = <K extends keyof Form>(k: K, v: Form[K]) => setForm({ ...form, [k]: v });
 
   const save = async (e: React.FormEvent) => {
     e.preventDefault();
     setBanner(null);
     try {
-      const res = await configClient.setConfig({
-        server: {
+      const err = await patchConfig((init) => {
+        init.server = {
           host: form.host,
           port: form.port,
           username: form.username,
           password: form.password,
           listenPort: form.listenPort,
-        },
-        spotify: { clientId: form.clientId, clientSecret: form.clientSecret },
-        update: { enabled: form.updateEnabled, autoApply: form.autoApply, repo: form.repo },
-        ui: { bindAddr: form.bindAddr, openBrowser: form.openBrowser },
-        sharing: {
+        };
+        init.update = { enabled: form.updateEnabled, autoApply: form.autoApply, repo: form.repo };
+        init.ui = { bindAddr: form.bindAddr, openBrowser: form.openBrowser };
+        init.sharing = {
           folders: form.folders.split("\n").map((s) => s.trim()).filter(Boolean),
           downloadDir: form.downloadDir,
           incompleteDir: form.incompleteDir,
           uploadSlots: form.uploadSlots,
-          respondToSearches: form.respondToSearches,
           fifoQueue: form.fifoQueue,
+          respondToSearches: form.respondToSearches,
           maxSearchResults: form.maxSearchResults,
           minResultFiles: form.minResultFiles,
           minPeerUploadSpeed: form.minPeerUploadSpeed,
           maxPeerQueueLength: form.maxPeerQueueLength,
           maxDownloadSpeed: form.maxDownloadSpeed,
           maxUploadSpeed: form.maxUploadSpeed,
-        },
+        };
       });
-      setBanner(res.error ? `error: ${res.error}` : "saved");
+      setBanner(err ? `error: ${err}` : "saved");
     } catch (err) {
       setBanner(String(err));
     }
   };
 
   return (
-    <div className="view">
+    <>
+      <h1>Settings</h1>
+      <p className="sub">Account, sharing, updates and interface.</p>
       {banner && <div className="banner">{banner}</div>}
       <form onSubmit={save}>
         <fieldset>
@@ -155,35 +150,12 @@ export function ConfigView() {
         </fieldset>
 
         <fieldset>
-          <legend>Spotify</legend>
-          <Field label="Client ID" value={form.clientId} onChange={(v) => set("clientId", v)} />
-          <Field
-            label="Client secret"
-            type="password"
-            value={form.clientSecret}
-            placeholder="leave blank to keep current"
-            onChange={(v) => set("clientSecret", v)}
-          />
-          <p>
-            {form.spotifyConnected ? (
-              <span className="pill ok">● connected</span>
-            ) : (
-              <span className="pill warn">● not connected</span>
-            )}{" "}
-            <a className="btn xs" href="/spotify/login">
-              Connect Spotify
-            </a>
-            <span className="muted"> (save your client ID/secret first)</span>
-          </p>
-        </fieldset>
-
-        <fieldset>
           <legend>Updates</legend>
           <Check label="Check for updates" value={form.updateEnabled} onChange={(v) => set("updateEnabled", v)} />
           <Check label="Auto-apply" value={form.autoApply} onChange={(v) => set("autoApply", v)} />
           <Field label="Repo" value={form.repo} onChange={(v) => set("repo", v)} />
           <p className="muted">{updaterLabel(updater)}</p>
-          <button type="button" className="xs" onClick={() => updaterClient.applyUpdate({}).catch(() => {})}>
+          <button type="button" className="btn xs secondary" onClick={() => updaterClient.applyUpdate({}).catch(() => {})}>
             Apply update
           </button>
         </fieldset>
@@ -195,16 +167,18 @@ export function ConfigView() {
         </fieldset>
 
         <div className="row">
-          <button type="submit">Save</button>
-          <button type="button" className="ghost" onClick={() => systemClient.restart({}).catch(() => {})}>
+          <button className="btn" type="submit">
+            Save
+          </button>
+          <button type="button" className="btn secondary" onClick={() => systemClient.restart({}).catch(() => {})}>
             Restart
           </button>
-          <button type="button" className="ghost" onClick={() => systemClient.quit({}).catch(() => {})}>
+          <button type="button" className="btn secondary" onClick={() => systemClient.quit({}).catch(() => {})}>
             Quit
           </button>
         </div>
       </form>
-    </div>
+    </>
   );
 }
 
@@ -256,11 +230,7 @@ function NumField(props: { label: string; value: number; onChange: (v: number) =
   return (
     <label className="field">
       <span>{props.label}</span>
-      <input
-        type="number"
-        value={props.value}
-        onChange={(e) => props.onChange(Number(e.target.value) || 0)}
-      />
+      <input type="number" value={props.value} onChange={(e) => props.onChange(Number(e.target.value) || 0)} />
     </label>
   );
 }

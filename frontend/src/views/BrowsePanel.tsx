@@ -1,13 +1,13 @@
-// Browse a peer's shared files. The listing arrives asynchronously and streams
-// in via WatchBrowse.
+// Browse a peer's shared files — embedded on the Search page (as in the old UI).
+// The listing arrives asynchronously and streams in via WatchBrowse.
 import { useState } from "react";
 
 import { browseClient, transfersClient } from "../client";
 import { useWatch } from "../useWatch";
-import { humanSize } from "../format";
+import { basename, humanSize } from "../format";
 import type { BrowseListings } from "../gen/soulrust/api/v1/api_pb";
 
-export function BrowseView() {
+export function BrowsePanel() {
   const listings = useWatch<BrowseListings>((signal) => browseClient.watchBrowse({}, { signal }));
   const [username, setUsername] = useState("");
   const [banner, setBanner] = useState<string | null>(null);
@@ -26,17 +26,19 @@ export function BrowseView() {
   const users = listings?.users ?? [];
 
   return (
-    <div className="view">
+    <div className="card">
+      <h3>Browse a user</h3>
       <form className="search-form" onSubmit={submit}>
         <input placeholder="peer username" value={username} onChange={(e) => setUsername(e.target.value)} />
-        <button type="submit">Browse</button>
+        <button className="btn" type="submit">
+          Browse
+        </button>
       </form>
-      {banner && <div className="banner">{banner}</div>}
-      {users.length === 0 && <p className="muted">No browses yet.</p>}
+      {banner && <div className="banner" style={{ marginTop: "0.8rem" }}>{banner}</div>}
       {users.map((u) => (
-        <div className="card" key={u.username}>
-          <div className="card-head">
-            <b>{u.username}</b>
+        <details className="dir" key={u.username} open>
+          <summary>
+            <b>{u.username}</b>{" "}
             {u.error ? (
               <span className="pill warn">{u.error}</span>
             ) : (
@@ -44,7 +46,7 @@ export function BrowseView() {
                 {Number(u.totalFiles)} file(s){u.truncated ? " (partial)" : ""}
               </span>
             )}
-          </div>
+          </summary>
           {!u.error &&
             u.directories.map((dir) => (
               <details key={dir.path} className="dir">
@@ -61,7 +63,7 @@ export function BrowseView() {
                             .catch(() => {})
                         }
                       >
-                        {f.name.replace(/^.*[\\/]/, "")}
+                        {basename(f.name)}
                       </button>
                       <span className="muted"> ({humanSize(f.size)})</span>
                     </li>
@@ -69,7 +71,7 @@ export function BrowseView() {
                 </ul>
               </details>
             ))}
-        </div>
+        </details>
       ))}
     </div>
   );

@@ -112,3 +112,12 @@ export const UpdaterStatusKind = {
 export function isAudio(path: string): boolean {
   return /\.(mp3|flac|wav|m4a|m4b|aac|mp4|ogg|opus|aiff|aif)$/i.test(path);
 }
+
+export function basename(path: string): string {
+  return path.replace(/^.*[\\/]/, "");
+}
+
+export function dirname(path: string): string {
+  const i = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  return i >= 0 ? path.slice(0, i) : "";
+}
