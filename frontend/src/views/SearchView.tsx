@@ -14,7 +14,6 @@ import type { Search, Searches } from "../gen/soulrust/api/v1/api_pb";
 export function SearchView() {
   const searches = useWatch<Searches>((signal) => searchClient.watchSearches({}, { signal }));
   const [input, setInput] = useState("");
-  const [source, setSource] = useState("search");
   const [organize, setOrganize] = useState(false);
   const [banner, setBanner] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -25,7 +24,7 @@ export function SearchView() {
     setBusy(true);
     setBanner(null);
     try {
-      const res = await searchClient.search({ input, source, organize });
+      const res = await searchClient.search({ input, organize });
       setBanner(res.error ? res.error : `started ${res.started.length} search(es)`);
       setInput("");
     } catch (err) {
@@ -48,16 +47,11 @@ export function SearchView() {
         <form className="search-form" onSubmit={submit}>
           <input
             autoFocus
-            placeholder="artist / title, a track list, or a Spotify playlist URL"
+            placeholder="artist / title, or a Spotify track / album / playlist URL"
             value={input}
             onChange={(e) => setInput(e.target.value)}
           />
-          <select value={source} onChange={(e) => setSource(e.target.value)}>
-            <option value="search">Search</option>
-            <option value="spotify">Spotify</option>
-            <option value="tracklist">Track list</option>
-          </select>
-          <label className="checkbox" style={{ marginTop: 0 }}>
+          <label className="checkbox" style={{ marginTop: 0 }} title="organize a playlist/album into a numbered subfolder">
             <input type="checkbox" checked={organize} onChange={(e) => setOrganize(e.target.checked)} />
             Organize
           </label>

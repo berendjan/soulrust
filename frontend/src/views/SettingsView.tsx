@@ -37,7 +37,17 @@ interface Form {
 export function SettingsView() {
   const [form, setForm] = useState<Form | null>(null);
   const [banner, setBanner] = useState<string | null>(null);
+  const [file, setFile] = useState<{ path: string; yaml: string } | null>(null);
   const updater = useWatch<UpdaterStatus>((signal) => updaterClient.watchUpdater({}, { signal }));
+
+  const viewFile = async () => {
+    try {
+      const f = await configClient.getConfigFile({});
+      setFile({ path: f.path, yaml: f.yaml });
+    } catch (err) {
+      setBanner(String(err));
+    }
+  };
 
   useEffect(() => {
     configClient
@@ -164,6 +174,24 @@ export function SettingsView() {
           <legend>Interface</legend>
           <Field label="Bind address" value={form.bindAddr} onChange={(v) => set("bindAddr", v)} />
           <Check label="Open browser on start" value={form.openBrowser} onChange={(v) => set("openBrowser", v)} />
+        </fieldset>
+
+        <fieldset>
+          <legend>Config file</legend>
+          <p className="muted">The effective configuration on disk, with secrets redacted.</p>
+          <button type="button" className="btn xs secondary" onClick={viewFile}>
+            {file ? "Refresh" : "View config file"}
+          </button>
+          {file && (
+            <>
+              <p className="muted" style={{ marginBottom: "0.3rem" }}>
+                <code>{file.path}</code>
+              </p>
+              <pre className="log" style={{ maxHeight: "20rem" }}>
+                {file.yaml}
+              </pre>
+            </>
+          )}
         </fieldset>
 
         <div className="row">

@@ -46,10 +46,12 @@ service StatusService {
 // --- Search ----------------------------------------------------------------
 
 message SearchRequest {
-  // Free text, a track list, or a Spotify/URL reference — parsed server-side.
+  // Free text or a Spotify track/album/playlist URL — the extractor auto-detects
+  // which (a Spotify reference is matched by its URL/URI; anything else is a
+  // plain-text search), so there is no explicit source selector.
   string input = 1;
-  // "search" (plain query), "spotify", or "tracklist" — the extractor source.
-  string source = 2;
+  reserved 2;  // was `source` — the extractor auto-detects, no selector needed
+  reserved "source";
   // Organize downloads from this search into a numbered subfolder.
   bool organize = 3;
   // If non-zero, remove this existing search card before starting (re-search).
@@ -271,10 +273,18 @@ message SetConfigResponse {
   string error = 1;
 }
 
+// The effective config as it sits on disk: the file path plus its serialized
+// YAML with secrets redacted (for the "view config file" panel).
+message ConfigFile {
+  string path = 1;
+  string yaml = 2;
+}
+
 service ConfigService {
   rpc GetConfig(Empty) returns (Config);
   rpc SetConfig(Config) returns (SetConfigResponse);
   rpc WatchConfig(Empty) returns (stream Config);
+  rpc GetConfigFile(Empty) returns (ConfigFile);
 }
 
 // --- Updater ---------------------------------------------------------------

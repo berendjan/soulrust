@@ -1154,6 +1154,34 @@ impl ConfigService for Api {
     ) -> ServiceResult<ServiceStream<api::Config>> {
         Response::stream_ok(watch_stream(self.shared.config_tx.subscribe()))
     }
+
+    #[allow(refining_impl_trait)]
+    async fn get_config_file(
+        &self,
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, api::Empty>,
+    ) -> ServiceResult<api::ConfigFile> {
+        let yaml = serde_yaml::to_string(&redact_secrets(&self.shared.current.lock().unwrap()))
+            .unwrap_or_else(|e| format!("# failed to serialize config: {e}"));
+        Response::ok(api::ConfigFile {
+            path: self.shared.config_path.display().to_string(),
+            yaml,
+            ..Default::default()
+        })
+    }
+}
+
+/// A copy of the config with secrets masked, for the read-only "view config
+/// file" panel — so the on-disk shape is visible without exposing credentials.
+fn redact_secrets(c: &Config) -> Config {
+    const MASK: &str = "••••••••";
+    let mask = |s: &str| if s.is_empty() { String::new() } else { MASK.to_owned() };
+    let mask_opt = |s: &Option<String>| s.as_deref().filter(|s| !s.is_empty()).map(|_| MASK.to_owned());
+    let mut c = c.clone();
+    c.server.password = mask(&c.server.password);
+    c.spotify.client_secret = mask_opt(&c.spotify.client_secret);
+    c.spotify.refresh_token = mask_opt(&c.spotify.refresh_token);
+    c
 }
 
 impl UpdaterService for Api {
