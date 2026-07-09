@@ -188,6 +188,10 @@ struct Shared {
     corr: AtomicU64,
     control: Arc<Control>,
     config_path: PathBuf,
+    /// The full current config, including secrets never sent over the wire
+    /// (password, client_secret, refresh_token). The source of truth for merging
+    /// SetConfig (empty secret = keep) and for the Spotify OAuth flow.
+    current: Mutex<Config>,
     /// Pending Spotify OAuth `state` nonce between /spotify/login and its callback.
     oauth_state: Mutex<Option<String>>,
     status_tx: tokio_api::sync::watch::Sender<api::Status>,
@@ -284,6 +288,7 @@ impl ApiServer {
             corr: AtomicU64::new(0),
             control: ctx.control.clone(),
             config_path: ctx.config_path.clone(),
+            current: Mutex::new(ctx.config.clone()),
             oauth_state: Mutex::new(None),
             status_tx,
             searches_tx,
@@ -535,6 +540,7 @@ impl traits::core::Handle<ConfigChanged> for ApiServer {
     fn handle<W: traits::core::Writer>(&mut self, message: &ConfigChanged, _writer: &W) {
         let config = config::config_from_proto(&message.config);
         self.username = config.server.username.clone();
+        *self.shared.current.lock().unwrap() = config.clone();
         let _ = self.shared.config_tx.send_replace(config_to_api(&config));
         self.log("configuration updated".into());
     }
@@ -823,8 +829,13 @@ fn serve<W: traits::core::Writer + Clone + Send + 'static>(
             .with_state(shared.clone())
             // The Connect service (POST /soulrust.api.v1.*) is the fallback; it
             // never collides with the GET routes above.
-            .fallback_service(router.into_axum_service())
-            .layer(tower_http::cors::CorsLayer::permissive());
+            //
+            // No CORS layer: the SPA is served same-origin from this port and the
+            // dev server reaches the API through Vite's proxy, so no cross-origin
+            // access is needed. Omitting it stops other origins (the browser
+            // blocks cross-origin reads without CORS headers) from reaching this
+            // unauthenticated loopback API.
+            .fallback_service(router.into_axum_service());
 
         let listener = match tokio_api::net::TcpListener::bind(&addr).await {
             Ok(listener) => listener,
@@ -1113,7 +1124,21 @@ impl ConfigService for Api {
         _ctx: RequestContext,
         request: ServiceRequest<'_, api::Config>,
     ) -> ServiceResult<api::SetConfigResponse> {
-        let cfg = config::config_to_proto(&api_config_to_serde(&request.to_owned_message()));
+        let mut serde = api_config_to_serde(&request.to_owned_message());
+        // Merge secrets from the stored config: the client never receives them,
+        // so an empty field means "keep". refresh_token is server-managed (only
+        // the OAuth callback writes it), so it is always preserved here.
+        {
+            let current = self.shared.current.lock().unwrap();
+            if serde.server.password.is_empty() {
+                serde.server.password = current.server.password.clone();
+            }
+            if serde.spotify.client_secret.as_deref().is_none_or(str::is_empty) {
+                serde.spotify.client_secret = current.spotify.client_secret.clone();
+            }
+            serde.spotify.refresh_token = current.spotify.refresh_token.clone();
+        }
+        let cfg = config::config_to_proto(&serde);
         let result = match self.shared.round_trip(|corr| BusCommand::SetConfig { corr, config: cfg }).await? {
             BridgeReply::SetConfig(result) => result,
             _ => return Err(ConnectError::internal("unexpected reply")),
@@ -1217,10 +1242,10 @@ fn content_type(path: &str) -> &'static str {
 /// existing files with a known audio extension.
 async fn serve_media(headers: HeaderMap, RawQuery(query): RawQuery) -> HttpResponse {
     let params = parse_query(query.as_deref().unwrap_or(""));
-    let Some(path) = params.get("path").filter(|p| !p.is_empty()) else {
+    let Some(path) = params.get("path").filter(|p| !p.is_empty()).cloned() else {
         return (StatusCode::BAD_REQUEST, "missing path").into_response();
     };
-    let p = std::path::Path::new(path);
+    let p = std::path::PathBuf::from(&path);
     let mime = match p.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
         Some("mp3") => "audio/mpeg",
         Some("flac") => "audio/flac",
@@ -1230,35 +1255,60 @@ async fn serve_media(headers: HeaderMap, RawQuery(query): RawQuery) -> HttpRespo
         Some("aiff") | Some("aif") => "audio/aiff",
         _ => return (StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported media type").into_response(),
     };
-    if !p.is_file() {
-        return (StatusCode::NOT_FOUND, "not found").into_response();
-    }
-    let bytes = match std::fs::read(p) {
-        Ok(b) => b,
+    let range_header = headers.get(header::RANGE).and_then(|h| h.to_str().ok()).map(str::to_owned);
+    // File stat + read of just the requested slice runs on a blocking thread so
+    // it never stalls the async runtime's workers (audio files can be large).
+    let read = tokio_api::task::spawn_blocking(move || read_media_range(&p, range_header.as_deref())).await;
+    let slice = match read {
+        Ok(Ok(slice)) => slice,
+        Ok(Err(code)) => return (code, "").into_response(),
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "read error").into_response(),
     };
-    let total = bytes.len();
-    let range = headers.get(header::RANGE).and_then(|h| h.to_str().ok()).and_then(|h| parse_byte_range(h, total));
-    let (status, start, end) = match range {
-        Some((s, e)) => (StatusCode::PARTIAL_CONTENT, s, e),
-        None => (StatusCode::OK, 0, total.saturating_sub(1)),
-    };
-    let body = if total == 0 { Vec::new() } else { bytes[start..=end].to_vec() };
     let mut builder = HttpResponse::builder()
-        .status(status)
         .header(header::CONTENT_TYPE, mime)
         .header(header::ACCEPT_RANGES, "bytes");
-    if status == StatusCode::PARTIAL_CONTENT {
-        builder = builder.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{total}"));
+    if slice.partial {
+        builder = builder
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(header::CONTENT_RANGE, format!("bytes {}-{}/{}", slice.start, slice.end, slice.total));
     }
-    builder.body(Body::from(body)).expect("media response")
+    builder.body(Body::from(slice.data)).expect("media response")
+}
+
+struct MediaSlice {
+    data: Vec<u8>,
+    start: usize,
+    end: usize,
+    total: usize,
+    partial: bool,
+}
+
+/// Read only the requested byte range of an existing audio file (blocking).
+/// Restricted to regular files so a stray request can't read arbitrary paths.
+fn read_media_range(p: &std::path::Path, range: Option<&str>) -> Result<MediaSlice, StatusCode> {
+    use std::io::{Read, Seek, SeekFrom};
+    let meta = std::fs::metadata(p).map_err(|_| StatusCode::NOT_FOUND)?;
+    if !meta.is_file() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let total = meta.len() as usize;
+    let (start, end, partial) = match range.and_then(|h| parse_byte_range(h, total)) {
+        Some((s, e)) => (s, e, true),
+        None => (0, total.saturating_sub(1), false),
+    };
+    if total == 0 {
+        return Ok(MediaSlice { data: Vec::new(), start: 0, end: 0, total, partial: false });
+    }
+    let mut file = std::fs::File::open(p).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    file.seek(SeekFrom::Start(start as u64)).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut data = vec![0u8; end - start + 1];
+    file.read_exact(&mut data).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(MediaSlice { data, start, end, total, partial })
 }
 
 /// GET /spotify/login: 302 to Spotify's authorize screen.
 async fn spotify_login(State(shared): State<Arc<Shared>>) -> HttpResponse {
-    let config = config::config_from_proto(&config::config_to_proto(
-        &api_config_to_serde(&shared.config_tx.borrow().clone()),
-    ));
+    let config = shared.current.lock().unwrap().clone();
     let Some(client_id) = config.spotify.client_id.as_deref().filter(|s| !s.is_empty()) else {
         return (StatusCode::BAD_REQUEST, "set your Spotify Client ID first").into_response();
     };
@@ -1313,7 +1363,7 @@ async fn complete_spotify_login(shared: &Shared, query: &str) -> Result<(), Stri
         _ => return Err("state mismatch — please start the login again".into()),
     }
 
-    let mut config = api_config_to_serde(&shared.config_tx.borrow().clone());
+    let mut config = shared.current.lock().unwrap().clone();
     let client_id = config.spotify.client_id.clone().filter(|s| !s.is_empty()).ok_or("Spotify Client ID is not set")?;
     let client_secret =
         config.spotify.client_secret.clone().filter(|s| !s.is_empty()).ok_or("Spotify Client Secret is not set")?;
@@ -1442,14 +1492,18 @@ fn config_to_api(c: &Config) -> api::Config {
             host: c.server.host.clone(),
             port: u32::from(c.server.port),
             username: c.server.username.clone(),
-            password: c.server.password.clone(),
+            // Password is a secret: never sent to the client. Empty on SetConfig
+            // means "keep the stored password".
+            password: String::new(),
             listen_port: c.server.listen_port,
             ..Default::default()
         }),
         spotify: MessageField::some(api::SpotifyConfig {
             client_id: c.spotify.client_id.clone().unwrap_or_default(),
-            client_secret: c.spotify.client_secret.clone().unwrap_or_default(),
-            refresh_token: c.spotify.refresh_token.clone().unwrap_or_default(),
+            // Secrets are never sent to the client: client_secret is blanked (an
+            // empty value on SetConfig means "keep"), and refresh_token is off
+            // the wire entirely — `connected` conveys its presence.
+            client_secret: String::new(),
             connected: c.spotify.refresh_token.as_deref().is_some_and(|s| !s.is_empty()),
             ..Default::default()
         }),
@@ -1496,7 +1550,8 @@ fn api_config_to_serde(c: &api::Config) -> Config {
         spotify: config::SpotifyConfig {
             client_id: opt(&c.spotify.client_id),
             client_secret: opt(&c.spotify.client_secret),
-            refresh_token: opt(&c.spotify.refresh_token),
+            // Not carried on the wire; set_config merges the stored token back in.
+            refresh_token: None,
         },
         update: config::UpdateConfig {
             enabled: c.update.enabled,

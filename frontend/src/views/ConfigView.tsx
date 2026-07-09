@@ -27,6 +27,11 @@ interface Form {
   incompleteDir: string;
   uploadSlots: number;
   respondToSearches: boolean;
+  fifoQueue: boolean;
+  maxSearchResults: number;
+  minResultFiles: number;
+  minPeerUploadSpeed: number;
+  maxPeerQueueLength: number;
   maxDownloadSpeed: number;
   maxUploadSpeed: number;
 }
@@ -59,6 +64,11 @@ export function ConfigView() {
           incompleteDir: c.sharing?.incompleteDir ?? "",
           uploadSlots: c.sharing?.uploadSlots ?? 0,
           respondToSearches: c.sharing?.respondToSearches ?? false,
+          fifoQueue: c.sharing?.fifoQueue ?? false,
+          maxSearchResults: c.sharing?.maxSearchResults ?? 0,
+          minResultFiles: c.sharing?.minResultFiles ?? 0,
+          minPeerUploadSpeed: c.sharing?.minPeerUploadSpeed ?? 0,
+          maxPeerQueueLength: c.sharing?.maxPeerQueueLength ?? 0,
           maxDownloadSpeed: c.sharing?.maxDownloadSpeed ?? 0,
           maxUploadSpeed: c.sharing?.maxUploadSpeed ?? 0,
         }),
@@ -91,6 +101,11 @@ export function ConfigView() {
           incompleteDir: form.incompleteDir,
           uploadSlots: form.uploadSlots,
           respondToSearches: form.respondToSearches,
+          fifoQueue: form.fifoQueue,
+          maxSearchResults: form.maxSearchResults,
+          minResultFiles: form.minResultFiles,
+          minPeerUploadSpeed: form.minPeerUploadSpeed,
+          maxPeerQueueLength: form.maxPeerQueueLength,
           maxDownloadSpeed: form.maxDownloadSpeed,
           maxUploadSpeed: form.maxUploadSpeed,
         },
@@ -108,7 +123,13 @@ export function ConfigView() {
         <fieldset>
           <legend>Account</legend>
           <Field label="Username" value={form.username} onChange={(v) => set("username", v)} />
-          <Field label="Password" type="password" value={form.password} onChange={(v) => set("password", v)} />
+          <Field
+            label="Password"
+            type="password"
+            value={form.password}
+            placeholder="leave blank to keep current"
+            onChange={(v) => set("password", v)}
+          />
           <Field label="Server host" value={form.host} onChange={(v) => set("host", v)} />
           <NumField label="Server port" value={form.port} onChange={(v) => set("port", v)} />
           <NumField label="Listen port" value={form.listenPort} onChange={(v) => set("listenPort", v)} />
@@ -125,13 +146,24 @@ export function ConfigView() {
           <NumField label="Upload slots" value={form.uploadSlots} onChange={(v) => set("uploadSlots", v)} />
           <NumField label="Max download B/s (0=∞)" value={form.maxDownloadSpeed} onChange={(v) => set("maxDownloadSpeed", v)} />
           <NumField label="Max upload B/s (0=∞)" value={form.maxUploadSpeed} onChange={(v) => set("maxUploadSpeed", v)} />
+          <NumField label="Max search results" value={form.maxSearchResults} onChange={(v) => set("maxSearchResults", v)} />
+          <NumField label="Min result files" value={form.minResultFiles} onChange={(v) => set("minResultFiles", v)} />
+          <NumField label="Min peer upload B/s" value={form.minPeerUploadSpeed} onChange={(v) => set("minPeerUploadSpeed", v)} />
+          <NumField label="Max peer queue length" value={form.maxPeerQueueLength} onChange={(v) => set("maxPeerQueueLength", v)} />
           <Check label="Respond to searches" value={form.respondToSearches} onChange={(v) => set("respondToSearches", v)} />
+          <Check label="FIFO queue" value={form.fifoQueue} onChange={(v) => set("fifoQueue", v)} />
         </fieldset>
 
         <fieldset>
           <legend>Spotify</legend>
           <Field label="Client ID" value={form.clientId} onChange={(v) => set("clientId", v)} />
-          <Field label="Client secret" type="password" value={form.clientSecret} onChange={(v) => set("clientSecret", v)} />
+          <Field
+            label="Client secret"
+            type="password"
+            value={form.clientSecret}
+            placeholder="leave blank to keep current"
+            onChange={(v) => set("clientSecret", v)}
+          />
           <p>
             {form.spotifyConnected ? (
               <span className="pill ok">● connected</span>
@@ -200,11 +232,22 @@ function updaterLabel(u: UpdaterStatus | null): string {
   }
 }
 
-function Field(props: { label: string; value: string; type?: string; onChange: (v: string) => void }) {
+function Field(props: {
+  label: string;
+  value: string;
+  type?: string;
+  placeholder?: string;
+  onChange: (v: string) => void;
+}) {
   return (
     <label className="field">
       <span>{props.label}</span>
-      <input type={props.type ?? "text"} value={props.value} onChange={(e) => props.onChange(e.target.value)} />
+      <input
+        type={props.type ?? "text"}
+        value={props.value}
+        placeholder={props.placeholder}
+        onChange={(e) => props.onChange(e.target.value)}
+      />
     </label>
   );
 }

@@ -224,8 +224,11 @@ message ServerConfig {
 
 message SpotifyConfig {
   string client_id = 1;
+  // Write-only from the client's view: GetConfig returns "" (never ships the
+  // secret); an empty value on SetConfig means "keep the stored secret".
   string client_secret = 2;
-  string refresh_token = 3;
+  reserved 3;  // was refresh_token — server-managed (OAuth), never on the wire
+  reserved "refresh_token";
   // Derived: a refresh token is present (the user has completed OAuth login).
   bool connected = 4;
 }

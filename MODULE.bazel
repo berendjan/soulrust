@@ -10,8 +10,8 @@ bazel_dep(name = "rules_rust", version = "0.70.0")
 # Hermetic JS toolchain for the React frontend: a Bazel-provided Node runs the
 # vite build + TS codegen as build actions, and the resulting bundle is embedded
 # into the soulrust binary (see //frontend and the `web_assets` gen). No system
-# node/npm — deps are fetched from the pinned package-lock.json with integrity
-# hashes, exactly like the pinned codegen plugins below.
+# node/npm — deps are fetched from the pinned frontend/pnpm-lock.yaml with
+# integrity hashes, exactly like the pinned codegen plugins below.
 bazel_dep(name = "aspect_rules_js", version = "3.2.2")
 bazel_dep(name = "aspect_bazel_lib", version = "2.22.5")
 bazel_dep(name = "rules_nodejs", version = "6.7.3")
