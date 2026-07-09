@@ -121,3 +121,11 @@ export function dirname(path: string): string {
   const i = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
   return i >= 0 ? path.slice(0, i) : "";
 }
+
+// Bitrate to sort/filter on: the advertised value, or — for lossless that only
+// gave sample rate + bit depth — Nicotine+'s estimate (sr × depth × 2 / 1000).
+export function effectiveBitrate(f: { bitrate: number; sampleRate: number; bitDepth: number }): number {
+  if (f.bitrate) return f.bitrate;
+  if (f.sampleRate && f.bitDepth) return Math.floor((f.sampleRate * f.bitDepth * 2) / 1000);
+  return 0;
+}

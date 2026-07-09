@@ -1228,6 +1228,26 @@ impl SystemService for Api {
         self.shared.control.quit.store(true, Ordering::SeqCst);
         Response::ok(api::Empty::default())
     }
+
+    #[allow(refining_impl_trait)]
+    async fn open_path(
+        &self,
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, api::OpenPathRequest>,
+    ) -> ServiceResult<api::Empty> {
+        let req = request.to_owned_message();
+        let p = std::path::Path::new(&req.path);
+        // Open the containing folder (or the path itself when it's a directory).
+        // Only an existing directory is opened, so a stray request can't launch
+        // arbitrary files.
+        let dir = if p.is_dir() { Some(p.to_path_buf()) } else { p.parent().map(|d| d.to_path_buf()) };
+        if let Some(dir) = dir {
+            if dir.is_dir() {
+                os_open(&dir.to_string_lossy());
+            }
+        }
+        Response::ok(api::Empty::default())
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 // Downloads: Active + Previous cards, matching the old two-section layout.
-import { transfersClient } from "../client";
+import { systemClient, transfersClient } from "../client";
 import { useWatch } from "../useWatch";
 import { basename, DownloadStatus, downloadStatusLabel, isAudio, percent } from "../format";
 import { usePlayer } from "../player";
@@ -62,6 +62,15 @@ export function DownloadsView() {
         {d.status === DownloadStatus.COMPLETED && isAudio(d.path) && (
           <button className="btn xs" onClick={() => play(d.path)}>
             ▶
+          </button>
+        )}
+        {d.status === DownloadStatus.COMPLETED && d.path && (
+          <button
+            className="btn xs secondary"
+            title="open containing folder"
+            onClick={() => systemClient.openPath({ path: d.path }).catch(() => {})}
+          >
+            ↗
           </button>
         )}
       </td>

@@ -320,7 +320,13 @@ service UpdaterService {
 
 // --- System (process control) ----------------------------------------------
 
+message OpenPathRequest {
+  string path = 1;
+}
+
 service SystemService {
   rpc Restart(Empty) returns (Empty);
   rpc Quit(Empty) returns (Empty);
+  // Open the containing folder of `path` in the OS file manager (server-side).
+  rpc OpenPath(OpenPathRequest) returns (Empty);
 }

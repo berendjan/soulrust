@@ -66,6 +66,23 @@ export function SettingsIcon() {
   );
 }
 
+export function EditIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M13.5 4.5l2 2L7 15l-2.6.6L5 13z" />
+      <path d="M12 6l2 2" />
+    </svg>
+  );
+}
+
+export function FolderIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M2.5 5.5h5l1.5 2h8.5v7a1 1 0 0 1-1 1h-14a1 1 0 0 1-1-1z" />
+    </svg>
+  );
+}
+
 export function UserIcon() {
   return (
     <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round">
