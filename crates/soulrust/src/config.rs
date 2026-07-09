@@ -78,7 +78,7 @@ pub struct UiConfig {
 
 impl Default for UiConfig {
     fn default() -> Self {
-        UiConfig { bind_addr: "127.0.0.1:5030".into(), open_browser: true }
+        UiConfig { bind_addr: "127.0.0.1:5031".into(), open_browser: true }
     }
 }
 
@@ -438,7 +438,7 @@ mod tests {
         let config = load_config(Path::new("/nonexistent/soulrust.yaml"));
         assert_eq!(config, Config::default());
         assert_eq!(config.server.host, "server.slsknet.org");
-        assert_eq!(config.ui.bind_addr, "127.0.0.1:5030");
+        assert_eq!(config.ui.bind_addr, "127.0.0.1:5031");
     }
 
     #[test]

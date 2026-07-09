@@ -298,8 +298,18 @@ impl ApiServer {
             updater_tx,
         });
 
+        // Serve on the configured UI address; fall back to the default if it is
+        // unset or unparseable.
+        let addr = {
+            let a = ctx.config.ui.bind_addr.trim();
+            if a.parse::<std::net::SocketAddr>().is_ok() {
+                a.to_owned()
+            } else {
+                DEFAULT_API_ADDR.to_owned()
+            }
+        };
         ApiServer {
-            addr: DEFAULT_API_ADDR.to_owned(),
+            addr,
             open_browser: ctx.config.ui.open_browser,
             shared,
             cmd_rx: Some(cmd_rx),
@@ -840,7 +850,14 @@ fn serve<W: traits::core::Writer + Clone + Send + 'static>(
         let listener = match tokio_api::net::TcpListener::bind(&addr).await {
             Ok(listener) => listener,
             Err(err) => {
-                eprintln!("api server: cannot bind {addr}: {err}");
+                eprintln!(
+                    "soulrust: cannot bind {addr}: {err}\n\
+                     Another soulrust may already be running on that port — quit it \
+                     (or change ui.bind_addr) and start again."
+                );
+                // Without the UI/API there's nothing to control, so exit cleanly
+                // rather than linger as a dead process holding the bus.
+                shared.control.quit.store(true, Ordering::SeqCst);
                 return;
             }
         };
